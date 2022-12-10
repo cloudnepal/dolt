@@ -31,6 +31,11 @@ jobs:
       with:
         ref: ${{ github.event.client_payload.version }}
 
+    - name: install sysbench
+      run: |
+        curl -s https://packagecloud.io/install/repositories/akopytov/sysbench/script.deb.sh | sudo bash
+        sudo apt -y install sysbench
+
     - name: Install dolt
       working-directory: ./go
       run: go install ./cmd/dolt
@@ -38,7 +43,7 @@ jobs:
     - name: Clone sysbench scripts
       run: |
         scripts=$GITHUB_WORKSPACE/scripts
-        git clone git@github.com:dolthub/systab-sysbench-scripts.git "$scripts"
+        git clone https://github.com/dolthub/systab-sysbench-scripts.git "$scripts"
 
     - name: Run bench
       id: bench
@@ -81,13 +86,13 @@ jobs:
           dolt checkout $branch
         fi
 
-        dolt sql -q "drop table if exists {{ env.RESULT_TABLE_NAME }}"
+        dolt sql -q "drop table if exists sysbench_results"
 
         # load results
         dolt sql < "$in"
 
         # push results to dolthub
-        dolt add ${{ env.RESULT_TABLE_NAME }}
+        dolt add sysbench_results
         dolt commit -m "CI commit"
         dolt push -f origin $branch
 
