@@ -82,7 +82,15 @@ type Puller struct {
 
 // NewPuller creates a new Puller instance to do the syncing.  If a nil puller is returned without error that means
 // that there is nothing to pull and the sinkDB is already up to date.
-func NewPuller(ctx context.Context, tempDir string, chunksPerTF int, srcCS, sinkCS chunks.ChunkStore, walkAddrs WalkAddrs, hashes []hash.Hash, statsCh chan Stats) (*Puller, error) {
+func NewPuller(
+	ctx context.Context,
+	tempDir string,
+	chunksPerTF int,
+	srcCS, sinkCS chunks.ChunkStore,
+	walkAddrs WalkAddrs,
+	hashes []hash.Hash,
+	statsCh chan Stats,
+) (*Puller, error) {
 	// Sanity Check
 	hs := hash.NewHashSet(hashes...)
 	missing, err := srcCS.HasMany(ctx, hs)
@@ -304,7 +312,7 @@ func (p *Puller) uploadTempTableFile(ctx context.Context, tmpTblFile tempTblFile
 	// we can add bytes on to our bufferedSendBytes when
 	// we have to retry a table file write.
 	var localUploaded uint64
-	return p.sinkDBCS.(nbs.TableFileStore).WriteTableFile(ctx, tmpTblFile.id, tmpTblFile.numChunks, tmpTblFile.contentHash, func() (io.ReadCloser, uint64, error) {
+	return p.sinkDBCS.(chunks.TableFileStore).WriteTableFile(ctx, tmpTblFile.id, tmpTblFile.numChunks, tmpTblFile.contentHash, func() (io.ReadCloser, uint64, error) {
 		rc, err := tmpTblFile.read.Reader()
 		if err != nil {
 			return nil, 0, err
@@ -366,7 +374,7 @@ LOOP:
 		}
 	}
 
-	return p.sinkDBCS.(nbs.TableFileStore).AddTableFilesToManifest(ctx, fileIdToNumChunks)
+	return p.sinkDBCS.(chunks.TableFileStore).AddTableFilesToManifest(ctx, fileIdToNumChunks)
 }
 
 // Pull executes the sync operation
