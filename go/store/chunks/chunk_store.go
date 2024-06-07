@@ -29,9 +29,43 @@ import (
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
+// A ChunkStore's |ExclusiveAccessMode| can indicate to a client what type of
+// exclusive access and concurrency control are support by the ChunkStore, and
+// for a ChunkStore instance which the client is holding, what level of access
+// it has. Typically, a ChunkStore will be in Mode_Shared, which means multiple
+// processes can concurrently write to the chunk store and the chunk store can
+// change out from under the process. Other possible modes, currently only used
+// by local ChunkStores using the chunk journal in go/store/nbs are
+// Mode_ReadOnly, which means the journal was opened in read only mode and all
+// attempts to write will fail, or Mode_Exclusive, which means the journal was
+// opened successfully in write mode and no other processes will write to it
+// while this ChunkStore is open.
+type ExclusiveAccessMode uint8
+
+// Note: the order of these constants is relied on in nbs/GenerationalNBS. The
+// order should go from least restricted access to most restricted access. If a
+// client has many stores with different levels of accses, a common question
+// they want to answer is: what is the most restricted access across all of
+// these stores.
+const (
+	ExclusiveAccessMode_Shared = iota
+	ExclusiveAccessMode_Exclusive
+	ExclusiveAccessMode_ReadOnly
+)
+
 var ErrNothingToCollect = errors.New("no changes since last gc")
 
-type GetAddrsCb func(ctx context.Context, c Chunk) (hash.HashSet, error)
+// GetAddrsCurry returns a function that will add a chunk's child
+// references to a HashSet. The intermediary lets us build a single
+// HashSet per memTable.
+type GetAddrsCurry func(c Chunk) GetAddrsCb
+
+// GetAddrsCb adds the refs for a pre-specified chunk to |addrs|
+type GetAddrsCb func(ctx context.Context, addrs hash.HashSet, exists PendingRefExists) error
+
+type PendingRefExists func(hash.Hash) bool
+
+func NoopPendingRefExists(_ hash.Hash) bool { return false }
 
 // ChunkStore is the core storage abstraction in noms. We can put data
 // anyplace we have a ChunkStore implementation for.
@@ -58,10 +92,13 @@ type ChunkStore interface {
 	// to Flush(). Put may be called concurrently with other calls to Put(),
 	// Get(), GetMany(), Has() and HasMany(). Will return an error if the
 	// addrs returned by `getAddrs` are absent from the chunk store.
-	Put(ctx context.Context, c Chunk, getAddrs GetAddrsCb) error
+	Put(ctx context.Context, c Chunk, getAddrs GetAddrsCurry) error
 
 	// Returns the NomsBinFormat with which this ChunkSource is compatible.
 	Version() string
+
+	// Returns the current access mode for this opened ChunkStore.
+	AccessMode() ExclusiveAccessMode
 
 	// Rebase brings this ChunkStore into sync with the persistent storage's
 	// current root.
@@ -85,6 +122,12 @@ type ChunkStore interface {
 	// this ChunkStore. It must return "Unsupported" if this operation is not
 	// supported.
 	StatsSummary() string
+
+	// PersistGhostHashes is used to persist a set of addresses that are known to exist, but
+	// are not currently stored here. Only the GenerationalChunkStore implementation allows use of this method, as
+	// shallow clones are only allowed in local copies currently. Note that at the application level, the only
+	// hashes which can be ghosted are commit ids, but the chunk store doesn't know what those are.
+	PersistGhostHashes(ctx context.Context, refs hash.HashSet) error
 
 	// Close tears down any resources in use by the implementation. After
 	// Close(), the ChunkStore may not be used again. It is NOT SAFE to call
@@ -129,7 +172,7 @@ type ChunkStoreGarbageCollector interface {
 	BeginGC(addChunk func(hash.Hash) bool) error
 
 	// EndGC indicates that the GC is over. The previously provided
-	// addChunk function must not be called after this function function.
+	// addChunk function must not be called after this function.
 	EndGC()
 
 	// MarkAndSweepChunks is expected to read chunk addresses off of
@@ -155,8 +198,27 @@ type PrefixChunkStore interface {
 type GenerationalCS interface {
 	NewGen() ChunkStoreGarbageCollector
 	OldGen() ChunkStoreGarbageCollector
+	GhostGen() ChunkStore
 }
 
 var ErrUnsupportedOperation = errors.New("operation not supported")
 
 var ErrGCGenerationExpired = errors.New("garbage collection generation expired")
+
+type PushConcurrencyControl int8
+
+const (
+	PushConcurrencyControl_IgnoreWorkingSet = iota
+	PushConcurrencyControl_AssertWorkingSet = iota
+)
+
+type ConcurrencyControlChunkStore interface {
+	PushConcurrencyControl() PushConcurrencyControl
+}
+
+func GetPushConcurrencyControl(cs ChunkStore) PushConcurrencyControl {
+	if cs, ok := cs.(ConcurrencyControlChunkStore); ok {
+		return cs.PushConcurrencyControl()
+	}
+	return PushConcurrencyControl_IgnoreWorkingSet
+}

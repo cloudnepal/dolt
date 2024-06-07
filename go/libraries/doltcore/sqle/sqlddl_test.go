@@ -20,7 +20,9 @@ import (
 	"strings"
 	"testing"
 
+	gms "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/analyzer"
 	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
 	"github.com/dolthub/vitess/go/sqltypes"
 	"github.com/stretchr/testify/assert"
@@ -31,8 +33,10 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/row"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 	"github.com/dolthub/dolt/go/store/types"
 )
 
@@ -134,7 +138,8 @@ func TestCreateTable(t *testing.T) {
 							c23 tinyint unsigned,
 							c24 smallint unsigned,
 							c25 mediumint unsigned,
-							c26 bigint unsigned)`,
+							c26 bigint unsigned,
+							c27 tinyint(1))`,
 			expectedSchema: dtestutils.CreateSchema(
 				schemaNewColumn(t, "c0", 594, gmstypes.Int32, true, schema.NotNullConstraint{}),
 				schemaNewColumn(t, "c1", 601, gmstypes.Int8, false),
@@ -163,6 +168,7 @@ func TestCreateTable(t *testing.T) {
 				schemaNewColumn(t, "c24", 8689, gmstypes.Uint16, false),
 				schemaNewColumn(t, "c25", 5243, gmstypes.Uint24, false),
 				schemaNewColumn(t, "c26", 9338, gmstypes.Uint64, false),
+				schemaNewColumn(t, "c27", 5981, gmstypes.Boolean, false),
 			),
 		},
 		{
@@ -259,6 +265,7 @@ func TestCreateTable(t *testing.T) {
 			ctx := context.Background()
 			dEnv, err := CreateEmptyTestDatabase()
 			require.NoError(t, err)
+			defer dEnv.DoltDB.Close()
 
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
@@ -274,7 +281,7 @@ func TestCreateTable(t *testing.T) {
 
 			require.NotNil(t, updatedRoot)
 
-			table, ok, err := updatedRoot.GetTable(ctx, tt.expectedTable)
+			table, ok, err := updatedRoot.GetTable(ctx, doltdb.TableName{Name: tt.expectedTable})
 			require.True(t, ok)
 			require.NoError(t, err)
 
@@ -334,6 +341,7 @@ func TestDropTable(t *testing.T) {
 			ctx := context.Background()
 			dEnv, err := CreateTestDatabase()
 			require.NoError(t, err)
+			defer dEnv.DoltDB.Close()
 
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
@@ -350,7 +358,7 @@ func TestDropTable(t *testing.T) {
 
 			require.NotNil(t, updatedRoot)
 			for _, tableName := range tt.tableNames {
-				has, err := updatedRoot.HasTable(ctx, tableName)
+				has, err := updatedRoot.HasTable(ctx, doltdb.TableName{Name: tableName})
 				assert.NoError(t, err)
 				assert.False(t, has)
 			}
@@ -508,6 +516,7 @@ func TestAddColumn(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dEnv, err := CreateTestDatabase()
 			require.NoError(t, err)
+			defer dEnv.DoltDB.Close()
 
 			ctx := context.Background()
 			root, err := dEnv.WorkingRoot(ctx)
@@ -524,7 +533,7 @@ func TestAddColumn(t *testing.T) {
 			}
 
 			assert.NotNil(t, updatedRoot)
-			table, _, err := updatedRoot.GetTable(ctx, PeopleTableName)
+			table, _, err := updatedRoot.GetTable(ctx, doltdb.TableName{Name: PeopleTableName})
 
 			assert.NoError(t, err)
 			sch, err := table.GetSchema(ctx)
@@ -535,7 +544,7 @@ func TestAddColumn(t *testing.T) {
 				return // todo: convert these to enginetests
 			}
 
-			updatedTable, ok, err := updatedRoot.GetTable(ctx, "people")
+			updatedTable, ok, err := updatedRoot.GetTable(ctx, doltdb.TableName{Name: "people"})
 			assert.NoError(t, err)
 			require.True(t, ok)
 
@@ -629,6 +638,7 @@ func TestRenameColumn(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dEnv, err := CreateTestDatabase()
 			require.NoError(t, err)
+			defer dEnv.DoltDB.Close()
 
 			ctx := context.Background()
 			root, _ := dEnv.WorkingRoot(ctx)
@@ -644,7 +654,7 @@ func TestRenameColumn(t *testing.T) {
 			}
 
 			require.NotNil(t, updatedRoot)
-			table, _, err := updatedRoot.GetTable(ctx, PeopleTableName)
+			table, _, err := updatedRoot.GetTable(ctx, doltdb.TableName{Name: PeopleTableName})
 			assert.NoError(t, err)
 			sch, err := table.GetSchema(ctx)
 			require.NoError(t, err)
@@ -654,7 +664,7 @@ func TestRenameColumn(t *testing.T) {
 				return // todo: convert these to enginetests
 			}
 
-			updatedTable, ok, err := updatedRoot.GetTable(ctx, "people")
+			updatedTable, ok, err := updatedRoot.GetTable(ctx, doltdb.TableName{Name: "people"})
 			assert.NoError(t, err)
 			require.True(t, ok)
 
@@ -725,7 +735,7 @@ func TestRenameTableStatements(t *testing.T) {
 		},
 		{
 			name:        "invalid table name",
-			query:       "rename table people to `123`",
+			query:       "rename table people to `a!trailing^space*is%the(worst) `",
 			expectedErr: "Invalid table name",
 		},
 		{
@@ -744,6 +754,7 @@ func TestRenameTableStatements(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dEnv, err := CreateTestDatabase()
 			require.NoError(t, err)
+			defer dEnv.DoltDB.Close()
 
 			ctx := context.Background()
 			root, err := dEnv.WorkingRoot(ctx)
@@ -759,11 +770,11 @@ func TestRenameTableStatements(t *testing.T) {
 			}
 			require.NotNil(t, updatedRoot)
 
-			has, err := updatedRoot.HasTable(ctx, tt.oldTableName)
+			has, err := updatedRoot.HasTable(ctx, doltdb.TableName{Name: tt.oldTableName})
 			require.NoError(t, err)
 			assert.False(t, has)
 
-			newTable, ok, err := updatedRoot.GetTable(ctx, tt.newTableName)
+			newTable, ok, err := updatedRoot.GetTable(ctx, doltdb.TableName{Name: tt.newTableName})
 			require.NoError(t, err)
 			require.True(t, ok)
 
@@ -795,19 +806,13 @@ func TestRenameTableStatements(t *testing.T) {
 }
 
 func TestAlterSystemTables(t *testing.T) {
-	systemTableNames := []string{"dolt_log", "dolt_history_people", "dolt_diff_people", "dolt_commit_diff_people", "dolt_schemas"} // "dolt_docs",
-	reservedTableNames := []string{"dolt_query_catalog"}
+	systemTableNames := []string{"dolt_log", "dolt_history_people", "dolt_diff_people", "dolt_commit_diff_people", "dolt_schemas"}
+	reservedTableNames := []string{"dolt_query_catalog", "dolt_docs", "dolt_procedures", "dolt_ignore"}
 
 	var dEnv *env.DoltEnv
 	var err error
 	setup := func() {
 		dEnv, err = CreateTestDatabase()
-		require.NoError(t, err)
-
-		err := CreateEmptyTestTable(dEnv, "dolt_docs", doltdb.DocsSchema)
-		require.NoError(t, err)
-
-		err = CreateEmptyTestTable(dEnv, doltdb.SchemasTableName, schemaTableSchema)
 		require.NoError(t, err)
 
 		CreateTestTable(t, dEnv, "dolt_docs", doltdb.DocsSchema,
@@ -816,10 +821,14 @@ func TestAlterSystemTables(t *testing.T) {
 			"INSERT INTO dolt_query_catalog VALUES ('abc123', 1, 'example', 'select 2+2 from dual', 'description')")
 		CreateTestTable(t, dEnv, doltdb.SchemasTableName, schemaTableSchema,
 			"INSERT INTO dolt_schemas (type, name, fragment) VALUES ('view', 'name', 'create view name as select 2+2 from dual')")
+		ExecuteSetupSQL(context.Background(), `
+		CREATE PROCEDURE simple_proc2() SELECT 1+1;
+		INSERT INTO dolt_ignore VALUES ('test', 1);`)(t, dEnv)
 	}
 
 	t.Run("Create", func(t *testing.T) {
 		setup()
+		defer dEnv.DoltDB.Close()
 		for _, tableName := range append(systemTableNames, reservedTableNames...) {
 			assertFails(t, dEnv, fmt.Sprintf("create table %s (a int primary key not null)", tableName), "reserved")
 		}
@@ -827,8 +836,12 @@ func TestAlterSystemTables(t *testing.T) {
 
 	t.Run("Drop", func(t *testing.T) {
 		setup()
-		for _, tableName := range append(systemTableNames) {
-			expectedErr := "system tables cannot be dropped or altered"
+		defer dEnv.DoltDB.Close()
+		for _, tableName := range systemTableNames {
+			expectedErr := "system table"
+			if strings.HasPrefix(tableName, "dolt_diff") || strings.HasPrefix(tableName, "dolt_history") {
+				expectedErr = "system tables cannot be dropped or altered"
+			}
 			assertFails(t, dEnv, fmt.Sprintf("drop table %s", tableName), expectedErr)
 		}
 		for _, tableName := range reservedTableNames {
@@ -838,6 +851,7 @@ func TestAlterSystemTables(t *testing.T) {
 
 	t.Run("Rename", func(t *testing.T) {
 		setup()
+		defer dEnv.DoltDB.Close()
 		for _, tableName := range systemTableNames {
 			expectedErr := "system table"
 			if strings.HasPrefix(tableName, "dolt_diff") || strings.HasPrefix(tableName, "dolt_history") {
@@ -852,6 +866,7 @@ func TestAlterSystemTables(t *testing.T) {
 
 	t.Run("Alter", func(t *testing.T) {
 		setup()
+		defer dEnv.DoltDB.Close()
 		for _, tableName := range append(systemTableNames, reservedTableNames...) {
 			expectedErr := "cannot be altered"
 			if strings.HasPrefix(tableName, "dolt_diff") || strings.HasPrefix(tableName, "dolt_history") {
@@ -880,7 +895,7 @@ func TestParseCreateTableStatement(t *testing.T) {
 		{
 			name:          "Test create table starting with number",
 			query:         "create table 123table (id int primary key)",
-			expectedTable: "`123table`",
+			expectedTable: "123table",
 			expectedSchema: dtestutils.CreateSchema(
 				schemaNewColumn(t, "id", 4817, gmstypes.Int32, true, schema.NotNullConstraint{})),
 		},
@@ -1061,10 +1076,20 @@ func TestParseCreateTableStatement(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dEnv := dtestutils.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 			ctx := context.Background()
 			root, _ := dEnv.WorkingRoot(ctx)
+			//eng, dbName, _ := engine.NewSqlEngineForEnv(ctx, dEnv)
+			eng, sqlCtx := newTestEngine(ctx, dEnv)
 
-			tblName, sch, err := sqlutil.ParseCreateTableStatement(ctx, root, tt.query)
+			_, iter, err := eng.Query(sqlCtx, "create database test")
+			if err != nil {
+				panic(err)
+			}
+			_, _ = sql.RowIterToRows(sqlCtx, iter)
+			sqlCtx.SetCurrentDatabase("test")
+
+			tblName, sch, err := sqlutil.ParseCreateTableStatement(sqlCtx, root, eng, tt.query)
 
 			if tt.expectedErr != "" {
 				require.Error(t, err)
@@ -1078,9 +1103,34 @@ func TestParseCreateTableStatement(t *testing.T) {
 	}
 }
 
+func newTestEngine(ctx context.Context, dEnv *env.DoltEnv) (*gms.Engine, *sql.Context) {
+	pro, err := NewDoltDatabaseProviderWithDatabases("main", dEnv.FS, nil, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
+	if err != nil {
+		panic(err)
+	}
+
+	doltSession, err := dsess.NewDoltSession(sql.NewBaseSession(), pro, dEnv.Config.WriteableConfig(), nil, nil, writer.NewWriteSession)
+	if err != nil {
+		panic(err)
+	}
+
+	sqlCtx := sql.NewContext(ctx, sql.WithSession(doltSession))
+	sqlCtx.SetCurrentDatabase(mrEnv.GetFirstDatabase())
+
+	return gms.New(analyzer.NewBuilder(pro).WithParallelism(1).Build(), &gms.Config{
+		IsReadOnly:     false,
+		IsServerLocked: false,
+	}), sqlCtx
+}
 func TestIndexOverwrite(t *testing.T) {
 	ctx := context.Background()
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 	root, err := dEnv.WorkingRoot(ctx)
 	if err != nil {
 		panic(err)
@@ -1185,6 +1235,7 @@ INSERT INTO child_non_unq VALUES ('1', 1), ('2', NULL), ('3', 3), ('4', 3), ('5'
 func TestDropPrimaryKey(t *testing.T) {
 	ctx := context.Background()
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 	root, err := dEnv.WorkingRoot(ctx)
 	if err != nil {
 		panic(err)
@@ -1242,6 +1293,7 @@ func TestDropPrimaryKey(t *testing.T) {
 func TestDropIndex(t *testing.T) {
 	ctx := context.Background()
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 	root, err := dEnv.WorkingRoot(ctx)
 	if err != nil {
 		panic(err)
@@ -1295,6 +1347,7 @@ func TestDropIndex(t *testing.T) {
 
 func TestCreateIndexUnique(t *testing.T) {
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 	root, err := dEnv.WorkingRoot(context.Background())
 	if err != nil {
 		panic(err)

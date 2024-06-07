@@ -35,8 +35,8 @@ teardown() {
     dolt sql -q "create table german1 (c char(10)) CHARACTER SET latin1 COLLATE latin1_german1_ci"
     run dolt sql -q "show create table german1";
     [ $status -eq 0 ]
-    [[ $output =~ "CHARACTER SET latin1" ]] || false
-    [[ $output =~ "COLLATE latin1_german1_ci" ]] || false
+    [[ $output =~ "latin1_german1_ci" ]] || false
+    [[ ! $output =~ "utf8" ]] || false
 
     # check information_schema.TABLES table
     run dolt sql -q "select table_name, table_type, table_collation from information_schema.TABLES where table_name = 'german1';" -r csv
@@ -45,9 +45,9 @@ teardown() {
 
 @test "sql-charsets-collations: define charset and collation on a database" {
     start_sql_server
-    dolt sql-client -u dolt --use-db '' -P $PORT -q "CREATE DATABASE test CHARACTER SET latin1 COLLATE latin1_swedish_ci;"
-    dolt sql-client -u dolt --use-db test -P $PORT -q "SELECT @@character_set_database" ";@@SESSION.character_set_database\nlatin1"
-    dolt sql-client -u dolt --use-db test -P $PORT -q "SELECT @@character_set_database" ";@@SESSION.collation_database\nlatin1_swedish_ci"
+    dolt sql -q "CREATE DATABASE test CHARACTER SET latin1 COLLATE latin1_swedish_ci;"
+    dolt sql -q "SELECT @@character_set_database; set @@SESSION.character_set_database=latin1"
+    dolt sql -q "SELECT @@character_set_database; set @@SESSION.collation_database=latin1_swedish_ci"
     stop_sql_server
     sleep 0.5
 }

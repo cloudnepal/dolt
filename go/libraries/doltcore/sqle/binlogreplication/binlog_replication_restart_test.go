@@ -49,7 +49,7 @@ func TestBinlogReplicationServerRestart(t *testing.T) {
 	time.Sleep(1000 * time.Millisecond)
 
 	var err error
-	doltPort, doltProcess, err = startDoltSqlServer(testDir)
+	doltPort, doltProcess, err = startDoltSqlServer(testDir, nil)
 	require.NoError(t, err)
 
 	// Check replication status on the replica and assert configuration persisted
@@ -75,8 +75,8 @@ func TestBinlogReplicationServerRestart(t *testing.T) {
 	require.NoError(t, err)
 	replicaRows, err := replicaDatabase.Queryx(countMaxQuery)
 	require.NoError(t, err)
-	primaryRow := convertByteArraysToStrings(readNextRow(t, primaryRows))
-	replicaRow := convertByteArraysToStrings(readNextRow(t, replicaRows))
+	primaryRow := convertMapScanResultToStrings(readNextRow(t, primaryRows))
+	replicaRow := convertMapScanResultToStrings(readNextRow(t, replicaRows))
 	require.Equal(t, primaryRow["count"], replicaRow["count"])
 	require.Equal(t, primaryRow["max"], replicaRow["max"])
 	require.NoError(t, replicaRows.Close())

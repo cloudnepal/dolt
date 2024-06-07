@@ -35,6 +35,8 @@ import (
 	"time"
 
 	"github.com/dolthub/dolt/go/libraries/utils/file"
+	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/util/tempfiles"
 )
 
@@ -66,17 +68,22 @@ type fsTablePersister struct {
 var _ tablePersister = &fsTablePersister{}
 var _ tableFilePersister = &fsTablePersister{}
 
-func (ftp *fsTablePersister) Open(ctx context.Context, name addr, chunkCount uint32, stats *Stats) (chunkSource, error) {
+func (ftp *fsTablePersister) Open(ctx context.Context, name hash.Hash, chunkCount uint32, stats *Stats) (chunkSource, error) {
 	return newFileTableReader(ctx, ftp.dir, name, chunkCount, ftp.q)
 }
 
-func (ftp *fsTablePersister) Exists(ctx context.Context, name addr, chunkCount uint32, stats *Stats) (bool, error) {
+func (ftp *fsTablePersister) Exists(ctx context.Context, name hash.Hash, chunkCount uint32, stats *Stats) (bool, error) {
 	ftp.removeMu.Lock()
 	defer ftp.removeMu.Unlock()
 	if ftp.toKeep != nil {
 		ftp.toKeep[filepath.Join(ftp.dir, name.String())] = struct{}{}
 	}
-	return tableFileExists(ctx, ftp.dir, name)
+
+	exists, err := tableFileExists(ctx, ftp.dir, name)
+	if exists || err != nil {
+		return exists, err
+	}
+	return archiveFileExists(ctx, ftp.dir, name)
 }
 
 func (ftp *fsTablePersister) Persist(ctx context.Context, mt *memTable, haver chunkReader, stats *Stats) (chunkSource, error) {
@@ -95,15 +102,8 @@ func (ftp *fsTablePersister) Path() string {
 	return ftp.dir
 }
 
-func (ftp *fsTablePersister) CopyTableFile(ctx context.Context, r io.ReadCloser, fileId string, fileSz uint64, chunkCount uint32) error {
+func (ftp *fsTablePersister) CopyTableFile(ctx context.Context, r io.Reader, fileId string, fileSz uint64, chunkCount uint32) error {
 	tn, f, err := func() (n string, cleanup func(), err error) {
-		defer func() {
-			cerr := r.Close()
-			if err == nil {
-				err = cerr
-			}
-		}()
-
 		ftp.removeMu.Lock()
 		var temp *os.File
 		temp, err = tempfiles.MovableTempFileProvider.NewFile(ftp.dir, tempTablePrefix)
@@ -128,6 +128,11 @@ func (ftp *fsTablePersister) CopyTableFile(ctx context.Context, r io.ReadCloser,
 		}()
 
 		_, err = io.Copy(temp, r)
+		if err != nil {
+			return "", cleanup, err
+		}
+
+		err = temp.Sync()
 		if err != nil {
 			return "", cleanup, err
 		}
@@ -158,7 +163,7 @@ func (ftp *fsTablePersister) TryMoveCmpChunkTableWriter(ctx context.Context, fil
 	return w.FlushToFile(path)
 }
 
-func (ftp *fsTablePersister) persistTable(ctx context.Context, name addr, data []byte, chunkCount uint32, stats *Stats) (cs chunkSource, err error) {
+func (ftp *fsTablePersister) persistTable(ctx context.Context, name hash.Hash, data []byte, chunkCount uint32, stats *Stats) (cs chunkSource, err error) {
 	if chunkCount == 0 {
 		return emptyChunkSource{}, nil
 	}
@@ -188,6 +193,11 @@ func (ftp *fsTablePersister) persistTable(ctx context.Context, name addr, data [
 		}()
 
 		_, ferr = io.Copy(temp, bytes.NewReader(data))
+		if ferr != nil {
+			return "", cleanup, ferr
+		}
+
+		ferr = temp.Sync()
 		if ferr != nil {
 			return "", cleanup, ferr
 		}
@@ -243,7 +253,6 @@ func (ftp *fsTablePersister) ConjoinAll(ctx context.Context, sources chunkSource
 
 		defer func() {
 			closeErr := temp.Close()
-
 			if ferr == nil {
 				ferr = closeErr
 			}
@@ -279,6 +288,11 @@ func (ftp *fsTablePersister) ConjoinAll(ctx context.Context, sources chunkSource
 			return "", cleanup, ferr
 		}
 
+		ferr = temp.Sync()
+		if ferr != nil {
+			return "", cleanup, ferr
+		}
+
 		return temp.Name(), cleanup, nil
 	}()
 	defer f()
@@ -308,7 +322,7 @@ func (ftp *fsTablePersister) ConjoinAll(ctx context.Context, sources chunkSource
 	}, nil
 }
 
-func (ftp *fsTablePersister) PruneTableFiles(ctx context.Context, keeper func() []addr, mtime time.Time) error {
+func (ftp *fsTablePersister) PruneTableFiles(ctx context.Context, keeper func() []hash.Hash, mtime time.Time) error {
 	ftp.removeMu.Lock()
 	if ftp.toKeep != nil {
 		ftp.removeMu.Unlock()
@@ -360,8 +374,7 @@ func (ftp *fsTablePersister) PruneTableFiles(ctx context.Context, keeper func() 
 			continue // not a table file
 		}
 
-		_, err := parseAddr(info.Name())
-		if err != nil {
+		if _, ok := hash.MaybeParse(info.Name()); !ok {
 			continue // not a table file
 		}
 
@@ -410,4 +423,8 @@ func (ftp *fsTablePersister) PruneTableFiles(ctx context.Context, keeper func() 
 
 func (ftp *fsTablePersister) Close() error {
 	return nil
+}
+
+func (ftp *fsTablePersister) AccessMode() chunks.ExclusiveAccessMode {
+	return chunks.ExclusiveAccessMode_Shared
 }

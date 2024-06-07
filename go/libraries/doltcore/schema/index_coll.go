@@ -46,7 +46,13 @@ type IndexCollection interface {
 	// GetIndexByColumnNames returns whether the collection contains an index that has this exact collection and ordering of columns.
 	GetIndexByColumnNames(cols ...string) (Index, bool)
 	// GetIndexByTags returns whether the collection contains an index that has this exact collection and ordering of columns.
+	// Note that if an index collection contains multiple indexes that cover the same column tags (e.g. different index
+	// types) then this method will return one of them, but it is not guaranteed which one and can easily result in a
+	// race condition.
 	GetIndexByTags(tags ...uint64) (Index, bool)
+	// GetIndexesByTags returns all indexes from this collection that cover the same columns identified by |tags|, in the
+	// same order specified. This method is preferred over GetIndexByTags.
+	GetIndexesByTags(tags ...uint64) []Index
 	// IndexesWithColumn returns all indexes that index the given column.
 	IndexesWithColumn(columnName string) []Index
 	// IndexesWithTag returns all indexes that index the given tag.
@@ -64,13 +70,30 @@ type IndexCollection interface {
 	RenameIndex(oldName, newName string) (Index, error)
 	//SetPks changes the pks or pk ordinals
 	SetPks([]uint64) error
+	// ContainsFullTextIndex returns whether the collection contains at least one Full-Text index.
+	ContainsFullTextIndex() bool
+	// Copy returns a copy of this index collection that can be modified without affecting the original.
+	Copy() IndexCollection
 }
 
 type IndexProperties struct {
 	IsUnique      bool
 	IsSpatial     bool
+	IsFullText    bool
 	IsUserDefined bool
 	Comment       string
+	FullTextProperties
+}
+
+type FullTextProperties struct {
+	ConfigTable      string
+	PositionTable    string
+	DocCountTable    string
+	GlobalCountTable string
+	RowCountTable    string
+	KeyType          uint8
+	KeyName          string
+	KeyPositions     []uint16
 }
 
 type indexCollectionImpl struct {
@@ -102,6 +125,40 @@ func NewIndexCollection(cols *ColCollection, pkCols *ColCollection) IndexCollect
 	return ixc
 }
 
+func (ixc indexCollectionImpl) Copy() IndexCollection {
+	if ixc.pks != nil {
+		pks := make([]uint64, len(ixc.pks))
+		copy(pks, ixc.pks)
+		ixc.pks = pks
+	}
+
+	if ixc.indexes != nil {
+		indexes := make(map[string]*indexImpl, len(ixc.indexes))
+		for name, index := range ixc.indexes {
+			indexes[name] = index.copy()
+		}
+		ixc.indexes = indexes
+	}
+
+	if ixc.colTagToIndex != nil {
+		colTagToIndex := make(map[uint64][]*indexImpl, len(ixc.colTagToIndex))
+		for tag, indexes := range ixc.colTagToIndex {
+			var indexesCopy []*indexImpl
+			if indexes != nil {
+				indexesCopy = make([]*indexImpl, len(indexes))
+				for i, index := range indexes {
+					indexesCopy[i] = index.copy()
+				}
+			}
+			colTagToIndex[tag] = indexesCopy
+		}
+		ixc.colTagToIndex = colTagToIndex
+	}
+
+	// no need to copy the colColl, it's immutable
+	return &ixc
+}
+
 func (ixc *indexCollectionImpl) AddIndex(indexes ...Index) {
 	for _, indexInterface := range indexes {
 		index, ok := indexInterface.(*indexImpl)
@@ -111,7 +168,8 @@ func (ixc *indexCollectionImpl) AddIndex(indexes ...Index) {
 		index = index.copy()
 		index.indexColl = ixc
 		index.allTags = combineAllTags(index.tags, ixc.pks)
-		oldNamedIndex, ok := ixc.indexes[index.name]
+		lowerName := strings.ToLower(index.name)
+		oldNamedIndex, ok := ixc.indexes[lowerName]
 		if ok {
 			ixc.removeIndex(oldNamedIndex)
 		}
@@ -119,7 +177,7 @@ func (ixc *indexCollectionImpl) AddIndex(indexes ...Index) {
 		if oldTaggedIndex != nil {
 			ixc.removeIndex(oldTaggedIndex)
 		}
-		ixc.indexes[index.name] = index
+		ixc.indexes[lowerName] = index
 		for _, tag := range index.tags {
 			ixc.colTagToIndex[tag] = append(ixc.colTagToIndex[tag], index)
 		}
@@ -135,11 +193,12 @@ func (ixc *indexCollectionImpl) AddIndexByColNames(indexName string, cols []stri
 }
 
 func (ixc *indexCollectionImpl) AddIndexByColTags(indexName string, tags []uint64, prefixLengths []uint16, props IndexProperties) (Index, error) {
-	if strings.HasPrefix(indexName, "dolt_") {
+	lowerName := strings.ToLower(indexName)
+	if strings.HasPrefix(lowerName, "dolt_") {
 		return nil, fmt.Errorf("indexes cannot be prefixed with `dolt_`")
 	}
-	if ixc.Contains(indexName) {
-		return nil, fmt.Errorf("`%s` already exists as an index for this table", indexName)
+	if ixc.Contains(lowerName) {
+		return nil, fmt.Errorf("`%s` already exists as an index for this table", lowerName)
 	}
 	if !ixc.tagsExist(tags...) {
 		return nil, fmt.Errorf("tags %v do not exist on this table", tags)
@@ -161,11 +220,13 @@ func (ixc *indexCollectionImpl) AddIndexByColTags(indexName string, tags []uint6
 		allTags:       combineAllTags(tags, ixc.pks),
 		isUnique:      props.IsUnique,
 		isSpatial:     props.IsSpatial,
+		isFullText:    props.IsFullText,
 		isUserDefined: props.IsUserDefined,
 		comment:       props.Comment,
 		prefixLengths: prefixLengths,
+		fullTextProps: props.FullTextProperties,
 	}
-	ixc.indexes[indexName] = index
+	ixc.indexes[lowerName] = index
 	for _, tag := range tags {
 		ixc.colTagToIndex[tag] = append(ixc.colTagToIndex[tag], index)
 	}
@@ -185,11 +246,13 @@ func (ixc *indexCollectionImpl) UnsafeAddIndexByColTags(indexName string, tags [
 		allTags:       combineAllTags(tags, ixc.pks),
 		isUnique:      props.IsUnique,
 		isSpatial:     props.IsSpatial,
+		isFullText:    props.IsFullText,
 		isUserDefined: props.IsUserDefined,
 		comment:       props.Comment,
 		prefixLengths: prefixLengths,
+		fullTextProps: props.FullTextProperties,
 	}
-	ixc.indexes[indexName] = index
+	ixc.indexes[strings.ToLower(indexName)] = index
 	for _, tag := range tags {
 		ixc.colTagToIndex[tag] = append(ixc.colTagToIndex[tag], index)
 	}
@@ -210,7 +273,7 @@ func (ixc *indexCollectionImpl) AllIndexes() []Index {
 }
 
 func (ixc *indexCollectionImpl) Contains(indexName string) bool {
-	_, ok := ixc.indexes[indexName]
+	_, ok := ixc.indexes[strings.ToLower(indexName)]
 	return ok
 }
 
@@ -234,7 +297,7 @@ func (ixc *indexCollectionImpl) Equals(other IndexCollection) bool {
 }
 
 func (ixc *indexCollectionImpl) GetByName(indexName string) Index {
-	ix, ok := ixc.indexes[indexName]
+	ix, ok := ixc.indexes[strings.ToLower(indexName)]
 	if ok {
 		return ix
 	}
@@ -282,6 +345,30 @@ func (ixc *indexCollectionImpl) GetIndexByTags(tags ...uint64) (Index, bool) {
 	return idx, true
 }
 
+// GetIndexesByTags implements the schema.Index interface
+func (ixc *indexCollectionImpl) GetIndexesByTags(tags ...uint64) []Index {
+	var result []Index
+
+	tagCount := len(tags)
+	for _, idx := range ixc.indexes {
+		if tagCount != len(idx.tags) {
+			continue
+		}
+
+		allMatch := true
+		for i, idxTag := range idx.tags {
+			if tags[i] != idxTag {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			result = append(result, idx)
+		}
+	}
+	return result
+}
+
 func (ixc *indexCollectionImpl) hasIndexOnTags(tags ...uint64) bool {
 	_, ok := ixc.GetIndexByTags(tags...)
 	return ok
@@ -326,9 +413,11 @@ func (ixc *indexCollectionImpl) Merge(indexes ...Index) {
 				indexColl:     ixc,
 				isUnique:      index.IsUnique(),
 				isSpatial:     index.IsSpatial(),
+				isFullText:    index.IsFullText(),
 				isUserDefined: index.IsUserDefined(),
 				comment:       index.Comment(),
 				prefixLengths: index.PrefixLengths(),
+				fullTextProps: index.FullTextProperties(),
 			}
 			ixc.AddIndex(newIndex)
 		}
@@ -336,11 +425,12 @@ func (ixc *indexCollectionImpl) Merge(indexes ...Index) {
 }
 
 func (ixc *indexCollectionImpl) RemoveIndex(indexName string) (Index, error) {
-	if !ixc.Contains(indexName) {
-		return nil, fmt.Errorf("`%s` does not exist as an index for this table", indexName)
+	lowerName := strings.ToLower(indexName)
+	if !ixc.Contains(lowerName) {
+		return nil, fmt.Errorf("`%s` does not exist as an index for this table", lowerName)
 	}
-	index := ixc.indexes[indexName]
-	delete(ixc.indexes, indexName)
+	index := ixc.indexes[lowerName]
+	delete(ixc.indexes, lowerName)
 	for _, tag := range index.tags {
 		indexesRefThisCol := ixc.colTagToIndex[tag]
 		for i, comparisonIndex := range indexesRefThisCol {
@@ -354,16 +444,19 @@ func (ixc *indexCollectionImpl) RemoveIndex(indexName string) (Index, error) {
 }
 
 func (ixc *indexCollectionImpl) RenameIndex(oldName, newName string) (Index, error) {
-	if !ixc.Contains(oldName) {
+	lowerCaseOldName := strings.ToLower(oldName)
+	lowerCaseNewName := strings.ToLower(newName)
+
+	if !ixc.Contains(lowerCaseOldName) {
 		return nil, fmt.Errorf("`%s` does not exist as an index for this table", oldName)
 	}
-	if ixc.Contains(newName) {
+	if ixc.Contains(lowerCaseNewName) {
 		return nil, fmt.Errorf("`%s` already exists as an index for this table", newName)
 	}
-	index := ixc.indexes[oldName]
-	delete(ixc.indexes, oldName)
+	index := ixc.indexes[lowerCaseOldName]
+	delete(ixc.indexes, lowerCaseOldName)
 	index.name = newName
-	ixc.indexes[newName] = index
+	ixc.indexes[lowerCaseNewName] = index
 	return index, nil
 }
 
@@ -399,7 +492,7 @@ func (ixc *indexCollectionImpl) containsColumnTagCollection(tags ...uint64) *ind
 }
 
 func (ixc *indexCollectionImpl) removeIndex(index *indexImpl) {
-	delete(ixc.indexes, index.name)
+	delete(ixc.indexes, strings.ToLower(index.name))
 	for _, tag := range index.tags {
 		var newReferences []*indexImpl
 		for _, referencedIndex := range ixc.colTagToIndex[tag] {
@@ -430,6 +523,26 @@ func (ixc *indexCollectionImpl) SetPks(tags []uint64) error {
 	}
 	ixc.pks = tags
 	return nil
+}
+
+func (ixc *indexCollectionImpl) ContainsFullTextIndex() bool {
+	for _, idx := range ixc.indexes {
+		if idx.isFullText {
+			return true
+		}
+	}
+	return false
+}
+
+// TableNameSlice returns the table names as a slice, which may be used to easily grab all of the tables using a for loop.
+func (props FullTextProperties) TableNameSlice() []string {
+	return []string{
+		props.ConfigTable,
+		props.PositionTable,
+		props.DocCountTable,
+		props.GlobalCountTable,
+		props.RowCountTable,
+	}
 }
 
 func combineAllTags(tags []uint64, pks []uint64) []uint64 {

@@ -22,6 +22,44 @@ teardown() {
     teardown_common
 }
 
+@test "diff: db collation diff" {
+    dolt sql -q "create database colldb"
+    cd colldb
+
+    dolt sql -q "alter database colldb collate utf8mb4_spanish_ci"
+
+    run dolt diff
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "CREATE DATABASE `colldb`" ]] || false
+    [[ "$output" =~ "40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_spanish_ci" ]] || false
+
+    run dolt diff --data
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "CREATE DATABASE `colldb`" ]] || false
+    [[ ! "$output" =~ "40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_spanish_ci" ]] || false
+
+    run dolt diff --schema
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "CREATE DATABASE `colldb`" ]] || false
+    [[ "$output" =~ "40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_spanish_ci" ]] || false
+
+    run dolt diff --summary
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 0 ]
+
+    run dolt diff -r json
+    EXPECTED=$(cat <<'EOF'
+{"tables":[{"name":"__DATABASE__colldb","schema_diff":["ALTER DATABASE `colldb` COLLATE='utf8mb4_spanish_ci';"],"data_diff":[]}]}
+EOF
+)
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$EXPECTED" ]] || false
+
+    run dolt diff -r sql
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "ALTER DATABASE \`colldb\` COLLATE='utf8mb4_spanish_ci';" ]] || false
+}
+
 @test "diff: row, line, in-place, context diff modes" {
     # We're not using the test table, so we might as well delete it
     dolt sql <<SQL
@@ -192,6 +230,79 @@ SQL
     [[ "$output" =~ "| > | modify2 | CREATE PROCEDURE modify2() SELECT 43 |" ]] || false
 }
 
+@test "diff: reverse diff" {
+    # We're not using the test table, so we might as well delete it
+    dolt sql <<SQL
+DROP TABLE test;
+CREATE TABLE tbl (PK BIGINT PRIMARY KEY);
+INSERT INTO tbl VALUES (1), (2), (3);
+DELIMITER //
+CREATE PROCEDURE modify1() BEGIN
+DECLARE a INT DEFAULT 1;
+SELECT a
+  AS RESULT;
+END//
+CREATE PROCEDURE modify2() SELECT 42;//
+CREATE PROCEDURE remove() BEGIN
+SELECT 8;
+END//
+SQL
+    dolt add -A
+    dolt commit -m "First commit"
+    dolt branch original
+
+    dolt sql <<SQL
+DELETE FROM tbl WHERE pk = 2;
+INSERT INTO tbl VALUES (4);
+DROP PROCEDURE modify1;
+DROP PROCEDURE modify2;
+DROP PROCEDURE remove;
+DELIMITER //
+CREATE PROCEDURE modify1() BEGIN
+SELECT 2
+  AS RESULTING
+  FROM DUAL;
+END//
+CREATE PROCEDURE modify2() SELECT 43;//
+CREATE PROCEDURE adding() BEGIN
+SELECT 9;
+END//
+SQL
+    dolt add -A
+    dolt commit -m "Second commit"
+
+    # Look at the context diff
+    run dolt diff original -R
+    [ "$status" -eq 0 ]
+    echo "$output"
+    # Verify that standard diffs are still working
+    [[ "$output" =~ "|   | PK |" ]] || false
+    [[ "$output" =~ "+---+----+" ]] || false
+    [[ "$output" =~ "| - | 4  |" ]] || false
+    [[ "$output" =~ "| + | 2  |" ]] || false
+    # Check the overall stored procedure diff (excluding dates since they're variable)
+    [[ "$output" =~ "+---+---------+--------------------------------------+" ]] || false
+    [[ "$output" =~ "|   | name    | create_stmt                          |" ]] || false
+    [[ "$output" =~ "+---+---------+--------------------------------------+" ]] || false
+    [[ "$output" =~ "| - | adding  | CREATE PROCEDURE adding() BEGIN      |" ]] || false
+    [[ "$output" =~ "|   |         | SELECT 9;                            |" ]] || false
+    [[ "$output" =~ "|   |         | END                                  |" ]] || false
+    [[ "$output" =~ "| * | modify1 |  CREATE PROCEDURE modify1() BEGIN    |" ]] || false
+    [[ "$output" =~ "|   |         | -SELECT 2                            |" ]] || false
+    [[ "$output" =~ "|   |         | -  AS RESULTING                      |" ]] || false
+    [[ "$output" =~ "|   |         | -  FROM DUAL;                        |" ]] || false
+    [[ "$output" =~ "|   |         | +DECLARE a INT DEFAULT 1;            |" ]] || false
+    [[ "$output" =~ "|   |         | +SELECT a                            |" ]] || false
+    [[ "$output" =~ "|   |         | +  AS RESULT;                        |" ]] || false
+    [[ "$output" =~ "|   |         |  END                                 |" ]] || false
+    [[ "$output" =~ "| < | modify2 | CREATE PROCEDURE modify2() SELECT 43 |" ]] || false
+    [[ "$output" =~ "| > | modify2 | CREATE PROCEDURE modify2() SELECT 42 |" ]] || false
+    [[ "$output" =~ "| + | remove  | CREATE PROCEDURE remove() BEGIN      |" ]] || false
+    [[ "$output" =~ "|   |         | SELECT 8;                            |" ]] || false
+    [[ "$output" =~ "|   |         | END                                  |" ]] || false
+    [[ "$output" =~ "+---+---------+--------------------------------------+" ]] || false
+}
+
 @test "diff: clean working set" {
     dolt add .
     dolt commit -m table
@@ -262,6 +373,11 @@ SQL
 }
 
 @test "diff: two and three dot diff" {
+    # TODO: remove this once dolt checkout is migrated
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "This test relies on dolt checkout, which has not been migrated yet."
+    fi
+
     dolt checkout main
     dolt sql -q 'insert into test values (0,0,0,0,0,0)'
     dolt add .
@@ -595,7 +711,7 @@ EOF
     [[ ! "$output" =~ "+ | 0" ]] || false
 }
 
-@test "diff: new foreign key added and resolved" {
+@test "diff: new foreign key added and resolves" {
     dolt sql <<SQL
 create table parent (i int primary key);
 create table child (j int primary key, foreign key (j) references parent (i));
@@ -603,10 +719,10 @@ SQL
 
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "+  CONSTRAINT \`child_ibfk_1\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 }
 
-@test "diff: new foreign key added and not resolved" {
+@test "diff: new foreign key added without foreign key check, and does not resolve" {
     dolt sql <<SQL
 set foreign_key_checks=0;
 create table parent (i int primary key);
@@ -617,7 +733,7 @@ SQL
 
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    [[ ! "$output" =~ "+  CONSTRAINT \`child_ibfk_1\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 }
 
 @test "diff: existing foreign key that was resolved is deleted" {
@@ -627,7 +743,7 @@ create table child (j int primary key, constraint fk foreign key (j) references 
 SQL
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "+  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 
     dolt add -A
     dolt commit -m "init commit"
@@ -635,7 +751,7 @@ SQL
 
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "-  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 }
 
 @test "diff: existing foreign key that was not resolved is deleted" {
@@ -646,7 +762,7 @@ create table child (j int primary key, constraint fk foreign key (j) references 
 SQL
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "+  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 
     dolt add -A
     dolt commit -m "init commit"
@@ -654,7 +770,7 @@ SQL
 
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "-  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 }
 
 @test "diff: existing foreign key that was resolved is modified" {
@@ -664,7 +780,7 @@ create table child (j int primary key, constraint fk foreign key (j) references 
 SQL
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "+  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 
     dolt add -A
     dolt commit -m "init commit"
@@ -674,7 +790,8 @@ SQL
 
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "-  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
+    [[ "$output" =~ "+  CONSTRAINT \`fk\` FOREIGN KEY (\`k\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 }
 
 @test "diff: existing foreign key that was not resolved is modified" {
@@ -685,7 +802,7 @@ create table child (j int primary key, constraint fk foreign key (j) references 
 SQL
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "+  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
 
     dolt add -A
     dolt commit -m "init commit"
@@ -695,26 +812,40 @@ SQL
 
     run dolt diff
     [ "$status" -eq 0 ]
-    [[ "$output" =~ 'resolved foreign key' ]] || false
+    [[ "$output" =~ "-  CONSTRAINT \`fk\` FOREIGN KEY (\`j\`) REFERENCES \`parent\` (\`i\`)" ]] || false
+    [[ "$output" =~ "+  CONSTRAINT \`fk\` FOREIGN KEY (\`k\`) REFERENCES \`parent\` (\`i\`)" ]] || false
+
 }
 
-@test "diff: existing foreign key is resolved" {
+@test "diff: resolved FKs don't show up in diff results" {
     dolt sql <<SQL
-set foreign_key_checks=0;
-create table parent (i int primary key);
-create table child (j int primary key, constraint fk foreign key (j) references parent (i));
+SET @@foreign_key_checks=0;
+CREATE TABLE dept_emp (
+  emp_no int NOT NULL,
+  dept_no char(4) COLLATE utf8mb4_0900_ai_ci NOT NULL,
+  PRIMARY KEY (emp_no,dept_no),
+  KEY dept_no (dept_no),
+  CONSTRAINT dept_emp_ibfk_1 FOREIGN KEY (emp_no) REFERENCES employees (emp_no) ON DELETE CASCADE
+);
+CREATE TABLE employees (
+  emp_no int NOT NULL,
+  nickname varchar(100),
+  PRIMARY KEY (emp_no)
+);
+insert into employees values (100, "bob");
+insert into dept_emp values (100, 1);
 SQL
-    run dolt diff
-    [ "$status" -eq 0 ]
-    [[ ! "$output" =~ 'resolved foreign key' ]] || false
+    dolt commit -Am "Importing data, with unresolved FKs"
 
-    dolt add -A
-    dolt commit -m "init commit"
-    dolt sql -q "delete from parent where i = 0"
+    # update a row to trigger FKs to be resolved
+    dolt sql -q "UPDATE employees SET nickname = 'bobby' WHERE emp_no = 100;"
+    dolt commit -am "Updating data, and resolving FKs"
 
-    run dolt diff
+    # check that the diff output doesn't mention FKs getting resolved or the dept_emp table
+    run dolt diff HEAD~ HEAD
     [ "$status" -eq 0 ]
-    [[ "$output" =~ 'resolved foreign key' ]] || false
+    ! [[ "$output" =~ "dept_emp" ]] || false
+    ! [[ "$output" =~ "FOREIGN KEY" ]] || false
 }
 
 @test "diff: with index and foreign key changes" {
@@ -751,6 +882,11 @@ SQL
 }
 
 @test "diff: with where clause" {
+    # TODO: remove this once dolt checkout is migrated
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "This test relies on dolt checkout, which has not been migrated yet."
+    fi
+
     dolt sql -q "insert into test values (0, 0, 0, 0, 0, 0)"
     dolt sql -q "insert into test values (1, 1, 1, 1, 1, 1)"
     dolt add test
@@ -841,6 +977,11 @@ SQL
 }
 
 @test "diff: with where clause errors" {
+    # TODO: remove this once dolt checkout is migrated
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "This test relies on dolt checkout, which has not been migrated yet."
+    fi
+
     dolt sql -q "insert into test values (0, 0, 0, 0, 0, 0)"
     dolt sql -q "insert into test values (1, 1, 1, 1, 1, 1)"
     dolt add test
@@ -897,6 +1038,12 @@ SQL
 }
 
 @test "diff: with invalid ref does not panic" {
+    # TODO: remove this once dolt checkout is migrated
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "This test relies on dolt checkout, which has not been migrated yet."
+    fi
+
+
     dolt add .
     dolt commit -m table
     dolt checkout -b test-branch
@@ -906,43 +1053,57 @@ SQL
     FIRST_COMMIT=`dolt log | grep commit | cut -d " " -f 2 | tail -1`
     run dolt diff $FIRST_COMMIT test-branch
     [ $status -eq 0 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff main@$FIRST_COMMIT test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff ref.with.period test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
 
     run dolt diff $FIRST_COMMIT..test-branch
     [ $status -eq 0 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff main@$FIRST_COMMIT..test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff ref.with.period..test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
 
     run dolt diff $FIRST_COMMIT...test-branch
     [ $status -eq 0 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff main@$FIRST_COMMIT...test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff ref.with.period...test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
 
     run dolt diff --merge-base $FIRST_COMMIT test-branch
     [ $status -eq 0 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff --merge-base main@$FIRST_COMMIT test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
     run dolt diff --merge-base ref.with.period test-branch
     [ $status -eq 1 ]
-    [[ ! $output =~ "panic" ]]
+    [[ ! $output =~ "panic" ]] || false
+}
+
+@test "diff: binary data in sql output is hex encoded" {
+    dolt sql <<SQL
+DROP TABLE test;
+CREATE TABLE t (PK VARBINARY(100) PRIMARY KEY, c1 BINARY(3));
+INSERT INTO t VALUES (0xead543, 0x1EE4), (0x0e, NULL);
+SQL
+    dolt commit -Am "creating table t"
+
+    run dolt diff -r=sql HEAD~ HEAD
+    [ $status -eq 0 ]
+    [[ $output =~ 'INSERT INTO `t` (`PK`,`c1`) VALUES (0x0e,NULL);' ]] || false
+    [[ $output =~ 'INSERT INTO `t` (`PK`,`c1`) VALUES (0xead543,0x1ee400);' ]] || false
 }
 
 @test "diff: with foreign key and sql output" {
@@ -971,6 +1132,11 @@ SQL
 }
 
 @test "diff: table with same name on different branches with different primary key sets" {
+    # TODO: remove this once dolt checkout is migrated
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "This test relies on dolt checkout, which has not been migrated yet."
+    fi
+
     dolt branch another-branch
     dolt sql <<SQL
 CREATE TABLE a (
@@ -1143,7 +1309,6 @@ SQL
 }
 
 @test "diff: keyless sql diffs" {
-
     dolt sql -q "create table t(pk int, val int)"
     dolt add .
     dolt commit -am "cm1"
@@ -1166,10 +1331,10 @@ SQL
     dolt diff -r sql
     run dolt diff -r sql
     [ $status -eq 0 ]
-    [[ "$output" =~ 'DELETE FROM `t` WHERE `pk`=1 AND `val`=1;' ]]
-    [[ "$output" =~ 'DELETE FROM `t` WHERE `pk`=1 AND `val`=1;' ]]
-    [[ "$output" =~ 'INSERT INTO `t` (`pk`,`val`) VALUES (1,2);' ]]
-    [[ "$output" =~ 'INSERT INTO `t` (`pk`,`val`) VALUES (1,2);' ]]
+    [[ "$output" =~ 'DELETE FROM `t` WHERE `pk`=1 AND `val`=1;' ]] || false
+    [[ "$output" =~ 'DELETE FROM `t` WHERE `pk`=1 AND `val`=1;' ]] || false
+    [[ "$output" =~ 'INSERT INTO `t` (`pk`,`val`) VALUES (1,2);' ]] || false
+    [[ "$output" =~ 'INSERT INTO `t` (`pk`,`val`) VALUES (1,2);' ]] || false
     [ "${#lines[@]}" = "4" ]
 
     dolt commit -am "cm4"
@@ -1413,11 +1578,11 @@ EOF
     run dolt diff --limit 0
 
     [[ "$output" =~ "diff --dolt a/test b/test" ]] || false
-    [[ "$output" =~ "--- a/test @" ]] || false
-    [[ "$output" =~ "+++ b/test @" ]] || false
+    [[ "$output" =~ "--- a/test" ]] || false
+    [[ "$output" =~ "+++ b/test" ]] || false
     [[ "$output" =~ "diff --dolt a/test2 b/test2" ]] || false
-    [[ "$output" =~ "--- a/test2 @" ]] || false
-    [[ "$output" =~ "+++ b/test2 @" ]] || false
+    [[ "$output" =~ "--- a/test2" ]] || false
+    [[ "$output" =~ "+++ b/test2" ]] || false
 
     run dolt diff --limit
     [ "$status" -ne 0 ]
@@ -1455,7 +1620,7 @@ SQL
 +---+------+------+------+
 EOF
 )
-    [[ "$output" =~ "$EXPECTED_TABLE" ]]
+    [[ "$output" =~ "$EXPECTED_TABLE" ]] || false
 
     EXPECTED_TABLE=$(cat <<'EOF'
 +---+------+------+------+------+------+
@@ -1466,7 +1631,7 @@ EOF
 +---+------+------+------+------+------+
 EOF
 )
-    [[ "$output" =~ "$EXPECTED_TABLE" ]]
+    [[ "$output" =~ "$EXPECTED_TABLE" ]] || false
 }
 
 # This test was added to prevent short tuples from causing an empty diff.
@@ -1534,6 +1699,103 @@ SQL
     [[ "$output" =~ "-        update average_age set average = (SELECT AVG(age) FROM people);" ]] || false
     [[ "$output" =~ "-CREATE VIEW adults AS SELECT name FROM people WHERE age >= 18;"          ]] || false
     [[ "$output" =~ "+CREATE VIEW adults AS SELECT nickname FROM people WHERE age >= 18;"      ]] || false
-
 }
 
+@test "diff: get diff on dolt_schemas table with different result output formats" {
+    # TODO: remove this once dolt checkout is migrated
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "This test relies on dolt checkout, which has not been migrated yet."
+    fi
+
+    dolt add .
+    dolt commit -am "commit 1"
+    dolt sql <<SQL
+CREATE TABLE mytable(pk BIGINT PRIMARY KEY AUTO_INCREMENT, v1 BIGINT);
+CREATE TRIGGER trigger1 BEFORE INSERT ON mytable FOR EACH ROW SET new.v1 = -new.v1;
+CREATE EVENT event1 ON SCHEDULE EVERY '1:2' MINUTE_SECOND DISABLE DO INSERT INTO mytable (v1) VALUES (1);
+SQL
+
+    dolt add .
+    dolt commit -m "commit 2"
+
+    dolt sql <<SQL
+INSERT INTO mytable VALUES (1, 1);
+CREATE VIEW view1 AS SELECT v1 FROM mytable;
+DROP TRIGGER trigger1;
+CREATE TRIGGER trigger1 BEFORE INSERT ON mytable FOR EACH ROW SET new.v1 = -2*new.v1;
+DROP EVENT event1;
+CREATE EVENT event1 ON SCHEDULE EVERY '1:2' MINUTE_SECOND DISABLE DO INSERT INTO mytable (v1) VALUES (2);
+SQL
+
+    run dolt diff -r json
+    [ $status -eq 0 ]
+
+    run dolt diff
+    [ $status -eq 0 ]
+    [[ "$output" =~ "-CREATE DEFINER = \`root\`@\`localhost\` EVENT \`event1\` ON SCHEDULE EVERY '1:2' MINUTE_SECOND STARTS".*"ON COMPLETION NOT PRESERVE DISABLE DO INSERT INTO mytable (v1) VALUES (1);" ]] || false
+    [[ "$output" =~ "+CREATE DEFINER = \`root\`@\`localhost\` EVENT \`event1\` ON SCHEDULE EVERY '1:2' MINUTE_SECOND STARTS".*"ON COMPLETION NOT PRESERVE DISABLE DO INSERT INTO mytable (v1) VALUES (2);" ]] || false
+    [[ "$output" =~ "-CREATE TRIGGER trigger1 BEFORE INSERT ON mytable FOR EACH ROW SET new.v1 = -new.v1;" ]] || false
+    [[ "$output" =~ "+CREATE TRIGGER trigger1 BEFORE INSERT ON mytable FOR EACH ROW SET new.v1 = -2*new.v1;" ]] || false
+    [[ "$output" =~ "+CREATE VIEW view1 AS SELECT v1 FROM mytable;" ]] || false
+
+    run dolt diff -r sql
+    [ $status -eq 0 ]
+    [[ "$output" =~ "INSERT INTO \`mytable\` (\`pk\`,\`v1\`) VALUES (1,-1);" ]] || false
+    [[ "$output" =~ "DROP EVENT \`event1\`;" ]] || false
+    [[ "$output" =~ "CREATE DEFINER = \`root\`@\`localhost\` EVENT \`event1\` ON SCHEDULE EVERY '1:2' MINUTE_SECOND STARTS".*"ON COMPLETION NOT PRESERVE DISABLE DO INSERT INTO mytable (v1) VALUES (2);" ]] || false
+    [[ "$output" =~ "DROP TRIGGER \`trigger1\`;" ]] || false
+    [[ "$output" =~ "CREATE TRIGGER trigger1 BEFORE INSERT ON mytable FOR EACH ROW SET new.v1 = -2*new.v1;" ]] || false
+    [[ "$output" =~ "CREATE VIEW view1 AS SELECT v1 FROM mytable;" ]] || false
+}
+
+@test "diff: table-only option" {
+    dolt sql <<SQL
+create table t1 (i int);
+create table t2 (i int);
+create table t3 (i int);
+SQL
+
+    dolt add .
+    dolt commit -m "commit 1"
+
+    dolt sql <<SQL
+drop table t1;
+alter table t2 add column j int;
+insert into t3 values (1);
+create table t4 (i int);
+SQL
+
+    run dolt diff --summary
+    [ $status -eq 0 ]
+    [ "${lines[0]}" = "+------------+-----------+-------------+---------------+" ]
+    [ "${lines[1]}" = "| Table name | Diff type | Data change | Schema change |" ]
+    [ "${lines[2]}" = "+------------+-----------+-------------+---------------+" ]
+    [ "${lines[3]}" = "| t1         | dropped   | false       | true          |" ]
+    [ "${lines[4]}" = "| t2         | modified  | false       | true          |" ]
+    [ "${lines[5]}" = "| t3         | modified  | true        | false         |" ]
+    [ "${lines[6]}" = "| t4         | added     | false       | true          |" ]
+    [ "${lines[7]}" = "+------------+-----------+-------------+---------------+" ]
+
+    run dolt diff --name-only
+    [ $status -eq 0 ]
+    [ "${lines[0]}" = "t1" ]
+    [ "${lines[1]}" = "t2" ]
+    [ "${lines[2]}" = "t3" ]
+    [ "${lines[3]}" = "t4" ]
+
+    run dolt diff --name-only --schema
+    [ $status -eq 1 ]
+    [[ $output =~ "invalid Arguments" ]] || false
+
+    run dolt diff --name-only --data
+    [ $status -eq 1 ]
+    [[ $output =~ "invalid Arguments" ]] || false
+
+    run dolt diff --name-only --stat
+    [ $status -eq 1 ]
+    [[ $output =~ "invalid Arguments" ]] || false
+
+    run dolt diff --name-only --summary
+    [ $status -eq 1 ]
+    [[ $output =~ "invalid Arguments" ]] || false
+}

@@ -16,13 +16,11 @@ package merge
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/types"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
@@ -53,7 +51,9 @@ func prollyParentSecDiffFkConstraintViolations(
 	childPriKD, _ := childPriIdx.Descriptors()
 
 	var err error
-	err = prolly.DiffMaps(ctx, preParentSecIdx, postParentSecIdx, func(ctx context.Context, diff tree.Diff) error {
+	// TODO: Determine whether we should surface every row as a diff when the map's value descriptor has changed.
+	considerAllRowsModified := false
+	err = prolly.DiffMaps(ctx, preParentSecIdx, postParentSecIdx, considerAllRowsModified, func(ctx context.Context, diff tree.Diff) error {
 		switch diff.Type {
 		case tree.RemovedDiff, tree.ModifiedDiff:
 			toSecKey, hadNulls := makePartialKey(partialKB, foreignKey.ReferencedTableColumns, postParent.Index, postParent.IndexSchema, val.Tuple(diff.Key), val.Tuple(diff.From), preParentSecIdx.Pool())
@@ -106,7 +106,9 @@ func prollyParentPriDiffFkConstraintViolations(
 	childScndryIdx := durable.ProllyMapFromIndex(postChild.IndexData)
 	primaryKD, _ := childPriIdx.Descriptors()
 
-	err := prolly.DiffMaps(ctx, preParentRowData, postParentRowData, func(ctx context.Context, diff tree.Diff) error {
+	// TODO: Determine whether we should surface every row as a diff when the map's value descriptor has changed.
+	considerAllRowsModified := false
+	err := prolly.DiffMaps(ctx, preParentRowData, postParentRowData, considerAllRowsModified, func(ctx context.Context, diff tree.Diff) error {
 		switch diff.Type {
 		case tree.RemovedDiff, tree.ModifiedDiff:
 			partialKey, hadNulls := makePartialKey(partialKB, foreignKey.ReferencedTableColumns, postParent.Index, postParent.Schema, val.Tuple(diff.Key), val.Tuple(diff.From), preParentRowData.Pool())
@@ -164,7 +166,9 @@ func prollyChildPriDiffFkConstraintViolations(
 	partialDesc := idxDesc.PrefixDesc(len(foreignKey.TableColumns))
 	partialKB := val.NewTupleBuilder(partialDesc)
 
-	err := prolly.DiffMaps(ctx, preChildRowData, postChildRowData, func(ctx context.Context, diff tree.Diff) error {
+	// TODO: Determine whether we should surface every row as a diff when the map's value descriptor has changed.
+	considerAllRowsModified := false
+	err := prolly.DiffMaps(ctx, preChildRowData, postChildRowData, considerAllRowsModified, func(ctx context.Context, diff tree.Diff) error {
 		switch diff.Type {
 		case tree.AddedDiff, tree.ModifiedDiff:
 			k, v := val.Tuple(diff.Key), val.Tuple(diff.To)
@@ -212,7 +216,9 @@ func prollyChildSecDiffFkConstraintViolations(
 	childPriKD, _ := postChildRowData.Descriptors()
 	childPriKB := val.NewTupleBuilder(childPriKD)
 
-	err := prolly.DiffMaps(ctx, preChildSecIdx, postChildSecIdx, func(ctx context.Context, diff tree.Diff) error {
+	// TODO: Determine whether we should surface every row as a diff when the map's value descriptor has changed.
+	considerAllRowsModified := false
+	err := prolly.DiffMaps(ctx, preChildSecIdx, postChildSecIdx, considerAllRowsModified, func(ctx context.Context, diff tree.Diff) error {
 		switch diff.Type {
 		case tree.AddedDiff, tree.ModifiedDiff:
 			k := val.Tuple(diff.Key)
@@ -292,28 +298,6 @@ func createCVForSecIdx(
 	}
 
 	return receiver.ProllyFKViolationFound(ctx, primaryIdxKey, value)
-}
-
-func handleFkMultipleViolForRowErr(err error, kd val.TupleDesc, tblName string) error {
-	if mv, ok := err.(*prolly.ErrMergeArtifactCollision); ok {
-		var e, n FkCVMeta
-		err = json.Unmarshal(mv.ExistingInfo, &e)
-		if err != nil {
-			return err
-		}
-		err = json.Unmarshal(mv.NewInfo, &n)
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf(`%w: pk %s of table '%s' violates foreign keys '%s' and '%s'`,
-			ErrMultipleViolationsForRow,
-			kd.Format(mv.Key), tblName, getRefTblAndCols(e), getRefTblAndCols(n))
-	}
-	return err
-}
-
-func getRefTblAndCols(m FkCVMeta) string {
-	return fmt.Sprintf("%s (%s)", m.ReferencedTable, strings.Join(m.ReferencedColumns, ", "))
 }
 
 func createCVsForPartialKeyMatches(
@@ -410,42 +394,43 @@ type FkCVMeta struct {
 	Table             string   `json:"Table"`
 }
 
-func (m FkCVMeta) Unmarshall(ctx *sql.Context) (val types.JSONDocument, err error) {
-	return types.JSONDocument{Val: m}, nil
-}
+var _ sql.JSONWrapper = FkCVMeta{}
 
-func (m FkCVMeta) Compare(ctx *sql.Context, v types.JSONValue) (cmp int, err error) {
-	ours := types.JSONDocument{Val: m}
-	return ours.Compare(ctx, v)
+func (m FkCVMeta) ToInterface() (interface{}, error) {
+	return map[string]interface{}{
+		"Columns":           m.Columns,
+		"ForeignKey":        m.ForeignKey,
+		"Index":             m.Index,
+		"OnDelete":          m.OnDelete,
+		"OnUpdate":          m.OnUpdate,
+		"ReferencedColumns": m.ReferencedColumns,
+		"ReferencedIndex":   m.ReferencedIndex,
+		"ReferencedTable":   m.ReferencedTable,
+		"Table":             m.Table,
+	}, nil
 }
-
-func (m FkCVMeta) ToString(ctx *sql.Context) (string, error) {
-	return m.PrettyPrint(), nil
-}
-
-var _ types.JSONValue = FkCVMeta{}
 
 // PrettyPrint is a custom pretty print function to match the old format's
 // output which includes additional whitespace between keys, values, and array elements.
 func (m FkCVMeta) PrettyPrint() string {
 	jsonStr := fmt.Sprintf(`{`+
-		`"Columns": ["%s"], `+
-		`"ForeignKey": "%s", `+
 		`"Index": "%s", `+
+		`"Table": "%s", `+
+		`"Columns": ["%s"], `+
 		`"OnDelete": "%s", `+
 		`"OnUpdate": "%s", `+
-		`"ReferencedColumns": ["%s"], `+
+		`"ForeignKey": "%s", `+
 		`"ReferencedIndex": "%s", `+
 		`"ReferencedTable": "%s", `+
-		`"Table": "%s"}`,
-		strings.Join(m.Columns, `', '`),
-		m.ForeignKey,
+		`"ReferencedColumns": ["%s"]}`,
 		m.Index,
+		m.Table,
+		strings.Join(m.Columns, `', '`),
 		m.OnDelete,
 		m.OnUpdate,
-		strings.Join(m.ReferencedColumns, `', '`),
+		m.ForeignKey,
 		m.ReferencedIndex,
 		m.ReferencedTable,
-		m.Table)
+		strings.Join(m.ReferencedColumns, `', '`))
 	return jsonStr
 }

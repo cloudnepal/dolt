@@ -15,31 +15,42 @@
 package sqlserver
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/dolthub/go-mysql-server/server"
 )
 
-var mySQLServer *server.Server
-var mySQLServerMutex sync.Mutex
+var theServer *server.Server
+var mutex sync.Mutex
 
 // RunningInServerMode returns true if the current process is running a SQL server.
 func RunningInServerMode() bool {
-	mySQLServerMutex.Lock()
-	defer mySQLServerMutex.Unlock()
-	return mySQLServer != nil
+	mutex.Lock()
+	defer mutex.Unlock()
+	return theServer != nil
 }
 
 // GetRunningServer returns the Server instance running in this process, or nil if no SQL server is running.
 func GetRunningServer() *server.Server {
-	mySQLServerMutex.Lock()
-	defer mySQLServerMutex.Unlock()
-	return mySQLServer
+	mutex.Lock()
+	defer mutex.Unlock()
+	return theServer
 }
 
 // SetRunningServer sets the specified Server as the running SQL server for this process.
-func SetRunningServer(server *server.Server) {
-	mySQLServerMutex.Lock()
-	defer mySQLServerMutex.Unlock()
-	mySQLServer = server
+func SetRunningServer(server *server.Server) error {
+	if server == nil {
+		return fmt.Errorf("server must be non-nil")
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	theServer = server
+	return nil
+}
+
+func UnsetRunningServer() {
+	mutex.Lock()
+	defer mutex.Unlock()
+	theServer = nil
 }

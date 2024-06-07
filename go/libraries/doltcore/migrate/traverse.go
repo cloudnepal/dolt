@@ -61,7 +61,14 @@ func TraverseDAG(ctx context.Context, menv Environment, old, new *doltdb.DoltDB)
 	if err = persistMigratedCommitMapping(ctx, new, m); err != nil {
 		return err
 	}
-	return nil
+
+	if err = old.Close(); err != nil {
+		return err
+	}
+	if err = new.Close(); err != nil {
+		return err
+	}
+	return
 }
 
 func traverseRefHistory(ctx context.Context, menv Environment, r ref.DoltRef, old, new *doltdb.DoltDB, prog *progress) error {
@@ -129,10 +136,15 @@ func traverseTagHistory(ctx context.Context, menv Environment, r ref.TagRef, old
 	if err != nil {
 		return err
 	}
-	cm, err := new.ReadCommit(ctx, newHash)
+	optCmt, err := new.ReadCommit(ctx, newHash)
 	if err != nil {
 		return err
 	}
+	cm, ok := optCmt.ToCommit()
+	if !ok {
+		return doltdb.ErrGhostCommitEncountered
+	}
+
 	return new.NewTagAtCommit(ctx, r, cm, t.Meta)
 }
 
@@ -176,9 +188,13 @@ func traverseCommitHistory(ctx context.Context, menv Environment, cm *doltdb.Com
 		if err = prog.Push(ctx, cm); err != nil {
 			return err
 		}
-		cm, err = cm.GetParent(ctx, idx)
+		optCmt, err := cm.GetParent(ctx, idx)
 		if err != nil {
 			return err
+		}
+		cm, ok = optCmt.ToCommit()
+		if !ok {
+			return doltdb.ErrGhostCommitEncountered
 		}
 	}
 }

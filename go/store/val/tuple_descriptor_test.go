@@ -23,7 +23,7 @@ import (
 
 func TestTupleDescriptorSize(t *testing.T) {
 	sz := unsafe.Sizeof(TupleDesc{})
-	assert.Equal(t, 64, int(sz))
+	assert.Equal(t, 88, int(sz))
 }
 
 func TestTupleDescriptorAddressTypes(t *testing.T) {
@@ -32,10 +32,11 @@ func TestTupleDescriptorAddressTypes(t *testing.T) {
 		{Enc: CommitAddrEnc},
 		{Enc: StringAddrEnc},
 		{Enc: JSONAddrEnc},
+		{Enc: GeomAddrEnc},
 	}
 	td := NewTupleDescriptor(types...)
 
-	assert.Equal(t, 4, td.AddressFieldCount())
+	assert.Equal(t, 5, td.AddressFieldCount())
 	IterAddressFields(td, func(i int, typ Type) {
 		assert.Equal(t, types[i], typ)
 	})

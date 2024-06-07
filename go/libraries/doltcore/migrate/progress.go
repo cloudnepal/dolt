@@ -182,7 +182,7 @@ func persistMigratedCommitMapping(ctx context.Context, ddb *doltdb.DoltDB, mappi
 	}
 
 	br := ref.NewBranchRef(MigratedCommitsBranch)
-	err = ddb.NewBranchAtCommit(ctx, br, init)
+	err = ddb.NewBranchAtCommit(ctx, br, init, nil)
 	if err != nil {
 		return err
 	}
@@ -241,7 +241,7 @@ func persistMigratedCommitMapping(ctx context.Context, ddb *doltdb.DoltDB, mappi
 		return err
 	}
 
-	root, err = root.PutTable(ctx, MigratedCommitsTable, tbl)
+	root, err = root.PutTable(ctx, doltdb.TableName{Name: MigratedCommitsTable}, tbl)
 	if err != nil {
 		return err
 	}
@@ -253,7 +253,7 @@ func commitRoot(
 	ctx context.Context,
 	ddb *doltdb.DoltDB,
 	br ref.BranchRef,
-	root *doltdb.RootValue,
+	root doltdb.RootValue,
 	parent *doltdb.Commit,
 ) error {
 	roots := doltdb.Roots{
@@ -298,6 +298,6 @@ func commitRoot(
 		Name:      meta.Name,
 		Email:     meta.Email,
 		Timestamp: uint64(time.Now().Unix()),
-	})
+	}, nil)
 	return err
 }

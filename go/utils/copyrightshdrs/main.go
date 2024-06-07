@@ -23,7 +23,7 @@ import (
 	"strings"
 )
 
-var ExpectedHeader = regexp.MustCompile(`// Copyright (2019|2020|2021|2022|2023|2019-2020|2019-2021|2019-2022|2019-2023|2020-2021|2020-2022|2020-2023|2021-2022|2021-2023|2022-2023) Dolthub, Inc.
+var ExpectedHeader = regexp.MustCompile(`// Copyright (2019|2020|2021|2022|2023|2024|2019-2020|2019-2021|2019-2022|2019-2023|2019-2024|2020-2021|2020-2022|2020-2023|2020-2024|2021-2022|2021-2023|2021-2024|2022-2023|2022-2024|2023-2024) Dolthub, Inc.
 //
 // Licensed under the Apache License, Version 2.0 \(the "License"\);
 // you may not use this file except in compliance with the License.
@@ -178,8 +178,6 @@ var CopiedNomsFiles []CopiedNomsFile = []CopiedNomsFile{
 	{Path: "store/nbs/dynamo_fake_test.go", NomsPath: "go/nbs/dynamo_fake_test.go", HadCopyrightNotice: true},
 	{Path: "store/nbs/dynamo_manifest.go", NomsPath: "go/nbs/dynamo_manifest.go", HadCopyrightNotice: true},
 	{Path: "store/nbs/dynamo_manifest_test.go", NomsPath: "go/nbs/dynamo_manifest_test.go", HadCopyrightNotice: true},
-	{Path: "store/nbs/dynamo_table_reader.go", NomsPath: "go/nbs/dynamo_table_reader.go", HadCopyrightNotice: true},
-	{Path: "store/nbs/dynamo_table_reader_test.go", NomsPath: "go/nbs/dynamo_table_reader_test.go", HadCopyrightNotice: true},
 	{Path: "store/nbs/file_manifest.go", NomsPath: "go/nbs/file_manifest.go", HadCopyrightNotice: true},
 	{Path: "store/nbs/file_manifest_test.go", NomsPath: "go/nbs/file_manifest_test.go", HadCopyrightNotice: true},
 	{Path: "store/nbs/file_table_persister.go", NomsPath: "go/nbs/file_table_persister.go", HadCopyrightNotice: true},
@@ -219,7 +217,6 @@ var CopiedNomsFiles []CopiedNomsFile = []CopiedNomsFile{
 	{Path: "store/sloppy/sloppy_test.go", NomsPath: "go/sloppy/sloppy_test.go", HadCopyrightNotice: true},
 	{Path: "store/spec/absolute_path.go", NomsPath: "go/spec/absolute_path.go", HadCopyrightNotice: true},
 	{Path: "store/spec/absolute_path_test.go", NomsPath: "go/spec/absolute_path_test.go", HadCopyrightNotice: true},
-	{Path: "store/spec/commit_meta.go", NomsPath: "go/spec/commit_meta.go", HadCopyrightNotice: true},
 	{Path: "store/spec/spec.go", NomsPath: "go/spec/spec.go", HadCopyrightNotice: true},
 	{Path: "store/spec/spec_test.go", NomsPath: "go/spec/spec_test.go", HadCopyrightNotice: true},
 	{Path: "store/spec/util.go", NomsPath: "go/spec/util.go", HadCopyrightNotice: true},

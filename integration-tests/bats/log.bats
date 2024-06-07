@@ -12,11 +12,28 @@ teardown() {
 
 @test "log: on initialized repo" {
     run dolt log
-    [ "$status" -eq "0" ]
+    [ "$status" -eq 0 ]
     [[ "$output" =~ "Initialize data repository" ]] || false
 }
 
+@test "log: basic log" {
+    dolt sql -q "create table testtable (pk int PRIMARY KEY)"
+    dolt add .
+    dolt commit -m "commit 1"
+    dolt commit	--allow-empty -m "commit 2"
+    dolt commit	--allow-empty -m "commit 3"
+    run dolt log
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "commit 1" ]] || false
+    [[ "$output" =~ "commit 2" ]] || false
+    [[ "$output" =~ "commit 3" ]] || false
+}
+
 @test "log: log respects branches" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt branch branch1
     dolt commit --allow-empty -m "commit 1 MAIN"
     dolt commit	--allow-empty -m "commit 2 MAIN"
@@ -41,6 +58,10 @@ teardown() {
 }
 
 @test "log: two and three dot log" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt sql -q "create table testtable (pk int PRIMARY KEY)"
     dolt add .
     dolt commit -m "commit 1 MAIN"
@@ -201,18 +222,6 @@ teardown() {
     [[ "$output" =~ "BRANCHB" ]] || false
 
     # Invalid
-    run dolt log main..branchA testtable
-    [ $status -eq 1 ]
-    run dolt log testtable main..branchA 
-    [ $status -eq 1 ]
-    run dolt log main...branchA testtable
-    [ $status -eq 1 ]
-    run dolt log testtable main...branchA 
-    [ $status -eq 1 ]
-    run dolt log ^main branchA testtable
-    [ $status -eq 1 ]
-    run dolt log branchA testtable --not main
-    [ $status -eq 1 ]
     run dolt log main..branchA main
     [ $status -eq 1 ]
      run dolt log main main..branchA
@@ -221,11 +230,7 @@ teardown() {
     [ $status -eq 1 ]
      run dolt log main main...branchA
     [ $status -eq 1 ]
-    run dolt log ^main testtable
-    [ $status -eq 1 ]
     run dolt log testtable ^main
-    [ $status -eq 1 ]
-    run dolt log ^branchA --not main
     [ $status -eq 1 ]
     run dolt log main..branchA --not main
     [ $status -eq 1 ]
@@ -238,6 +243,10 @@ teardown() {
 }
 
 @test "log: branch name and table name are the same" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt commit --allow-empty -m "commit 1 MAIN"
     dolt commit	--allow-empty -m "commit 2 MAIN"
     dolt checkout -b myname
@@ -246,6 +255,13 @@ teardown() {
     dolt commit -m "commit 1 BRANCH1"
     dolt commit --allow-empty -m "commit 2 BRANCH1"
     dolt commit --allow-empty -m "commit 3 BRANCH1"
+    dolt checkout main
+    dolt sql -q "create table main (pk int PRIMARY KEY)"
+    dolt add .
+    dolt commit -m "commit 3 MAIN"
+    dolt checkout -b newBranch
+    dolt commit --allow-empty -m "commit 2 BRANCH2"
+    dolt checkout myname
 
     # Should default to branch name if one argument provided
     run dolt log myname
@@ -254,14 +270,80 @@ teardown() {
     [[ "$output" =~ "BRANCH1" ]] || false
 
     # Should default to first argument as branch name, second argument as table name (if table exists) if two arguments provided
-    run dolt log myname myname 
+    run dolt log myname myname
     [ $status -eq 0 ]
     [[ ! "$output" =~ "MAIN" ]] || false
     [[ "$output" =~ "BRANCH1" ]] || false
 
     # Table main does not exist
+    run dolt log main -- main
+    [ $status -eq 0 ]
+
+    # Table main exists on different branch
     run dolt log main main
+    [ $status -eq 0 ]
+    [[ "$output" =~ "MAIN" ]] || false
+    [[ ! "$output" =~ "BRANCH1" ]] || false
+
+    run dolt log newBranch newBranch
     [ $status -eq 1 ]
+    [[ "$output" =~ "error: table newBranch does not exist" ]] || false
+}
+
+@test "log: branch with multiple tables" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
+    dolt sql -q "create table test (pk int PRIMARY KEY)"
+    dolt add .
+    dolt commit -m "created table test"
+    dolt sql -q "create table test2 (pk int PRIMARY KEY)"
+    dolt add .
+    dolt commit -m "created table test2"
+    dolt checkout -b b1
+    dolt sql -q "insert into test values (0)"
+    dolt add .
+    dolt commit -m "inserted 0 into test"
+    dolt sql -q "create table test3 (pk int PRIMARY KEY)"
+    dolt add .
+    dolt commit -m "created table test3"
+    dolt checkout -b b2
+    dolt sql -q "insert into test2 values (1)"
+    dolt add .
+    dolt commit -m "inserted 1 into test2"
+    dolt sql -q "create table test4 (pk int PRIMARY KEY)"
+    dolt add .
+    dolt commit -m "created table test4"
+
+    run dolt log b1 test
+    [ $status -eq 0 ]
+    [[ "$output" =~ "created table test" ]] || false
+    [[ "$output" =~ "inserted 0 into test" ]] || false
+    [[ ! "$output" =~ "created table test2" ]] || false
+    [[ ! "$output" =~ "created table test3" ]] || false
+    [[ ! "$output" =~ "created table test4" ]] || false
+
+    run dolt log b1 test test2
+    [ $status -eq 0 ]
+    [[ "$output" =~ "created table test" ]] || false
+    [[ "$output" =~ "created table test2" ]] || false
+    [[ "$output" =~ "inserted 0 into test" ]] || false
+    [[ ! "$output" =~ "created table test3" ]] || false
+    [[ ! "$output" =~ "created table test4" ]] || false
+
+    run dolt log b2 b1 test test2
+    [ $status -eq 0 ]
+    [[ "$output" =~ "created table test" ]] || false
+    [[ "$output" =~ "created table test2" ]] || false
+    [[ "$output" =~ "inserted 0 into test" ]] || false
+    [[ "$output" =~ "inserted 1 into test2" ]] || false
+    [[ ! "$output" =~ "created table test3" ]] || false
+    [[ ! "$output" =~ "created table test4" ]] || false
+
+    run dolt log b2 test b1 test2
+    [ $status -eq 1 ]
+    [[ "$output" =~ "error: table b1 does not exist" ]] || false
 }
 
 @test "log: with -n specified" {
@@ -279,6 +361,10 @@ teardown() {
 }
 
 @test "log: on fast-forward merge commits" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt sql -q	"create table test (pk int, c1 int, primary key(pk))"
     dolt add test
     dolt commit -m "Commit1"
@@ -297,6 +383,10 @@ teardown() {
 }
 
 @test "log: properly orders merge commits" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt sql -q "create table test (pk int, c1 int, primary key(pk))"
     dolt add test
     dolt commit -m "Commit1"
@@ -341,7 +431,7 @@ teardown() {
 
 @test "log: Properly throws an error when neither a valid commit hash nor a valid table are passed" {
     run dolt log notvalid
-    [ "$status" -eq "1" ]
+    [ "$status" -eq 1 ]
     [[ "$output" =~ "error: table notvalid does not exist" ]] || false
 }
 
@@ -402,7 +492,7 @@ teardown() {
     dolt commit -am "fourth commit"
 
     # Validate we only look at the right commits
-    run dolt log test -n 1
+    run dolt log -n 1 test
     [ $status -eq 0 ]
     [[ "$output" =~ "second commit" ]] || false
     [[ ! "$output" =~ "first commit" ]] || false
@@ -410,7 +500,7 @@ teardown() {
     [[ ! "$output" =~ "third commit" ]] || false
     [[ ! "$output" =~ "fourth commit" ]] || false
 
-    run dolt log test -n 100
+    run dolt log -n 100 test
     [ $status -eq 0 ]
     [[ "$output" =~ "second commit" ]] || false
     [[ "$output" =~ "first commit" ]] || false
@@ -420,6 +510,10 @@ teardown() {
 }
 
 @test "log: Log on a table works with merge commits" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt sql -q "create table test (pk int, c1 int, primary key(pk))"
     dolt add test
     dolt commit -m "Commit1"
@@ -439,7 +533,7 @@ teardown() {
     [[ "$output" =~ "Commit3" ]] || false
     [[ ! "$output" =~ "Initialize data repository" ]] || false
     [[ ! "$output" =~ "Merge:" ]] || false
-    [[ ! "$output" =~ "Commit2" ]]
+    [[ ! "$output" =~ "Commit2" ]] || false
 
     dolt add test
     dolt commit -m "MergeCommit"
@@ -455,6 +549,10 @@ teardown() {
 }
 
 @test "log: dolt log with ref and table" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt sql -q "create table test (pk int, c1 int, primary key(pk))"
     dolt add test
     dolt commit -m "Commit1"
@@ -483,6 +581,9 @@ teardown() {
     [ $status -eq 1 ]
     [[ "$output" =~ "error: table test does not exist" ]] || false
 
+    run dolt log -- test
+    [ $status -eq 0 ]
+
     dolt sql -q "create table test (pk int, c1 int, primary key(pk))"
     dolt add test
     dolt commit -m "Commit3"
@@ -494,6 +595,10 @@ teardown() {
 }
 
 @test "log: --merges, --parents, --min-parents option" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
     dolt sql -q "create table test (pk int, c1 int, primary key(pk))"
     dolt add -A
     dolt commit -m "Created table"
@@ -542,9 +647,9 @@ teardown() {
     dolt commit --allow-empty -m "a message 1"
     dolt commit --allow-empty -m "a message 2"
     run dolt log --oneline
-    [[ !("$output" =~ "Author") ]] || false
-    [[ !("$output" =~ "Date") ]] || false
-    [[ !("$output" =~ "commit") ]] || false
+    [[ ! "$output" =~ "Author" ]] || false
+    [[ ! "$output" =~ "Date" ]] || false
+    [[ ! "$output" =~ "commit" ]] || false
     res=$(dolt log --oneline | wc -l)
     [ "$res" -eq 3 ] # don't forget initial commit
     dolt commit --allow-empty -m "a message 3"
@@ -560,8 +665,8 @@ teardown() {
     [[ "$output" =~ "Date" ]] || false
     [[ "$output" =~ "main" ]] || false
     [[ "$output" =~ "tag: tag_v0" ]] || false
-    [[ !("$output" =~ "/refs/heads/") ]] || false
-    [[ !("$output" =~ "/refs/tags/") ]] || false
+    [[ ! "$output" =~ "/refs/heads/" ]] || false
+    [[ ! "$output" =~ "/refs/tags/" ]] || false
 }
 
 @test "log: --decorate=full shows full branches and tags" {
@@ -580,17 +685,17 @@ teardown() {
     [[ "$output" =~ "commit" ]] || false
     [[ "$output" =~ "Author" ]] || false
     [[ "$output" =~ "Date" ]] || false
-    [[ !("$output" =~ "main") ]] || false
-    [[ !("$output" =~ "tag_v0") ]] || false
+    [[ ! "$output" =~ "main" ]] || false
+    [[ ! "$output" =~ "tag_v0" ]] || false
 }
 
 @test "log: decorate and oneline work together" {
     dolt commit --allow-empty -m "a message 1"
     dolt commit --allow-empty -m "a message 2"
     run dolt log --oneline --decorate=full
-    [[ !("$output" =~ "commit") ]] || false
-    [[ !("$output" =~ "Author") ]] || false
-    [[ !("$output" =~ "Date") ]] || false
+    [[ ! "$output" =~ "commit" ]] || false
+    [[ ! "$output" =~ "Author" ]] || false
+    [[ ! "$output" =~ "Date" ]] || false
     [[ "$output" =~ "refs/heads/main" ]] || false
     res=$(dolt log --oneline --decorate=full | wc -l)
     [ "$res" -eq 3 ] # don't forget initial commit
@@ -602,9 +707,10 @@ teardown() {
 @test "log: --decorate=notanoption throws error" {
     run dolt log --decorate=notanoption
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "fatal: invalid --decorate option" ]] || false
+    [[ "$output" =~ "invalid --decorate option" ]] || false
 }
 
+# bats test_tags=no_lambda
 @test "log: check pager" {
     skiponwindows "Need to install expect and make this script work on windows."
     dolt commit --allow-empty -m "commit 1"
@@ -631,4 +737,92 @@ teardown() {
 @test "log: string formatting characters are escaped" {
     run dolt commit --allow-empty -m "% should be escaped"
     [[ "$output" =~ "% should be escaped" ]] || false
+}
+
+@test "log: identify HEAD" {
+    dolt commit --allow-empty -m "commit 1"
+    dolt tag commit1
+    dolt commit --allow-empty -m "commit 2"
+    dolt tag commit2
+    run dolt log commit1
+    [[ ! "$output" =~ "HEAD" ]] || false
+    run dolt log commit2
+    [[ "$output" =~ "HEAD" ]] || false
+}
+
+@test "log: --stat shows diffstat" {
+    dolt sql -q "create table test (pk int primary key, c int)"
+    dolt commit -Am "create table test"
+    run dolt log --stat head -n=1
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "test added" ]] || false
+
+    dolt sql -q "insert into test values (1,1)"
+    dolt commit -Am "insert into test"
+    run dolt log --stat head -n=1
+    [ "$status" -eq 0 ]
+    out=$(echo "$output" | sed -E 's/\x1b\[[0-9;]*m//g') # remove special characters for color
+    [[ "$out" =~ " test | 1 +" ]] || false
+    [[ "$out" =~ " 1 tables changed, 1 rows added(+), 0 rows modified(*), 0 rows deleted(-)" ]] || false
+
+    dolt sql -q "update test set c = 2 where pk = 1"
+    dolt commit -Am "update test"
+    run dolt log --stat head -n=1
+    [ "$status" -eq 0 ]
+    out=$(echo "$output" | sed -E 's/\x1b\[[0-9;]*m//g') # remove special characters for color
+    [[ "$out" =~ " test | 1 *" ]] || false
+    [[ "$out" =~ " 1 tables changed, 0 rows added(+), 1 rows modified(*), 0 rows deleted(-)" ]] || false
+
+    dolt sql -q "delete from test where pk = 1"
+    dolt commit -Am "delete from test"
+    run dolt log --stat head -n=1
+    [ "$status" -eq 0 ]
+    out=$(echo "$output" | sed -E 's/\x1b\[[0-9;]*m//g') # remove special characters for color
+    [[ "$out" =~ " test | 1 -" ]] || false
+    [[ "$out" =~ " 1 tables changed, 0 rows added(+), 0 rows modified(*), 1 rows deleted(-)" ]] || false
+
+    dolt sql -q "drop table test"
+    dolt commit -Am "drop table test"
+    run dolt log --stat head -n=1
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ " test deleted" ]] || false
+}
+
+@test "log: --stat works with --oneline" {
+    dolt sql -q "create table test (pk int primary key, c int)"
+    dolt commit -Am "create table test"
+    dolt sql -q "insert into test values (1,1)"
+    dolt commit -Am "insert into test"
+
+    run dolt log --stat --oneline
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 6 ]
+    l1=$(echo "${lines[1]}" | sed -E 's/\x1b\[[0-9;]*m//g') # remove special characters for color
+    [[ "$l1" =~ " test | 1 +" ]] || false
+    l2=$(echo "${lines[2]}" | sed -E 's/\x1b\[[0-9;]*m//g') # remove special characters for color
+    [[ "$output" =~ " 1 tables changed, 1 rows added(+), 0 rows modified(*), 0 rows deleted(-)" ]] || false
+    l3=$(echo "${lines[4]}" | sed -E 's/\x1b\[[0-9;]*m//g') # remove special characters for color
+    [[ "$l3" =~ " test added" ]] || false
+}
+
+@test "log: --stat doesn't print diffstat for merge commits" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "needs checkout which is unsupported for remote-engine"
+    fi
+
+    dolt sql -q "create table test (pk int primary key, c int)"
+    dolt commit -Am "create table test"
+    dolt branch branch1
+    dolt sql -q "insert into test values (1,1)"
+    dolt commit -Am "insert into test"
+    dolt checkout branch1
+    dolt sql -q "insert into test values (2,2)"
+    dolt commit -Am "insert into test"
+    dolt merge main -m "merge main"
+
+    run dolt log --stat head -n=1
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "test" ]] || false
+    [[ "$output" =~ "merge main" ]] || false
+    [ "${#lines[@]}" -eq 5 ]
 }

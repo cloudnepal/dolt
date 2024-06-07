@@ -55,9 +55,9 @@ type WritableFS interface {
 	// append only to that new file. If file exists, it will append to existing file.
 	OpenForWriteAppend(fp string, perm os.FileMode) (io.WriteCloser, error)
 
-	// WriteFile writes the entire data buffer to a given file.  The file will be created if it does not exist,
-	// and if it does exist it will be overwritten.
-	WriteFile(fp string, data []byte) error
+	// WriteFileWithPerms writes the entire data buffer to a given file.  The file will be created if it does not exist,
+	// and if it does exist it will be overwritten. WriteFile attempts to write the file atomically and durably.
+	WriteFile(fp string, data []byte, perm os.FileMode) error
 
 	// MkDirs creates a folder and all the parent folders that are necessary to create it.
 	MkDirs(path string) error
@@ -71,6 +71,11 @@ type WritableFS interface {
 
 	// MoveFile will move a file from the srcPath in the filesystem to the destPath
 	MoveFile(srcPath, destPath string) error
+
+	// MoveDir will move a directory from the srcPath in the filesystem to the destPath. For example,
+	// MoveDir("foo", "bar/baz") will move the "foo" directory to "bar/baz", meaning the contents of "foo" are now
+	// directly under the "baz" directory. All subdirectories on |destPath| must already exist before MoveDir is called.
+	MoveDir(srcPath, destPath string) error
 
 	// TempDir returns the path of a new temporary directory.
 	TempDir() string

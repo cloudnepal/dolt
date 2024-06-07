@@ -24,10 +24,11 @@ table WorkingSet {
   timestamp_millis:uint64;
 
   merge_state:MergeState;
+  rebase_state:RebaseState;
 }
 
 table MergeState {
-  // An address for the the working root value before the merge started.
+  // An address for the working root value before the merge started.
   pre_working_root_addr:[ubyte] (required);
 
   // The commit that we are merging.
@@ -36,6 +37,21 @@ table MergeState {
   // The spec that was used to identify the commit that we are merging. Optional
   // for backwards compatibility.
   from_commit_spec_str:string;
+
+  unmergable_tables:[string];
+
+  is_cherry_pick:bool;
+}
+
+table RebaseState {
+  // The address of the working root value before the rebase started.
+  pre_working_root_addr:[ubyte] (required);
+
+  // The branch being rebased.
+  branch:[ubyte] (required);
+
+  // The commit that we are rebasing onto.
+  onto_commit_addr:[ubyte] (required);
 }
 
 // KEEP THIS IN SYNC WITH fileidentifiers.go

@@ -69,7 +69,6 @@ SQL
 }
 
 @test "garbage_collection: call GC in sql script" {
-    export DOLT_ENABLE_GC_PROCEDURE="true"
     dolt sql <<SQL
 CREATE TABLE t (pk int primary key);
 INSERT INTO t VALUES (1),(2),(3);
@@ -196,41 +195,47 @@ setup_merge_with_cv() {
 
 @test "garbage_collection: leave conflicts" {
     setup_merge
-    dolt merge other -m "merge"
+    run dolt merge other -m "merge"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "CONFLICT (content):" ]] || false
 
     run dolt sql -r csv -q "select base_pk, base_c0, our_pk, our_c0, their_pk, their_c0 from dolt_conflicts_test;"
     [ $status -eq 0 ]
-    [[ "$output" =~ ",,0,10,0,20" ]]
-    [[ "$output" =~ ",,1,11,1,21" ]]
-    [[ "$output" =~ ",,2,12,2,22" ]]
+    [[ "$output" =~ ",,0,10,0,20" ]] || false
+    [[ "$output" =~ ",,1,11,1,21" ]] || false
+    [[ "$output" =~ ",,2,12,2,22" ]] || false
 
     dolt gc
 
     run dolt sql -r csv -q "select base_pk, base_c0, our_pk, our_c0, their_pk, their_c0 from dolt_conflicts_test;"
     [ $status -eq 0 ]
-    [[ "$output" =~ ",,0,10,0,20" ]]
-    [[ "$output" =~ ",,1,11,1,21" ]]
-    [[ "$output" =~ ",,2,12,2,22" ]]
+    [[ "$output" =~ ",,0,10,0,20" ]] || false
+    [[ "$output" =~ ",,1,11,1,21" ]] || false
+    [[ "$output" =~ ",,2,12,2,22" ]] || false
 }
 
 @test "garbage_collection: leave constraint violations" {
     setup_merge_with_cv
-    dolt merge other -m "merge"
+    run dolt merge other -m "merge"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "CONSTRAINT VIOLATION (content):" ]] || false
 
     run dolt sql -r csv -q "select pk, fk from dolt_constraint_violations_child;"
     [ $status -eq 0 ]
-    [[ "$output" =~ "1,1" ]]
+    [[ "$output" =~ "1,1" ]] || false
 
     dolt gc
 
     run dolt sql -r csv -q "select pk, fk from dolt_constraint_violations_child;"
     [ $status -eq 0 ]
-    [[ "$output" =~ "1,1" ]]
+    [[ "$output" =~ "1,1" ]] || false
 }
 
 @test "garbage_collection: leave merge commit" {
     setup_merge
-    dolt merge other -m "merge"
+    run dolt merge other -m "merge"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "CONFLICT (content):" ]] || false
 
     dolt gc
 
@@ -247,7 +252,9 @@ setup_merge_with_cv() {
 
 @test "garbage_collection: leave merge commit with stored procedure" {
     setup_merge
-    dolt merge other -m "merge"
+    run dolt merge other -m "merge"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "CONFLICT (content):" ]] || false
 
     dolt gc
 
@@ -268,7 +275,9 @@ setup_merge_with_cv() {
     # make a dirty working set with table quiz
     dolt sql -q "INSERT INTO quiz VALUES (9,99)"
 
-    dolt merge other -m "merge"
+    run dolt merge other -m "merge"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "CONFLICT (content):" ]] || false
     dolt gc
     run dolt merge --abort
     [ "$status" -eq 0 ]

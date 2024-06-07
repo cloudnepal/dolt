@@ -22,11 +22,8 @@
 package nbs
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha512"
-	"encoding/base32"
-	"encoding/binary"
 	"hash/crc32"
 	"io"
 
@@ -119,13 +116,11 @@ import (
   - Take the Ordinal discovered in Phase one
   - Calculate the Offset of your desired Chunk Record: Sum(Lengths[0]...Lengths[Ordinal-1])
   - Load Lengths[Ordinal] bytes from Table[Offset]
-  - Check the first 4 bytes of the loaded data against the last 4 bytes of your desired Hash. They should match, and the rest of the data is your Chunk data.
+  - Verify that the CRC of the loaded bytes matches the CRC stored in the Chunk Record.
+
 */
 
 const (
-	addrSize        = 20
-	addrPrefixSize  = 8
-	addrSuffixSize  = addrSize - addrPrefixSize
 	uint64Size      = 8
 	uint32Size      = 4
 	ordinalSize     = uint32Size
@@ -134,9 +129,12 @@ const (
 	magicNumber     = "\xff\xb5\xd8\xc2\x24\x63\xee\x50"
 	magicNumberSize = 8 //len(magicNumber)
 	footerSize      = uint32Size + uint64Size + magicNumberSize
-	prefixTupleSize = addrPrefixSize + ordinalSize
+	prefixTupleSize = hash.PrefixLen + ordinalSize
 	checksumSize    = uint32Size
 	maxChunkSize    = 0xffffffff // Snappy won't compress slices bigger than this
+
+	doltMagicNumber = "DOLTARC" // NBS doesn't support this, but we want to give a reasonable error message if one is encountered.
+	doltMagicSize   = 7         // len(doltMagicNumber)
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
@@ -145,50 +143,15 @@ func crc(b []byte) uint32 {
 	return crc32.Update(0, crcTable, b)
 }
 
-func computeAddrDefault(data []byte) addr {
+func computeHashDefault(data []byte) hash.Hash {
 	r := sha512.Sum512(data)
-	h := addr{}
-	copy(h[:], r[:addrSize])
-	return h
+	return hash.New(r[:hash.ByteLen])
 }
 
-var computeAddr = computeAddrDefault
-
-type addr [addrSize]byte
-
-var encoding = base32.NewEncoding("0123456789abcdefghijklmnopqrstuv")
-
-func (a addr) String() string {
-	return encoding.EncodeToString(a[:])
-}
-
-func (a addr) Prefix() uint64 {
-	return binary.BigEndian.Uint64(a[:])
-}
-
-func (a addr) Suffix() []byte {
-	return a[addrPrefixSize:]
-}
-
-func parseAddr(str string) (addr, error) {
-	var h addr
-	_, err := encoding.Decode(h[:], []byte(str))
-	return h, err
-}
-
-func ValidateAddr(s string) bool {
-	_, err := encoding.DecodeString(s)
-	return err == nil
-}
-
-type addrSlice []addr
-
-func (hs addrSlice) Len() int           { return len(hs) }
-func (hs addrSlice) Less(i, j int) bool { return bytes.Compare(hs[i][:], hs[j][:]) < 0 }
-func (hs addrSlice) Swap(i, j int)      { hs[i], hs[j] = hs[j], hs[i] }
+var computeAddr = computeHashDefault
 
 type hasRecord struct {
-	a      *addr
+	a      *hash.Hash
 	prefix uint64
 	order  int
 	has    bool
@@ -207,7 +170,7 @@ func (hs hasRecordByOrder) Less(i, j int) bool { return hs[i].order < hs[j].orde
 func (hs hasRecordByOrder) Swap(i, j int)      { hs[i], hs[j] = hs[j], hs[i] }
 
 type getRecord struct {
-	a      *addr
+	a      *hash.Hash
 	prefix uint64
 	found  bool
 }
@@ -219,21 +182,21 @@ func (hs getRecordByPrefix) Less(i, j int) bool { return hs[i].prefix < hs[j].pr
 func (hs getRecordByPrefix) Swap(i, j int)      { hs[i], hs[j] = hs[j], hs[i] }
 
 type extractRecord struct {
-	a    addr
+	a    hash.Hash
 	data []byte
 	err  error
 }
 
 type chunkReader interface {
 	// has returns true if a chunk with addr |h| is present.
-	has(h addr) (bool, error)
+	has(h hash.Hash) (bool, error)
 
 	// hasMany sets hasRecord.has to true for each present hasRecord query, it returns
 	// true if any hasRecord query was not found in this chunkReader.
 	hasMany(addrs []hasRecord) (bool, error)
 
 	// get returns the chunk data for a chunk with addr |h| if present, and nil otherwise.
-	get(ctx context.Context, h addr, stats *Stats) ([]byte, error)
+	get(ctx context.Context, h hash.Hash, stats *Stats) ([]byte, error)
 
 	// getMany sets getRecord.found to true, and calls |found| for each present getRecord query.
 	// It returns true if any getRecord query was not found in this chunkReader.
@@ -257,7 +220,7 @@ type chunkSource interface {
 	chunkReader
 
 	// hash returns the hash address of this chunkSource.
-	hash() addr
+	hash() hash.Hash
 
 	// opens a Reader to the first byte of the chunkData segment of this table.
 	reader(context.Context) (io.ReadCloser, uint64, error)
@@ -281,7 +244,7 @@ type chunkSource interface {
 
 type chunkSources []chunkSource
 
-type chunkSourceSet map[addr]chunkSource
+type chunkSourceSet map[hash.Hash]chunkSource
 
 func copyChunkSourceSet(s chunkSourceSet) (cp chunkSourceSet) {
 	cp = make(chunkSourceSet, len(s))

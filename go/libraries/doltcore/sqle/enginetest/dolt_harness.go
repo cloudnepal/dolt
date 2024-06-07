@@ -24,32 +24,41 @@ import (
 	gms "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/enginetest"
 	"github.com/dolthub/go-mysql-server/enginetest/scriptgen/setup"
+	"github.com/dolthub/go-mysql-server/memory"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
+	"github.com/dolthub/go-mysql-server/sql/rowexec"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
-	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dtestutils"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statsnoms"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statspro"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/types"
 )
 
 type DoltHarness struct {
-	t               *testing.T
-	provider        dsess.DoltDatabaseProvider
-	multiRepoEnv    *env.MultiRepoEnv
-	session         *dsess.DoltSession
-	branchControl   *branch_control.Controller
-	parallelism     int
-	skippedQueries  []string
-	setupData       []setup.SetupScript
-	resetData       []setup.SetupScript
-	engine          *gms.Engine
-	skipSetupCommit bool
+	t                   *testing.T
+	provider            dsess.DoltDatabaseProvider
+	statsPro            sql.StatsProvider
+	multiRepoEnv        *env.MultiRepoEnv
+	session             *dsess.DoltSession
+	branchControl       *branch_control.Controller
+	parallelism         int
+	skippedQueries      []string
+	setupData           []setup.SetupScript
+	resetData           []setup.SetupScript
+	engine              *gms.Engine
+	setupDbs            map[string]struct{}
+	skipSetupCommit     bool
+	configureStats      bool
+	useLocalFilesystem  bool
+	setupTestProcedures bool
 }
 
 var _ enginetest.Harness = (*DoltHarness)(nil)
@@ -62,12 +71,23 @@ var _ enginetest.KeylessTableHarness = (*DoltHarness)(nil)
 var _ enginetest.ReadOnlyDatabaseHarness = (*DoltHarness)(nil)
 var _ enginetest.ValidatingHarness = (*DoltHarness)(nil)
 
+// newDoltHarness creates a new harness for testing Dolt, using an in-memory filesystem and an in-memory blob store.
 func newDoltHarness(t *testing.T) *DoltHarness {
 	dh := &DoltHarness{
 		t:              t,
 		skippedQueries: defaultSkippedQueries,
+		parallelism:    1,
 	}
 
+	return dh
+}
+
+// newDoltHarnessForLocalFilesystem creates a new harness for testing Dolt, using
+// the local filesystem for all storage, instead of in-memory versions. This setup
+// is useful for testing functionality that requires a real filesystem.
+func newDoltHarnessForLocalFilesystem(t *testing.T) *DoltHarness {
+	dh := newDoltHarness(t)
+	dh.useLocalFilesystem = true
 	return dh
 }
 
@@ -80,6 +100,7 @@ var defaultSkippedQueries = []string{
 
 // Setup sets the setup scripts for this DoltHarness's engine
 func (d *DoltHarness) Setup(setupData ...[]setup.SetupScript) {
+	d.closeProvider()
 	d.engine = nil
 	d.provider = nil
 	d.setupData = nil
@@ -124,23 +145,18 @@ func (d *DoltHarness) resetScripts() []setup.SetupScript {
 			}
 
 			resetCmds = append(resetCmds, setup.SetupScript{fmt.Sprintf("drop table %s", tableName)})
-
-			ctx := enginetest.NewContext(d)
-			ctx.Session.SetCurrentDatabase(db)
-			_, showCreateResult := enginetest.MustQuery(ctx, d.engine, fmt.Sprintf("show create table %s;", tableName))
-			var createTableStatement strings.Builder
-			for _, row := range showCreateResult {
-				createTableStatement.WriteString(row[1].(string))
-			}
-
-			resetCmds = append(resetCmds, setup.SetupScript{createTableStatement.String()})
 		}
 
-		resetCmds = append(resetCmds, setup.SetupScript{"call dclean()"})
-		resetCmds = append(resetCmds, setup.SetupScript{"call dreset('--hard', 'head')"})
+		resetCmds = append(resetCmds, setup.SetupScript{"call dolt_clean()"})
+		resetCmds = append(resetCmds, setup.SetupScript{"call dolt_reset('--hard', 'head')"})
 	}
 
 	resetCmds = append(resetCmds, setup.SetupScript{"SET foreign_key_checks=1;"})
+	for _, db := range dbs {
+		if _, ok := d.setupDbs[db]; !ok && db != "mydb" {
+			resetCmds = append(resetCmds, setup.SetupScript{fmt.Sprintf("drop database if exists %s", db)})
+		}
+	}
 	resetCmds = append(resetCmds, setup.SetupScript{"use mydb"})
 	return resetCmds
 }
@@ -160,30 +176,41 @@ func commitScripts(dbs []string) []setup.SetupScript {
 
 // NewEngine creates a new *gms.Engine or calls reset and clear scripts on the existing
 // engine for reuse.
-func (d *DoltHarness) NewEngine(t *testing.T) (*gms.Engine, error) {
-	if d.engine == nil {
-		d.branchControl = branch_control.CreateDefaultController()
+func (d *DoltHarness) NewEngine(t *testing.T) (enginetest.QueryEngine, error) {
+	initializeEngine := d.engine == nil
+	if initializeEngine {
+		d.branchControl = branch_control.CreateDefaultController(context.Background())
 
 		pro := d.newProvider()
-		doltProvider, ok := pro.(sqle.DoltDatabaseProvider)
+		if d.setupTestProcedures {
+			pro = d.newProviderWithProcedures()
+		}
+		doltProvider, ok := pro.(*sqle.DoltDatabaseProvider)
 		require.True(t, ok)
 		d.provider = doltProvider
 
+		statsProv := statspro.NewProvider(d.provider.(*sqle.DoltDatabaseProvider), statsnoms.NewNomsStatsFactory(d.multiRepoEnv.RemoteDialProvider()))
+		d.statsPro = statsProv
+
 		var err error
-		d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), doltProvider, d.multiRepoEnv.Config(), d.branchControl)
+		d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), d.provider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession)
 		require.NoError(t, err)
 
-		e, err := enginetest.NewEngine(t, d, d.provider, d.setupData)
+		e, err := enginetest.NewEngine(t, d, d.provider, d.setupData, d.statsPro)
 		if err != nil {
 			return nil, err
 		}
+		e.Analyzer.ExecBuilder = rowexec.DefaultBuilder
 		d.engine = e
 
 		ctx := enginetest.NewContext(d)
 		databases := pro.AllDatabases(ctx)
+		d.setupDbs = make(map[string]struct{})
 		var dbs []string
 		for _, db := range databases {
-			dbs = append(dbs, db.Name())
+			dbName := db.Name()
+			dbs = append(dbs, dbName)
+			d.setupDbs[dbName] = struct{}{}
 		}
 
 		if !d.skipSetupCommit {
@@ -193,17 +220,61 @@ func (d *DoltHarness) NewEngine(t *testing.T) (*gms.Engine, error) {
 			}
 		}
 
+		if d.configureStats {
+			bThreads := sql.NewBackgroundThreads()
+			e = e.WithBackgroundThreads(bThreads)
+
+			dSess := dsess.DSessFromSess(ctx.Session)
+			dbCache := dSess.DatabaseCache(ctx)
+
+			dsessDbs := make([]dsess.SqlDatabase, len(dbs))
+			for i, dbName := range dbs {
+				dsessDbs[i], _ = dbCache.GetCachedRevisionDb(fmt.Sprintf("%s/main", dbName), dbName)
+			}
+
+			ctxFact := func(context.Context) (*sql.Context, error) {
+				sess := d.newSessionWithClient(sql.Client{Address: "localhost", User: "root"})
+				return sql.NewContext(context.Background(), sql.WithSession(sess)), nil
+			}
+			if err = statsProv.Configure(ctx, ctxFact, bThreads, dsessDbs); err != nil {
+				return nil, err
+			}
+
+			statsOnlyQueries := filterStatsOnlyQueries(d.setupData)
+			e, err = enginetest.RunSetupScripts(ctx, e, statsOnlyQueries, d.SupportsNativeIndexCreation())
+		}
+
 		return e, nil
 	}
 
 	// Reset the mysql DB table to a clean state for this new engine
 	d.engine.Analyzer.Catalog.MySQLDb = mysql_db.CreateEmptyMySQLDb()
 	d.engine.Analyzer.Catalog.MySQLDb.AddRootAccount()
+	d.engine.Analyzer.Catalog.StatsProvider = statspro.NewProvider(d.provider.(*sqle.DoltDatabaseProvider), statsnoms.NewNomsStatsFactory(d.multiRepoEnv.RemoteDialProvider()))
+
+	// Get a fresh session if we are reusing the engine
+	if !initializeEngine {
+		var err error
+		d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), d.provider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession)
+		require.NoError(t, err)
+	}
 
 	ctx := enginetest.NewContext(d)
 	e, err := enginetest.RunSetupScripts(ctx, d.engine, d.resetScripts(), d.SupportsNativeIndexCreation())
 
 	return e, err
+}
+
+func filterStatsOnlyQueries(scripts []setup.SetupScript) []setup.SetupScript {
+	var ret []string
+	for i := range scripts {
+		for _, s := range scripts[i] {
+			if strings.HasPrefix(s, "analyze table") {
+				ret = append(ret, s)
+			}
+		}
+	}
+	return []setup.SetupScript{ret}
 }
 
 // WithParallelism returns a copy of the harness with parallelism set to the given number of threads. A value of 0 or
@@ -266,7 +337,8 @@ func (d *DoltHarness) newSessionWithClient(client sql.Client) *dsess.DoltSession
 	localConfig := d.multiRepoEnv.Config()
 	pro := d.session.Provider()
 
-	dSession, err := dsess.NewDoltSession(sql.NewBaseSessionWithClientServer("address", client, 1), pro.(dsess.DoltDatabaseProvider), localConfig, d.branchControl)
+	dSession, err := dsess.NewDoltSession(sql.NewBaseSessionWithClientServer("address", client, 1), pro.(dsess.DoltDatabaseProvider), localConfig, d.branchControl, d.statsPro, writer.NewWriteSession)
+	dSession.SetCurrentDatabase("mydb")
 	require.NoError(d.t, err)
 	return dSession
 }
@@ -284,18 +356,20 @@ func (d *DoltHarness) SupportsKeylessTables() bool {
 }
 
 func (d *DoltHarness) NewDatabases(names ...string) []sql.Database {
+	d.closeProvider()
 	d.engine = nil
 	d.provider = nil
 
-	d.branchControl = branch_control.CreateDefaultController()
+	d.branchControl = branch_control.CreateDefaultController(context.Background())
 
 	pro := d.newProvider()
-	doltProvider, ok := pro.(sqle.DoltDatabaseProvider)
+	doltProvider, ok := pro.(*sqle.DoltDatabaseProvider)
 	require.True(d.t, ok)
 	d.provider = doltProvider
+	d.statsPro = statspro.NewProvider(doltProvider, statsnoms.NewNomsStatsFactory(d.multiRepoEnv.RemoteDialProvider()))
 
 	var err error
-	d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), doltProvider, d.multiRepoEnv.Config(), d.branchControl)
+	d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), doltProvider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession)
 	require.NoError(d.t, err)
 
 	// TODO: the engine tests should do this for us
@@ -327,14 +401,14 @@ func (d *DoltHarness) NewDatabases(names ...string) []sql.Database {
 	return dbs
 }
 
-func (d *DoltHarness) NewReadOnlyEngine(provider sql.DatabaseProvider) (*gms.Engine, error) {
-	ddp, ok := provider.(sqle.DoltDatabaseProvider)
+func (d *DoltHarness) NewReadOnlyEngine(provider sql.DatabaseProvider) (enginetest.QueryEngine, error) {
+	ddp, ok := provider.(*sqle.DoltDatabaseProvider)
 	if !ok {
 		return nil, fmt.Errorf("expected a DoltDatabaseProvider")
 	}
 
 	allDatabases := ddp.AllDatabases(d.NewContext())
-	dbs := make([]sqle.SqlDatabase, len(allDatabases))
+	dbs := make([]dsess.SqlDatabase, len(allDatabases))
 	locations := make([]filesys.Filesys, len(allDatabases))
 
 	for i, db := range allDatabases {
@@ -352,6 +426,10 @@ func (d *DoltHarness) NewReadOnlyEngine(provider sql.DatabaseProvider) (*gms.Eng
 		return nil, err
 	}
 
+	// reset the session as well since we have swapped out the database provider, which invalidates caching assumptions
+	d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), readOnlyProvider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession)
+	require.NoError(d.t, err)
+
 	return enginetest.NewEngineWithProvider(nil, d, readOnlyProvider), nil
 }
 
@@ -359,13 +437,34 @@ func (d *DoltHarness) NewDatabaseProvider() sql.MutableDatabaseProvider {
 	return d.provider
 }
 
+func (d *DoltHarness) Close() {
+	d.closeProvider()
+}
+
+func (d *DoltHarness) closeProvider() {
+	if d.provider != nil {
+		dbs := d.provider.AllDatabases(sql.NewEmptyContext())
+		for _, db := range dbs {
+			require.NoError(d.t, db.(dsess.SqlDatabase).DbData().Ddb.Close())
+		}
+	}
+}
+
 func (d *DoltHarness) newProvider() sql.MutableDatabaseProvider {
-	dEnv := dtestutils.CreateTestEnv()
+	d.closeProvider()
+
+	var dEnv *env.DoltEnv
+	if d.useLocalFilesystem {
+		dEnv = dtestutils.CreateTestEnvForLocalFilesystem()
+	} else {
+		dEnv = dtestutils.CreateTestEnv()
+	}
+	defer dEnv.DoltDB.Close()
 
 	store := dEnv.DoltDB.ValueReadWriter().(*types.ValueStore)
 	store.SetValidateContentAddresses(true)
 
-	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	require.NoError(d.t, err)
 	d.multiRepoEnv = mrEnv
 
@@ -373,7 +472,17 @@ func (d *DoltHarness) newProvider() sql.MutableDatabaseProvider {
 	pro, err := sqle.NewDoltDatabaseProvider(b, d.multiRepoEnv.FileSystem())
 	require.NoError(d.t, err)
 
-	return pro.WithDbFactoryUrl(doltdb.InMemDoltDB)
+	return pro
+}
+
+func (d *DoltHarness) newProviderWithProcedures() sql.MutableDatabaseProvider {
+	pro := d.newProvider()
+	provider, ok := pro.(*sqle.DoltDatabaseProvider)
+	require.True(d.t, ok)
+	for _, esp := range memory.ExternalStoredProcedures {
+		provider.Register(esp)
+	}
+	return provider
 }
 
 func (d *DoltHarness) newTable(db sql.Database, name string, schema sql.PrimaryKeySchema) (sql.Table, error) {
@@ -381,7 +490,7 @@ func (d *DoltHarness) newTable(db sql.Database, name string, schema sql.PrimaryK
 
 	ctx := enginetest.NewContext(d)
 	ctx.Session.SetCurrentDatabase(db.Name())
-	err := tc.CreateTable(ctx, name, schema, sql.Collation_Default)
+	err := tc.CreateTable(ctx, name, schema, sql.Collation_Default, "")
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +533,7 @@ func (d *DoltHarness) SnapshotTable(db sql.VersionedDatabase, tableName string, 
 	_, iter, err := e.Query(ctx,
 		"CALL DOLT_COMMIT('-Am', 'test commit');")
 	require.NoError(d.t, err)
-	_, err = sql.RowIterToRows(ctx, nil, iter)
+	_, err = sql.RowIterToRows(ctx, iter)
 	require.NoError(d.t, err)
 
 	// Create a new branch at this commit with the given identifier
@@ -434,7 +543,7 @@ func (d *DoltHarness) SnapshotTable(db sql.VersionedDatabase, tableName string, 
 	_, iter, err = e.Query(ctx,
 		query)
 	require.NoError(d.t, err)
-	_, err = sql.RowIterToRows(ctx, nil, iter)
+	_, err = sql.RowIterToRows(ctx, iter)
 	require.NoError(d.t, err)
 
 	return nil

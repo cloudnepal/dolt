@@ -20,7 +20,7 @@ import (
 	"errors"
 	"fmt"
 
-	flatbuffers "github.com/google/flatbuffers/go"
+	flatbuffers "github.com/dolthub/flatbuffers/v23/go"
 
 	"github.com/dolthub/dolt/go/gen/fb/serial"
 	"github.com/dolthub/dolt/go/libraries/doltcore/conflict"
@@ -32,6 +32,7 @@ import (
 	"github.com/dolthub/dolt/go/store/prolly/shim"
 	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/types"
+	"github.com/dolthub/dolt/go/store/val"
 )
 
 const (
@@ -52,7 +53,7 @@ var (
 )
 
 var (
-	errNbfUnkown      = fmt.Errorf("unknown NomsBinFormat")
+	errNbfUnknown     = fmt.Errorf("unknown NomsBinFormat")
 	errNbfUnsupported = fmt.Errorf("operation unsupported for NomsBinFormat")
 )
 
@@ -71,8 +72,10 @@ type Table interface {
 	// SetSchema sets this table's schema.
 	SetSchema(ctx context.Context, sch schema.Schema) (Table, error)
 
-	// GetTableRows returns this tables rows.
+	// GetTableRows returns this table's rows.
 	GetTableRows(ctx context.Context) (Index, error)
+	// GetTableRowsWithDescriptors returns this table's rows with fewer deserialization calls
+	GetTableRowsWithDescriptors(ctx context.Context, kd, vd val.TupleDesc) (Index, error)
 	// SetTableRows sets this table's rows.
 	SetTableRows(ctx context.Context, rows Index) (Table, error)
 
@@ -106,7 +109,7 @@ type Table interface {
 	SetAutoIncrement(ctx context.Context, val uint64) (Table, error)
 
 	// DebugString returns the table contents for debugging purposes
-	DebugString(ctx context.Context) string
+	DebugString(ctx context.Context, ns tree.NodeStore) string
 }
 
 type nomsTable struct {
@@ -130,7 +133,7 @@ func NewTable(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore,
 		return newDoltDevTable(ctx, vrw, ns, sch, rows, indexes, autoIncVal)
 	}
 
-	schVal, err := encoding.MarshalSchemaAsNomsValue(ctx, vrw, sch)
+	schVal, err := encoding.MarshalSchema(ctx, vrw, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +282,7 @@ func (t nomsTable) GetSchemaHash(ctx context.Context) (hash.Hash, error) {
 
 // SetSchema implements Table.
 func (t nomsTable) SetSchema(ctx context.Context, sch schema.Schema) (Table, error) {
-	newSchemaVal, err := encoding.MarshalSchemaAsNomsValue(ctx, t.vrw, sch)
+	newSchemaVal, err := encoding.MarshalSchema(ctx, t.vrw, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +328,10 @@ func (t nomsTable) GetTableRows(ctx context.Context) (Index, error) {
 	}
 
 	return indexFromRef(ctx, t.vrw, t.ns, sch, val.(types.Ref))
+}
+
+func (t nomsTable) GetTableRowsWithDescriptors(ctx context.Context, kd, vd val.TupleDesc) (Index, error) {
+	return nil, fmt.Errorf("nomsTable does not implement GetTableRowsWithDescriptors")
 }
 
 // GetIndexes implements Table.
@@ -615,7 +622,7 @@ func (t nomsTable) SetAutoIncrement(ctx context.Context, val uint64) (Table, err
 	return nomsTable{t.vrw, t.ns, st}, nil
 }
 
-func (t nomsTable) DebugString(ctx context.Context) string {
+func (t nomsTable) DebugString(ctx context.Context, ns tree.NodeStore) string {
 	var buf bytes.Buffer
 	err := types.WriteEncodedValue(ctx, &buf, t.tableStruct)
 	if err != nil {
@@ -668,27 +675,7 @@ func (t nomsTable) DebugString(ctx context.Context) string {
 }
 
 func refFromNomsValue(ctx context.Context, vrw types.ValueReadWriter, val types.Value) (types.Ref, error) {
-	valRef, err := types.NewRef(val, vrw.Format())
-
-	if err != nil {
-		return types.Ref{}, err
-	}
-
-	targetVal, err := valRef.TargetValue(ctx, vrw)
-
-	if err != nil {
-		return types.Ref{}, err
-	}
-
-	if targetVal == nil {
-		_, err = vrw.WriteValue(ctx, val)
-
-		if err != nil {
-			return types.Ref{}, err
-		}
-	}
-
-	return valRef, err
+	return vrw.WriteValue(ctx, val)
 }
 
 func schemaFromRef(ctx context.Context, vrw types.ValueReadWriter, ref types.Ref) (schema.Schema, error) {
@@ -696,17 +683,7 @@ func schemaFromRef(ctx context.Context, vrw types.ValueReadWriter, ref types.Ref
 }
 
 func schemaFromAddr(ctx context.Context, vrw types.ValueReadWriter, addr hash.Hash) (schema.Schema, error) {
-	schemaVal, err := vrw.ReadValue(ctx, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	schema, err := encoding.UnmarshalSchemaNomsValue(ctx, vrw.Format(), schemaVal)
-	if err != nil {
-		return nil, err
-	}
-
-	return schema, nil
+	return encoding.UnmarshalSchemaAtAddr(ctx, vrw, addr)
 }
 
 type doltDevTable struct {
@@ -715,18 +692,18 @@ type doltDevTable struct {
 	msg *serial.Table
 }
 
-func (t doltDevTable) DebugString(ctx context.Context) string {
+func (t doltDevTable) DebugString(ctx context.Context, ns tree.NodeStore) string {
 	rows, err := t.GetTableRows(ctx)
 	if err != nil {
 		panic(err)
 	}
 
-	m := ProllyMapFromIndex(rows)
-	var b bytes.Buffer
-	m.WalkNodes(ctx, func(ctx context.Context, nd tree.Node) error {
-		return tree.OutputProllyNode(&b, nd)
-	})
-	return b.String()
+	schema, err := t.GetSchema(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	return rows.DebugString(ctx, ns, schema)
 }
 
 var _ Table = doltDevTable{}
@@ -781,7 +758,7 @@ func (fields serialTableFields) write() (*serial.Table, error) {
 }
 
 func newDoltDevTable(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, sch schema.Schema, rows Index, indexes IndexSet, autoIncVal types.Value) (Table, error) {
-	schVal, err := encoding.MarshalSchemaAsNomsValue(ctx, vrw, sch)
+	schVal, err := encoding.MarshalSchema(ctx, vrw, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -851,7 +828,7 @@ func (t doltDevTable) GetSchema(ctx context.Context) (schema.Schema, error) {
 }
 
 func (t doltDevTable) SetSchema(ctx context.Context, sch schema.Schema) (Table, error) {
-	newSchemaVal, err := encoding.MarshalSchemaAsNomsValue(ctx, t.vrw, sch)
+	newSchemaVal, err := encoding.MarshalSchema(ctx, t.vrw, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -874,6 +851,15 @@ func (t doltDevTable) GetTableRows(ctx context.Context) (Index, error) {
 		return nil, err
 	}
 	m, err := shim.MapFromValue(types.SerialMessage(rowbytes), sch, t.ns)
+	if err != nil {
+		return nil, err
+	}
+	return IndexFromProllyMap(m), nil
+}
+
+func (t doltDevTable) GetTableRowsWithDescriptors(ctx context.Context, kd, vd val.TupleDesc) (Index, error) {
+	rowbytes := t.msg.PrimaryIndexBytes()
+	m, err := shim.MapFromValueWithDescriptors(types.SerialMessage(rowbytes), kd, vd, t.ns)
 	if err != nil {
 		return nil, err
 	}
@@ -927,7 +913,10 @@ func (t doltDevTable) SetIndexes(ctx context.Context, indexes IndexSet) (Table, 
 }
 
 func (t doltDevTable) GetConflicts(ctx context.Context) (conflict.ConflictSchema, ConflictIndex, error) {
-	conflicts := t.msg.Conflicts(nil)
+	conflicts, err := t.msg.TryConflicts(nil)
+	if err != nil {
+		return conflict.ConflictSchema{}, nil, err
+	}
 
 	ouraddr := hash.New(conflicts.OurSchemaBytes())
 	theiraddr := hash.New(conflicts.TheirSchemaBytes())
@@ -1027,7 +1016,10 @@ func (t doltDevTable) SetArtifacts(ctx context.Context, artifacts ArtifactIndex)
 
 func (t doltDevTable) HasConflicts(ctx context.Context) (bool, error) {
 
-	conflicts := t.msg.Conflicts(nil)
+	conflicts, err := t.msg.TryConflicts(nil)
+	if err != nil {
+		return false, err
+	}
 	addr := hash.New(conflicts.OurSchemaBytes())
 	return !addr.IsEmpty(), nil
 }
@@ -1053,7 +1045,10 @@ func (t doltDevTable) SetConflicts(ctx context.Context, sch conflict.ConflictSch
 	}
 
 	msg := t.clone()
-	cmsg := msg.Conflicts(nil)
+	cmsg, err := msg.TryConflicts(nil)
+	if err != nil {
+		return nil, err
+	}
 	copy(cmsg.DataBytes(), conflictsAddr[:])
 	copy(cmsg.OurSchemaBytes(), ouraddr[:])
 	copy(cmsg.TheirSchemaBytes(), theiraddr[:])
@@ -1064,7 +1059,10 @@ func (t doltDevTable) SetConflicts(ctx context.Context, sch conflict.ConflictSch
 
 func (t doltDevTable) ClearConflicts(ctx context.Context) (Table, error) {
 	msg := t.clone()
-	conflicts := msg.Conflicts(nil)
+	conflicts, err := msg.TryConflicts(nil)
+	if err != nil {
+		return nil, err
+	}
 	var emptyhash hash.Hash
 	copy(conflicts.DataBytes(), emptyhash[:])
 	copy(conflicts.OurSchemaBytes(), emptyhash[:])
@@ -1140,7 +1138,10 @@ func (t doltDevTable) fields() (serialTableFields, error) {
 	}
 	ns := t.ns
 
-	conflicts := t.msg.Conflicts(nil)
+	conflicts, err := t.msg.TryConflicts(nil)
+	if err != nil {
+		return serialTableFields{}, err
+	}
 	am, err := prolly.NewAddressMap(node, ns)
 	if err != nil {
 		return serialTableFields{}, err
@@ -1160,15 +1161,11 @@ func (t doltDevTable) fields() (serialTableFields, error) {
 }
 
 func getSchemaAtAddr(ctx context.Context, vrw types.ValueReadWriter, addr hash.Hash) (schema.Schema, error) {
-	val, err := vrw.ReadValue(ctx, addr)
-	if err != nil {
-		return nil, err
-	}
-	return encoding.UnmarshalSchemaNomsValue(ctx, vrw.Format(), val)
+	return encoding.UnmarshalSchemaAtAddr(ctx, vrw, addr)
 }
 
 func getAddrForSchema(ctx context.Context, vrw types.ValueReadWriter, sch schema.Schema) (hash.Hash, error) {
-	st, err := encoding.MarshalSchemaAsNomsValue(ctx, vrw, sch)
+	st, err := encoding.MarshalSchema(ctx, vrw, sch)
 	if err != nil {
 		return hash.Hash{}, err
 	}

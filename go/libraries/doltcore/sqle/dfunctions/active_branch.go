@@ -15,11 +15,10 @@
 package dfunctions
 
 import (
-	"fmt"
-
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 )
@@ -37,15 +36,25 @@ func NewActiveBranchFunc() sql.Expression {
 // Eval implements the Expression interface.
 func (ab *ActiveBranchFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	dbName := ctx.GetCurrentDatabase()
+	if dbName == "" {
+		// it is possible to have no current database in some contexts.
+		// When you first connect to a sql server, which has no databases, for example.
+		return nil, nil
+	}
+
 	dSess := dsess.DSessFromSess(ctx.Session)
 
 	ddb, ok := dSess.GetDoltDB(ctx, dbName)
-
 	if !ok {
-		return nil, sql.ErrDatabaseNotFound.New(dbName)
+		// Not all databases are dolt databases. information_schema and mysql, for example.
+		return nil, nil
 	}
 
 	currentBranchRef, err := dSess.CWBHeadRef(ctx, dbName)
+	if err == doltdb.ErrOperationNotSupportedInDetachedHead {
+		// active_branch should return NULL if we're in detached head state
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +65,7 @@ func (ab *ActiveBranchFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, er
 	}
 
 	for _, br := range branches {
-		if ref.Equals(br, currentBranchRef) {
+		if ref.EqualsCaseInsensitive(br, currentBranchRef) {
 			return br.GetPath(), nil
 		}
 	}
@@ -66,7 +75,7 @@ func (ab *ActiveBranchFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, er
 
 // String implements the Stringer interface.
 func (ab *ActiveBranchFunc) String() string {
-	return fmt.Sprint("ACTIVE_BRANCH()")
+	return "ACTIVE_BRANCH()"
 }
 
 // IsNullable implements the Expression interface.

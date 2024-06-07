@@ -22,6 +22,7 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
+	"github.com/dolthub/go-mysql-server/sql/fulltext"
 	sqltypes "github.com/dolthub/go-mysql-server/sql/types"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
@@ -51,6 +52,7 @@ type DoltTableable interface {
 type DoltIndex interface {
 	sql.FilteredIndex
 	sql.OrderedIndex
+	fulltext.Index
 	Schema() schema.Schema
 	IndexSchema() schema.Schema
 	Format() *types.NomsBinFormat
@@ -183,28 +185,49 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 	return indexes, nil
 }
 
-func DoltCommitIndexes(tab string, db *doltdb.DoltDB, unique bool) (indexes []sql.Index, err error) {
+func DoltToFromCommitIndex(tbl string) sql.Index {
+	return &doltIndex{
+		id:      "commits",
+		tblName: doltdb.DoltCommitDiffTablePrefix + tbl,
+		columns: []schema.Column{
+			schema.NewColumn(ToCommitIndexId, schema.DiffCommitTag, types.StringKind, false),
+			schema.NewColumn(FromCommitIndexId, schema.DiffCommitTag, types.StringKind, false),
+		},
+		unique:                        true,
+		comment:                       "",
+		order:                         sql.IndexOrderNone,
+		constrainedToLookupExpression: false,
+	}
+}
+
+// MockIndex returns a sql.Index that is not backed by an actual datastore. It's useful for system tables and
+// system table functions provide indexes but produce their rows at execution time based on the provided `IndexLookup`
+func MockIndex(dbName, tableName, columnName string, columnType types.NomsKind, unique bool) (index *doltIndex) {
+	return &doltIndex{
+		id:      columnName,
+		tblName: tableName,
+		dbName:  dbName,
+		columns: []schema.Column{
+			schema.NewColumn(columnName, 0, columnType, false),
+		},
+		indexSch:                      nil,
+		tableSch:                      nil,
+		unique:                        unique,
+		comment:                       "",
+		vrw:                           nil,
+		ns:                            nil,
+		order:                         sql.IndexOrderNone,
+		constrainedToLookupExpression: false,
+	}
+}
+
+func DoltCommitIndexes(dbName, tab string, db *doltdb.DoltDB, unique bool) (indexes []sql.Index, err error) {
 	if !types.IsFormat_DOLT(db.Format()) {
 		return nil, nil
 	}
 
 	return []sql.Index{
-		NewCommitIndex(&doltIndex{
-			id:      CommitHashIndexId,
-			tblName: tab,
-			dbName:  "",
-			columns: []schema.Column{
-				schema.NewColumn(CommitHashIndexId, 0, types.StringKind, false),
-			},
-			indexSch:                      nil,
-			tableSch:                      nil,
-			unique:                        unique,
-			comment:                       "",
-			vrw:                           db.ValueReadWriter(),
-			ns:                            db.NodeStore(),
-			order:                         sql.IndexOrderNone,
-			constrainedToLookupExpression: false,
-		}),
+		NewCommitIndex(MockIndex(dbName, tab, CommitHashIndexId, types.StringKind, unique)),
 	}, nil
 }
 
@@ -298,7 +321,7 @@ func DoltHistoryIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.
 		unorderedIndexes[i] = di
 	}
 
-	cmIdx, err := DoltCommitIndexes(tbl, ddb, false)
+	cmIdx, err := DoltCommitIndexes(db, tbl, ddb, false)
 	if err != nil {
 		return nil, err
 	}
@@ -359,6 +382,7 @@ func getSecondaryIndex(ctx context.Context, db, tbl string, t *doltdb.Table, sch
 		tableSch:                      sch,
 		unique:                        idx.IsUnique(),
 		spatial:                       idx.IsSpatial(),
+		fulltext:                      idx.IsFullText(),
 		isPk:                          false,
 		comment:                       idx.Comment(),
 		vrw:                           vrw,
@@ -368,6 +392,38 @@ func getSecondaryIndex(ctx context.Context, db, tbl string, t *doltdb.Table, sch
 		constrainedToLookupExpression: true,
 		doltBinFormat:                 types.IsFormat_DOLT(vrw.Format()),
 		prefixLengths:                 idx.PrefixLengths(),
+		fullTextProps:                 idx.FullTextProperties(),
+	}, nil
+}
+
+// ConvertFullTextToSql converts a given Full-Text schema.Index into a sql.Index. As we do not need to write to a
+// Full-Text index, we can omit all such fields. This must not be used in any other circumstance.
+func ConvertFullTextToSql(ctx context.Context, db, tbl string, sch schema.Schema, idx schema.Index) (sql.Index, error) {
+	cols := make([]schema.Column, idx.Count())
+	for i, tag := range idx.IndexedColumnTags() {
+		cols[i], _ = idx.GetColumn(tag)
+	}
+
+	return &doltIndex{
+		id:                            idx.Name(),
+		tblName:                       tbl,
+		dbName:                        db,
+		columns:                       cols,
+		indexSch:                      idx.Schema(),
+		tableSch:                      sch,
+		unique:                        idx.IsUnique(),
+		spatial:                       idx.IsSpatial(),
+		fulltext:                      idx.IsFullText(),
+		isPk:                          false,
+		comment:                       idx.Comment(),
+		vrw:                           nil,
+		ns:                            nil,
+		keyBld:                        nil,
+		order:                         sql.IndexOrderAsc,
+		constrainedToLookupExpression: true,
+		doltBinFormat:                 true,
+		prefixLengths:                 idx.PrefixLengths(),
+		fullTextProps:                 idx.FullTextProperties(),
 	}, nil
 }
 
@@ -488,6 +544,7 @@ type doltIndex struct {
 	tableSch schema.Schema
 	unique   bool
 	spatial  bool
+	fulltext bool
 	isPk     bool
 	comment  string
 	order    sql.IndexOrder
@@ -502,9 +559,11 @@ type doltIndex struct {
 	doltBinFormat bool
 
 	prefixLengths []uint16
+	fullTextProps schema.FullTextProperties
 }
 
 var _ DoltIndex = (*doltIndex)(nil)
+var _ sql.ExtendedIndex = (*doltIndex)(nil)
 
 // CanSupport implements sql.Index
 func (di *doltIndex) CanSupport(...sql.Range) bool {
@@ -520,6 +579,20 @@ func (di *doltIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
 			Type:       col.TypeInfo.ToSqlType(),
 		}
 	}
+	return cets
+}
+
+// ExtendedColumnExpressionTypes implements the interface sql.ExtendedIndex.
+func (di *doltIndex) ExtendedColumnExpressionTypes() []sql.ColumnExpressionType {
+	pkCols := di.indexSch.GetPKCols()
+	cets := make([]sql.ColumnExpressionType, 0, len(pkCols.Tags))
+	_ = pkCols.Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+		cets = append(cets, sql.ColumnExpressionType{
+			Expression: di.tblName + "." + col.Name,
+			Type:       col.TypeInfo.ToSqlType(),
+		})
+		return false, nil
+	})
 	return cets
 }
 
@@ -761,7 +834,7 @@ func (di *doltIndex) HandledFilters(filters []sql.Expression) []sql.Expression {
 
 	var handled []sql.Expression
 	for _, f := range filters {
-		if expression.ContainsImpreciseComparison(f) {
+		if !expression.PreciseComparison(f) {
 			continue
 		}
 		handled = append(handled, f)
@@ -769,8 +842,56 @@ func (di *doltIndex) HandledFilters(filters []sql.Expression) []sql.Expression {
 	return handled
 }
 
+func (di *doltIndex) isMockIndex() bool {
+	return di.indexSch == nil
+}
+
+// HasContentHashedField returns true if any of the fields in this index are "content-hashed", meaning that the index
+// stores a hash of the content, instead of the content itself. This is currently limited to unique indexes, which can
+// use this property to store hashes of TEXT or BLOB fields and still efficiently detect uniqueness.
+func (di *doltIndex) HasContentHashedField() bool {
+	// content-hashed fields can currently only be used in unique indexes
+	if !di.IsUnique() {
+		return false
+	}
+
+	contentHashedField := false
+	if di.isMockIndex() {
+		return false
+	}
+	indexPkCols := di.indexSch.GetPKCols()
+	indexPkCols.Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+		i := indexPkCols.TagToIdx[tag]
+		prefixLength := uint16(0)
+		if len(di.prefixLengths) > i {
+			prefixLength = di.prefixLengths[i]
+		}
+
+		if sqltypes.IsTextBlob(col.TypeInfo.ToSqlType()) && prefixLength == 0 {
+			contentHashedField = true
+			return true, nil
+		}
+
+		return false, nil
+	})
+
+	return contentHashedField
+}
+
 func (di *doltIndex) Order() sql.IndexOrder {
+	if di.HasContentHashedField() {
+		return sql.IndexOrderNone
+	}
+
 	return di.order
+}
+
+func (di *doltIndex) Reversible() bool {
+	if di.HasContentHashedField() {
+		return false
+	}
+
+	return di.doltBinFormat
 }
 
 // Database implement sql.Index
@@ -787,6 +908,17 @@ func (di *doltIndex) Expressions() []string {
 	return strs
 }
 
+// ExtendedExpressions implements sql.ExtendedIndex
+func (di *doltIndex) ExtendedExpressions() []string {
+	pkCols := di.indexSch.GetPKCols()
+	strs := make([]string, 0, len(pkCols.Tags))
+	_ = pkCols.Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+		strs = append(strs, di.tblName+"."+col.Name)
+		return false, nil
+	})
+	return strs
+}
+
 // ID implements sql.Index
 func (di *doltIndex) ID() string {
 	return di.id
@@ -800,6 +932,11 @@ func (di *doltIndex) IsUnique() bool {
 // IsSpatial implements sql.Index
 func (di *doltIndex) IsSpatial() bool {
 	return di.spatial
+}
+
+// IsFullText implements sql.Index
+func (di *doltIndex) IsFullText() bool {
+	return di.fulltext
 }
 
 // IsPrimaryKey implements DoltIndex.
@@ -844,6 +981,34 @@ func (di *doltIndex) Table() string {
 
 func (di *doltIndex) Format() *types.NomsBinFormat {
 	return di.vrw.Format()
+}
+
+// FullTextTableNames implements sql.Index
+func (di *doltIndex) FullTextTableNames(ctx *sql.Context) (fulltext.IndexTableNames, error) {
+	return fulltext.IndexTableNames{
+		Config:      di.fullTextProps.ConfigTable,
+		Position:    di.fullTextProps.PositionTable,
+		DocCount:    di.fullTextProps.DocCountTable,
+		GlobalCount: di.fullTextProps.GlobalCountTable,
+		RowCount:    di.fullTextProps.RowCountTable,
+	}, nil
+}
+
+// FullTextKeyColumns implements sql.Index
+func (di *doltIndex) FullTextKeyColumns(ctx *sql.Context) (fulltext.KeyColumns, error) {
+	var positions []int
+	if len(di.fullTextProps.KeyPositions) > 0 {
+		positions = make([]int, len(di.fullTextProps.KeyPositions))
+		for i := range positions {
+			positions[i] = int(di.fullTextProps.KeyPositions[i])
+		}
+	}
+
+	return fulltext.KeyColumns{
+		Type:      fulltext.KeyType(di.fullTextProps.KeyType),
+		Name:      di.fullTextProps.KeyName,
+		Positions: positions,
+	}, nil
 }
 
 // keysToTuple returns a tuple that indicates the starting point for an index. The empty tuple will cause the index to
@@ -949,15 +1114,15 @@ func (di *doltIndex) prollySpatialRanges(ranges []sql.Range) ([]prolly.Range, er
 	}
 
 	var pRanges []prolly.Range
-	zMin := ZValue(minPoint)
-	zMax := ZValue(maxPoint)
-	zRanges := SplitZRanges(ZRange{zMin, zMax})
+	zMin := tree.ZValue(minPoint)
+	zMax := tree.ZValue(maxPoint)
+	zRanges := tree.SplitZRanges(tree.ZRange{zMin, zMax})
 	for level := byte(0); level < 65; level++ {
 		// For example, at highest level, we'll just look at origin point multiple times
 		var prevMinCell, prevMaxCell val.Cell
 		for i, zRange := range zRanges {
-			minCell := ZMask(level, zRange[0])
-			maxCell := ZMask(level, zRange[1])
+			minCell := tree.ZMask(level, zRange[0])
+			maxCell := tree.ZMask(level, zRange[1])
 			if i != 0 && minCell == prevMinCell && maxCell == prevMaxCell {
 				continue
 			}
@@ -1011,7 +1176,7 @@ func (di *doltIndex) prollyRangesFromSqlRanges(ctx context.Context, ns tree.Node
 					return nil, err
 				}
 				nv := di.trimRangeCutValue(j, v)
-				if err = PutField(ctx, ns, tb, j, nv); err != nil {
+				if err = tree.PutField(ctx, ns, tb, j, nv); err != nil {
 					return nil, err
 				}
 				bound := expr.LowerBound.TypeAsLowerBound()
@@ -1038,12 +1203,19 @@ func (di *doltIndex) prollyRangesFromSqlRanges(ctx context.Context, ns tree.Node
 					return nil, err
 				}
 				nv := di.trimRangeCutValue(i, v)
-				if err = PutField(ctx, ns, tb, i, nv); err != nil {
+				if err = tree.PutField(ctx, ns, tb, i, nv); err != nil {
 					return nil, err
 				}
+				if vv, ok := v.([]byte); ok {
+					v = string(vv)
+				}
+				if nvv, ok := nv.([]byte); ok {
+					nv = string(nvv)
+				}
+
 				fields[i].Hi = prolly.Bound{
 					Binding:   true,
-					Inclusive: bound == sql.Closed || nv != v, // TODO (james): this might panic for []byte
+					Inclusive: bound == sql.Closed || nv != v,
 				}
 			} else {
 				fields[i].Hi = prolly.Bound{}
@@ -1094,7 +1266,11 @@ func getRangeCutValue(cut sql.RangeCut, typ sql.Type) (interface{}, error) {
 	if _, ok := cut.(sql.AboveNull); ok {
 		return nil, nil
 	}
-	return typ.Convert(sql.GetRangeCutKey(cut))
+	ret, oob, err := typ.Convert(sql.GetRangeCutKey(cut))
+	if oob == sql.OutOfRange {
+		return ret, nil
+	}
+	return ret, err
 }
 
 // DropTrailingAllColumnExprs returns the Range with any |AllColumnExprs| at the end of it removed.

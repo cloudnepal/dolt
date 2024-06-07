@@ -8,9 +8,11 @@ venv
 .sqlhistory
 .doltcfg
 test.sh
+*eventsapi@*
 
 # ignore cp'd sysbench runner testing files
 SysbenchDockerfile
 SysbenchDockerfile.dockerignore
 sysbench-runner-tests-entrypoint.sh
 config.json
+integration-tests/bats/batsee_results

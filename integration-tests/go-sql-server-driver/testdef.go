@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"database/sql"
-
+	
 	driver "github.com/dolthub/dolt/go/libraries/doltcore/dtestutils/sql_server_driver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,13 +37,24 @@ type TestDef struct {
 // any Servers defined within them will be started. The interactions and
 // assertions defined in Conns will be run.
 type Test struct {
-	Name       string              `yaml:"name"`
-	Repos      []driver.TestRepo   `yaml:"repos"`
-	MultiRepos []driver.MultiRepo  `yaml:"multi_repos"`
-	Conns      []driver.Connection `yaml:"connections"`
+	Name        string              `yaml:"name"`
+	Repos       []driver.TestRepo   `yaml:"repos"`
+	MultiRepos  []driver.MultiRepo  `yaml:"multi_repos"`
+	Conns       []driver.Connection `yaml:"connections"`
 
 	// Skip the entire test with this reason.
 	Skip string `yaml:"skip"`
+}
+
+// Set this environment variable to effectively disable timeouts for debugging.
+const debugEnvKey = "DOLT_SQL_SERVER_TEST_DEBUG"
+var timeout = 20 * time.Second
+
+func init() {
+	_, ok := os.LookupEnv(debugEnvKey)
+	if ok {
+		timeout = 1000 * time.Hour
+	}
 }
 
 func ParseTestsFile(path string) (TestDef, error) {
@@ -74,11 +85,19 @@ func MakeServer(t *testing.T, dc driver.DoltCmdable, s *driver.Server) *driver.S
 	if s == nil {
 		return nil
 	}
-	opts := []driver.SqlServerOpt{driver.WithArgs(s.Args...)}
+	opts := []driver.SqlServerOpt{driver.WithArgs(s.Args...), driver.WithEnvs(s.Envs...), driver.WithName(s.Name)}
 	if s.Port != 0 {
 		opts = append(opts, driver.WithPort(s.Port))
 	}
-	server, err := driver.StartSqlServer(dc, opts...)
+
+	var server *driver.SqlServer
+	var err error
+	if s.DebugPort != 0 {
+		server, err = driver.DebugSqlServer(dc, s.DebugPort, opts...)	
+	} else {
+		server, err = driver.StartSqlServer(dc, opts...)
+	}
+	
 	require.NoError(t, err)
 	if len(s.ErrorMatches) > 0 {
 		err := server.ErrorStop()
@@ -123,6 +142,9 @@ func (test Test) Run(t *testing.T) {
 	for _, r := range test.Repos {
 		repo := MakeRepo(t, rs, r)
 
+		if r.Server.Name == "" {
+			r.Server.Name = r.Name
+		}
 		server := MakeServer(t, repo, r.Server)
 		if server != nil {
 			server.DBName = r.Name
@@ -145,6 +167,9 @@ func (test Test) Run(t *testing.T) {
 			require.NoError(t, f.WriteAtDir(rs.Dir))
 		}
 
+		if mr.Server.Name == "" {
+			mr.Server.Name = mr.Name
+		}
 		server := MakeServer(t, rs, mr.Server)
 		if server != nil {
 			servers[mr.Name] = server
@@ -184,7 +209,7 @@ func (test Test) Run(t *testing.T) {
 			}()
 		}
 		if c.RestartServer != nil {
-			err := server.Restart(c.RestartServer.Args)
+			err := server.Restart(c.RestartServer.Args, c.RestartServer.Envs)
 			require.NoError(t, err)
 		}
 	}
@@ -195,6 +220,16 @@ func RunTestsFile(t *testing.T, path string) {
 	require.NoError(t, err)
 	for _, test := range def.Tests {
 		t.Run(test.Name, test.Run)
+	}
+}
+
+func RunSingleTest(t *testing.T, path string, testName string) {
+	def, err := ParseTestsFile(path)
+	require.NoError(t, err)
+	for _, test := range def.Tests {
+		if test.Name == testName {
+			t.Run(test.Name, test.Run)
+		}
 	}
 }
 
@@ -268,14 +303,14 @@ func RunQueryAttempt(t require.TestingT, conn *sql.Conn, q driver.Query) {
 		args[i] = q.Args[i]
 	}
 	if q.Query != "" {
-		ctx, c := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, c := context.WithTimeout(context.Background(), timeout)
 		defer c()
 		rows, err := conn.QueryContext(ctx, q.Query, args...)
 		if err == nil {
 			defer rows.Close()
 		}
 		if q.ErrorMatch != "" {
-			require.Error(t, err)
+			require.Error(t, err, "expected error running query %s", q.Query)
 			require.Regexp(t, q.ErrorMatch, err.Error())
 			return
 		}
@@ -291,7 +326,7 @@ func RunQueryAttempt(t require.TestingT, conn *sql.Conn, q driver.Query) {
 			require.Contains(t, *q.Result.Rows.Or, rowstrings)
 		}
 	} else if q.Exec != "" {
-		ctx, c := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, c := context.WithTimeout(context.Background(), timeout)
 		defer c()
 		_, err := conn.ExecContext(ctx, q.Exec, args...)
 		if q.ErrorMatch == "" {

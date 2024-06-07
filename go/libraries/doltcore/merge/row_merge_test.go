@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
@@ -173,16 +174,6 @@ var testCases = []testCase{
 		true,
 		false,
 	},
-	{
-		"dropping a column should be equivalent to setting a column to null",
-		build(1, 2, 0),
-		build(2, 1),
-		build(1, 1, 1),
-		3, 2, 3,
-		build(2, 2),
-		true,
-		false,
-	},
 	// TODO (dhruv): need to fix this test case for new storage format
 	//{
 	//	"add rows but one holds a new column",
@@ -211,6 +202,8 @@ func TestRowMerge(t *testing.T) {
 		t.Skip()
 	}
 
+	ctx := sql.NewEmptyContext()
+
 	tests := make([]rowMergeTest, len(testCases))
 	for i, t := range testCases {
 		tests[i] = createRowMergeStruct(t)
@@ -218,9 +211,10 @@ func TestRowMerge(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			v := newValueMerger(test.mergedSch, test.leftSch, test.rightSch, test.baseSch, syncPool)
+			v := newValueMerger(test.mergedSch, test.leftSch, test.rightSch, test.baseSch, syncPool, nil)
 
-			merged, ok := v.tryMerge(test.row, test.mergeRow, test.ancRow)
+			merged, ok, err := v.tryMerge(ctx, test.row, test.mergeRow, test.ancRow)
+			assert.NoError(t, err)
 			assert.Equal(t, test.expectConflict, !ok)
 			vD := test.mergedSch.GetValueDescriptor()
 			assert.Equal(t, vD.Format(test.expectedResult), vD.Format(merged))

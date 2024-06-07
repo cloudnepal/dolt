@@ -109,6 +109,7 @@ func init() {
 
 // ErrInvalidTableFile is an error returned when a table file is corrupt or invalid.
 var ErrInvalidTableFile = errors.New("invalid or corrupt table file")
+var ErrUnsupportedTableFileFormat = errors.New("unsupported table file format")
 
 type indexEntry interface {
 	Offset() uint64
@@ -116,16 +117,16 @@ type indexEntry interface {
 }
 
 type indexResult struct {
-	o uint64
-	l uint32
+	offset uint64
+	length uint32
 }
 
 func (ir indexResult) Offset() uint64 {
-	return ir.o
+	return ir.offset
 }
 
 func (ir indexResult) Length() uint32 {
-	return ir.l
+	return ir.length
 }
 
 type tableReaderAt interface {
@@ -165,8 +166,6 @@ func newTableReader(index tableIndex, r tableReaderAt, blockSize uint64) (tableR
 
 // Scan across (logically) two ordered slices of address prefixes.
 func (tr tableReader) hasMany(addrs []hasRecord) (bool, error) {
-	// TODO: Use findInIndex if (tr.chunkCount - len(addrs)*Log2(tr.chunkCount)) > (tr.chunkCount - len(addrs))
-
 	filterIdx := uint32(0)
 	filterLen := uint32(tr.idx.chunkCount())
 
@@ -176,8 +175,21 @@ func (tr tableReader) hasMany(addrs []hasRecord) (bool, error) {
 			continue
 		}
 
-		for filterIdx < filterLen && addr.prefix > tr.prefixes[filterIdx] {
-			filterIdx++
+		// Use binary search to find the location of the addr.prefix in
+		// the prefixes array. filterIdx will be at the first entry
+		// where its prefix >= addr.prefix after this search.
+		//
+		// TODO: This is worse than a linear scan for small table files
+		// or for very large queries.
+		j := filterLen
+		for filterIdx < j {
+			h := filterIdx + (j-filterIdx)/2
+			// filterIdx <= h < j
+			if tr.prefixes[h] < addr.prefix {
+				filterIdx = h + 1 // tr.prefixes[filterIdx-1] < addr.prefix
+			} else {
+				j = h // tr.prefixes[j] >= addr.prefix
+			}
 		}
 
 		if filterIdx >= filterLen {
@@ -222,14 +234,14 @@ func (tr tableReader) index() (tableIndex, error) {
 }
 
 // returns true iff |h| can be found in this table.
-func (tr tableReader) has(h addr) (bool, error) {
+func (tr tableReader) has(h hash.Hash) (bool, error) {
 	_, ok, err := tr.idx.lookup(&h)
 	return ok, err
 }
 
 // returns the storage associated with |h|, iff present. Returns nil if absent. On success,
 // the returned byte slice directly references the underlying storage.
-func (tr tableReader) get(ctx context.Context, h addr, stats *Stats) ([]byte, error) {
+func (tr tableReader) get(ctx context.Context, h hash.Hash, stats *Stats) ([]byte, error) {
 	e, found, err := tr.idx.lookup(&h)
 	if err != nil {
 		return nil, err
@@ -252,7 +264,7 @@ func (tr tableReader) get(ctx context.Context, h addr, stats *Stats) ([]byte, er
 		return nil, errors.New("failed to read all data")
 	}
 
-	cmp, err := NewCompressedChunk(hash.Hash(h), buff)
+	cmp, err := NewCompressedChunk(h, buff)
 
 	if err != nil {
 		return nil, err
@@ -272,7 +284,7 @@ func (tr tableReader) get(ctx context.Context, h addr, stats *Stats) ([]byte, er
 }
 
 type offsetRec struct {
-	a      *addr
+	a      *hash.Hash
 	offset uint64
 	length uint32
 }
@@ -485,9 +497,21 @@ func (tr tableReader) findOffsets(reqs []getRecord) (ors offsetRecSlice, remaini
 			continue
 		}
 
-		// advance within the prefixes until we reach one which is >= req.prefix
-		for filterIdx < filterLen && tr.prefixes[filterIdx] < req.prefix {
-			filterIdx++
+		// Use binary search to find the location of the addr.prefix in
+		// the prefixes array. filterIdx will be at the first entry
+		// where its prefix >= addr.prefix after this search.
+		//
+		// TODO: This is worse than a linear scan for small table files
+		// or for very large queries.
+		j := filterLen
+		for filterIdx < j {
+			h := filterIdx + (j-filterIdx)/2
+			// filterIdx <= h < j
+			if tr.prefixes[h] < req.prefix {
+				filterIdx = h + 1 // tr.prefixes[filterIdx-1] < req.prefix
+			} else {
+				j = h // tr.prefixes[j] >= req.prefix
+			}
 		}
 
 		if filterIdx >= filterLen {
@@ -616,12 +640,12 @@ func (tr tableReader) extract(ctx context.Context, chunks chan<- extractRecord) 
 
 	var ors offsetRecSlice
 	for i := uint32(0); i < tr.idx.chunkCount(); i++ {
-		a := new(addr)
-		e, err := tr.idx.indexEntry(i, a)
+		h := new(hash.Hash)
+		e, err := tr.idx.indexEntry(i, h)
 		if err != nil {
 			return err
 		}
-		ors = append(ors, offsetRec{a, e.Offset(), e.Length()})
+		ors = append(ors, offsetRec{h, e.Offset(), e.Length()})
 	}
 	sort.Sort(ors)
 	for _, or := range ors {
@@ -652,7 +676,7 @@ func (tr tableReader) getRecordRanges(requests []getRecord) (map[hash.Hash]Range
 	}
 	ranges := make(map[hash.Hash]Range, len(recs))
 	for _, r := range recs {
-		ranges[hash.Hash(*r.a)] = Range{
+		ranges[*r.a] = Range{
 			Offset: r.offset,
 			Length: r.length,
 		}

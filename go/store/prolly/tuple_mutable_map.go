@@ -60,6 +60,17 @@ func newMutableMap(m Map) *MutableMap {
 	}
 }
 
+// newMutableMapWithDescriptors returns a new MutableMap with the key and value TupleDescriptors overridden to the
+// values specified in |kd| and |vd|. This is useful if you are rewriting the data in a map to change its schema.
+func newMutableMapWithDescriptors(m Map, kd, vd val.TupleDesc) *MutableMap {
+	return &MutableMap{
+		tuples:     m.tuples.Mutate(),
+		keyDesc:    kd,
+		valDesc:    vd,
+		maxPending: defaultMaxPending,
+	}
+}
+
 // Map materializes all pending and applied mutations in the MutableMap.
 func (mut *MutableMap) Map(ctx context.Context) (Map, error) {
 	s := message.NewProllyMapSerializer(mut.valDesc, mut.NodeStore().Pool())
@@ -120,9 +131,18 @@ func (mut *MutableMap) Get(ctx context.Context, key val.Tuple, cb tree.KeyValueF
 	return mut.tuples.Get(ctx, key, cb)
 }
 
+func (mut *MutableMap) GetPrefix(ctx context.Context, key val.Tuple, prefixDesc val.TupleDesc, cb tree.KeyValueFn[val.Tuple, val.Tuple]) (err error) {
+	return mut.tuples.GetPrefix(ctx, key, prefixDesc, cb)
+}
+
 // Has returns true if |key| is present in the MutableMap.
 func (mut *MutableMap) Has(ctx context.Context, key val.Tuple) (ok bool, err error) {
 	return mut.tuples.Has(ctx, key)
+}
+
+// HasPrefix returns true if a key with a matching prefix to |key| is present in the MutableMap.
+func (mut *MutableMap) HasPrefix(ctx context.Context, key val.Tuple, prefixDesc val.TupleDesc) (ok bool, err error) {
+	return mut.tuples.HasPrefix(ctx, key, prefixDesc)
 }
 
 // Checkpoint records a checkpoint that can be reverted to.
@@ -168,6 +188,13 @@ func (mut *MutableMap) flushPending(ctx context.Context) error {
 func (mut *MutableMap) IterAll(ctx context.Context) (MapIter, error) {
 	rng := Range{Fields: nil, Desc: mut.keyDesc}
 	return mut.IterRange(ctx, rng)
+}
+
+// IterKeyRange iterates over a physical key range defined by |start| and
+// |stop|. If |start| and/or |stop| is nil, the range will be open
+// towards that end.
+func (mut *MutableMap) IterKeyRange(ctx context.Context, start, stop val.Tuple) (MapIter, error) {
+	return mut.tuples.Static.IterKeyRange(ctx, start, stop)
 }
 
 // IterRange returns a MapIter that iterates over a Range.

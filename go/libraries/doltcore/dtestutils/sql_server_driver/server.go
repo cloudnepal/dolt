@@ -61,7 +61,11 @@ func (c *Connection) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 func (c Connection) Password() (string, error) {
 	if c.PassFile != "" {
-		bs, err := os.ReadFile(c.PassFile)
+		passFile := c.PassFile
+		if v := os.Getenv("TESTGENDIR"); v != "" {
+			passFile = strings.ReplaceAll(passFile, "$TESTGENDIR", v)
+		}
+		bs, err := os.ReadFile(passFile)
 		if err != nil {
 			return "", err
 		}
@@ -75,6 +79,7 @@ func (c Connection) Password() (string, error) {
 // example, to change server config on a restart.
 type RestartArgs struct {
 	Args *[]string `yaml:"args"`
+	Envs *[]string `yaml:"envs"`
 }
 
 // |TestRepo| represents an init'd dolt repository that is available to a
@@ -134,7 +139,11 @@ func (f WithFile) WriteAtDir(dir string) error {
 		return err
 	}
 	if f.SourcePath != "" {
-		source, err := os.Open(f.SourcePath)
+		sourcePath := f.SourcePath
+		if v := os.Getenv("TESTGENDIR"); v != "" {
+			sourcePath = strings.ReplaceAll(sourcePath, "$TESTGENDIR", v)
+		}
+		source, err := os.Open(sourcePath)
 		if err != nil {
 			return err
 		}
@@ -155,10 +164,15 @@ func (f WithFile) WriteAtDir(dir string) error {
 type Server struct {
 	Name string   `yaml:"name"`
 	Args []string `yaml:"args"`
+	Envs []string `yaml:"envs"`
 
 	// The |Port| which the server will be running on. For now, it is up to
 	// the |Args| to make sure this is true. Defaults to 3308.
 	Port int `yaml:"port"`
+
+	// DebugPort if set to a non-zero value will cause this server to be started with |dlv| listening for a debugger
+	// connection on the port given.
+	DebugPort int `yaml:"debug_port"`
 
 	// Assertions to be run against the log output of the server process
 	// after the server process successfully terminates.
@@ -198,7 +212,7 @@ type Query struct {
 	// |Query|.
 	Result QueryResult `yaml:"result"`
 
-	// If this is non-empty, asserts the the |Query| or the |Exec|
+	// If this is non-empty, asserts the |Query| or the |Exec|
 	// generates an error that matches this string.
 	ErrorMatch string `yaml:"error_match"`
 
@@ -213,7 +227,7 @@ type Query struct {
 
 // |QueryResult| specifies assertions on the results of a |Query|. Columns must
 // be specified for a |Query| and the query results must fully match. If Rows
-// are ommited, anything is allowed as long as all rows are read successfully.
+// are omitted, anything is allowed as long as all rows are read successfully.
 // All assertions here are string equality.
 type QueryResult struct {
 	Columns []string   `yaml:"columns"`

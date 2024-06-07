@@ -21,50 +21,37 @@ import (
 
 var DoltProcedures = []sql.ExternalStoredProcedureDetails{
 	{Name: "dolt_add", Schema: int64Schema("status"), Function: doltAdd},
-	{Name: "dolt_backup", Schema: int64Schema("success"), Function: doltBackup},
+	{Name: "dolt_backup", Schema: int64Schema("status"), Function: doltBackup, ReadOnly: true, AdminOnly: true},
 	{Name: "dolt_branch", Schema: int64Schema("status"), Function: doltBranch},
-	{Name: "dolt_checkout", Schema: int64Schema("status"), Function: doltCheckout},
-	{Name: "dolt_cherry_pick", Schema: stringSchema("hash"), Function: doltCherryPick},
+	{Name: "dolt_checkout", Schema: doltCheckoutSchema, Function: doltCheckout, ReadOnly: true},
+	{Name: "dolt_cherry_pick", Schema: cherryPickSchema, Function: doltCherryPick},
 	{Name: "dolt_clean", Schema: int64Schema("status"), Function: doltClean},
-	{Name: "dolt_clone", Schema: int64Schema("status"), Function: doltClone},
+	{Name: "dolt_clone", Schema: int64Schema("status"), Function: doltClone, AdminOnly: true},
 	{Name: "dolt_commit", Schema: stringSchema("hash"), Function: doltCommit},
 	{Name: "dolt_commit_hash_out", Schema: stringSchema("hash"), Function: doltCommitHashOut},
 	{Name: "dolt_conflicts_resolve", Schema: int64Schema("status"), Function: doltConflictsResolve},
-	{Name: "dolt_fetch", Schema: int64Schema("success"), Function: doltFetch},
+	{Name: "dolt_count_commits", Schema: int64Schema("ahead", "behind"), Function: doltCountCommits, ReadOnly: true},
+	{Name: "dolt_fetch", Schema: int64Schema("status"), Function: doltFetch, AdminOnly: true},
+	{Name: "dolt_undrop", Schema: int64Schema("status"), Function: doltUndrop, AdminOnly: true},
+	{Name: "dolt_purge_dropped_databases", Schema: int64Schema("status"), Function: doltPurgeDroppedDatabases, AdminOnly: true},
+	{Name: "dolt_rebase", Schema: doltRebaseProcedureSchema, Function: doltRebase},
 
 	// dolt_gc is enabled behind a feature flag for now, see dolt_gc.go
-	{Name: "dolt_gc", Schema: int64Schema("success"), Function: doltGC},
+	{Name: "dolt_gc", Schema: int64Schema("status"), Function: doltGC, ReadOnly: true, AdminOnly: true},
 
-	{Name: "dolt_merge", Schema: int64Schema("fast_forward", "conflicts"), Function: doltMerge},
-	{Name: "dolt_pull", Schema: int64Schema("fast_forward", "conflicts"), Function: doltPull},
-	{Name: "dolt_push", Schema: int64Schema("success"), Function: doltPush},
-	{Name: "dolt_remote", Schema: int64Schema("status"), Function: doltRemote},
+	{Name: "dolt_merge", Schema: doltMergeSchema, Function: doltMerge},
+	{Name: "dolt_pull", Schema: doltPullSchema, Function: doltPull, AdminOnly: true},
+	{Name: "dolt_push", Schema: doltPushSchema, Function: doltPush, AdminOnly: true},
+	{Name: "dolt_remote", Schema: int64Schema("status"), Function: doltRemote, AdminOnly: true},
 	{Name: "dolt_reset", Schema: int64Schema("status"), Function: doltReset},
 	{Name: "dolt_revert", Schema: int64Schema("status"), Function: doltRevert},
 	{Name: "dolt_tag", Schema: int64Schema("status"), Function: doltTag},
 	{Name: "dolt_verify_constraints", Schema: int64Schema("violations"), Function: doltVerifyConstraints},
 
-	// Dolt stored procedure aliases
-	// TODO: Add new procedure aliases in doltProcedureAliasSet in go-mysql-server/sql/information_schema/routines.go file
-	{Name: "dadd", Schema: int64Schema("status"), Function: doltAdd},
-	{Name: "dbranch", Schema: int64Schema("status"), Function: doltBranch},
-	{Name: "dcheckout", Schema: int64Schema("status"), Function: doltCheckout},
-	{Name: "dcherry_pick", Schema: stringSchema("hash"), Function: doltCherryPick},
-	{Name: "dclean", Schema: int64Schema("status"), Function: doltClean},
-	{Name: "dclone", Schema: int64Schema("status"), Function: doltClone},
-	{Name: "dcommit", Schema: stringSchema("hash"), Function: doltCommit},
-	{Name: "dfetch", Schema: int64Schema("success"), Function: doltFetch},
-
-	//	{Name: "dgc", Schema: int64Schema("status"), Function: doltGC},
-
-	{Name: "dmerge", Schema: int64Schema("fast_forward", "conflicts"), Function: doltMerge},
-	{Name: "dpull", Schema: int64Schema("fast_forward", "conflicts"), Function: doltPull},
-	{Name: "dpush", Schema: int64Schema("success"), Function: doltPush},
-	{Name: "dremote", Schema: int64Schema("status"), Function: doltRemote},
-	{Name: "dreset", Schema: int64Schema("status"), Function: doltReset},
-	{Name: "drevert", Schema: int64Schema("status"), Function: doltRevert},
-	{Name: "dtag", Schema: int64Schema("status"), Function: doltTag},
-	{Name: "dverify_constraints", Schema: int64Schema("violations"), Function: doltVerifyConstraints},
+	{Name: "dolt_stats_drop", Schema: statsFuncSchema, Function: statsFunc(statsDrop)},
+	{Name: "dolt_stats_restart", Schema: statsFuncSchema, Function: statsFunc(statsRestart)},
+	{Name: "dolt_stats_stop", Schema: statsFuncSchema, Function: statsFunc(statsStop)},
+	{Name: "dolt_stats_status", Schema: statsFuncSchema, Function: statsFunc(statsStatus)},
 }
 
 // stringSchema returns a non-nullable schema with all columns as LONGTEXT.

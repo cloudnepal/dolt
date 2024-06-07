@@ -37,15 +37,10 @@ var (
 var (
 	// InvalidCol is a Column instance that is returned when there is nothing to return and can be tested against.
 	InvalidCol = Column{
-		"invalid",
-		InvalidTag,
-		types.NullKind,
-		false,
-		typeinfo.UnknownType,
-		"",
-		false,
-		"",
-		nil,
+		Name:     "invalid",
+		Tag:      InvalidTag,
+		Kind:     types.NullKind,
+		TypeInfo: typeinfo.UnknownType,
 	}
 )
 
@@ -76,6 +71,15 @@ type Column struct {
 	// Default is the default value of this column. This is the string representation of a sql.Expression.
 	Default string
 
+	// Generated is the generated value of this column. This is the string representation of a sql.Expression.
+	Generated string
+
+	// OnUpdate is the on update value of this column. This is the string representation of a sql.Expression.
+	OnUpdate string
+
+	// Virtual is true if this is a virtual column.
+	Virtual bool
+
 	// AutoIncrement says whether this column auto increments.
 	AutoIncrement bool
 
@@ -97,33 +101,54 @@ func NewColumn(name string, tag uint64, kind types.NomsKind, partOfPK bool, cons
 }
 
 // NewColumnWithTypeInfo creates a Column instance with the given type info.
+// Callers are encouraged to construct schema.Column structs directly instead of using this method, then call
+// ValidateColumn.
 func NewColumnWithTypeInfo(name string, tag uint64, typeInfo typeinfo.TypeInfo, partOfPK bool, defaultVal string, autoIncrement bool, comment string, constraints ...ColConstraint) (Column, error) {
-	for _, c := range constraints {
+	c := Column{
+		Name:          name,
+		Tag:           tag,
+		Kind:          typeInfo.NomsKind(),
+		IsPartOfPK:    partOfPK,
+		TypeInfo:      typeInfo,
+		Default:       defaultVal,
+		AutoIncrement: autoIncrement,
+		Comment:       comment,
+		Constraints:   constraints,
+	}
+
+	err := ValidateColumn(c)
+	if err != nil {
+		return InvalidCol, err
+	}
+
+	return c, nil
+}
+
+// ValidateColumn validates the given column.
+func ValidateColumn(c Column) error {
+	for _, c := range c.Constraints {
 		if c == nil {
-			return Column{}, errors.New("nil passed as a constraint")
+			return errors.New("nil passed as a constraint")
 		}
 	}
 
-	if typeInfo == nil {
-		return Column{}, errors.New("cannot instantiate column with nil type info")
+	if c.TypeInfo == nil {
+		return errors.New("cannot instantiate column with nil type info")
 	}
 
-	return Column{
-		name,
-		tag,
-		typeInfo.NomsKind(),
-		partOfPK,
-		typeInfo,
-		defaultVal,
-		autoIncrement,
-		comment,
-		constraints,
-	}, nil
+	if c.TypeInfo.NomsKind() != c.Kind {
+		return errors.New("type info and kind do not match")
+	}
+
+	return nil
 }
 
 // IsNullable returns whether the column can be set to a null value.
 func (c Column) IsNullable() bool {
 	if c.IsPartOfPK {
+		return false
+	}
+	if c.AutoIncrement {
 		return false
 	}
 	for _, cnst := range c.Constraints {
@@ -138,6 +163,16 @@ func (c Column) IsNullable() bool {
 func (c Column) Equals(other Column) bool {
 	return c.Name == other.Name &&
 		c.Tag == other.Tag &&
+		c.Kind == other.Kind &&
+		c.IsPartOfPK == other.IsPartOfPK &&
+		c.TypeInfo.Equals(other.TypeInfo) &&
+		c.Default == other.Default &&
+		ColConstraintsAreEqual(c.Constraints, other.Constraints)
+}
+
+// EqualsWithoutTag tests equality between two columns, but does not check the columns' tags.
+func (c Column) EqualsWithoutTag(other Column) bool {
+	return c.Name == other.Name &&
 		c.Kind == other.Kind &&
 		c.IsPartOfPK == other.IsPartOfPK &&
 		c.TypeInfo.Equals(other.TypeInfo) &&

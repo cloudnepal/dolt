@@ -31,8 +31,8 @@ import (
 func TestCommitHooksNoErrors(t *testing.T) {
 	dEnv, err := CreateEnvWithSeedData()
 	require.NoError(t, err)
+	defer dEnv.DoltDB.Close()
 
-	AddDoltSystemVariables()
 	sql.SystemVariables.SetGlobal(dsess.SkipReplicationErrors, true)
 	sql.SystemVariables.SetGlobal(dsess.ReplicateToRemote, "unknown")
 	bThreads := sql.NewBackgroundThreads()

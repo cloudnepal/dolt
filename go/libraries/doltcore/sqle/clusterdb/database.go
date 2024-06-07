@@ -24,22 +24,28 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
+	"github.com/dolthub/dolt/go/libraries/utils/concurrentmap"
 )
+
+const DoltClusterDbName = "dolt_cluster"
 
 type database struct {
 	statusProvider ClusterStatusProvider
 }
 
 var _ sql.Database = database{}
-var _ sqle.SqlDatabase = database{}
+var _ dsess.SqlDatabase = database{}
 
 const StatusTableName = "dolt_cluster_status"
 
 func (database) Name() string {
-	return "dolt_cluster"
+	return DoltClusterDbName
+}
+
+func (db database) Schema() string {
+	return ""
 }
 
 func (db database) GetTableInsensitive(ctx *sql.Context, tblName string) (sql.Table, bool, error) {
@@ -77,13 +83,31 @@ func (database) DropStoredProcedure(ctx *sql.Context, name string) error {
 	return errors.New("unimplemented")
 }
 
+var _ sql.ViewDatabase = database{}
+
+func (db database) CreateView(ctx *sql.Context, name string, selectStatement, createViewStmt string) error {
+	return errors.New("unimplemented")
+}
+
+func (db database) DropView(ctx *sql.Context, name string) error {
+	return errors.New("unimplemented")
+}
+
+func (db database) GetViewDefinition(ctx *sql.Context, viewName string) (sql.ViewDefinition, bool, error) {
+	return sql.ViewDefinition{}, false, nil
+}
+
+func (db database) AllViews(ctx *sql.Context) ([]sql.ViewDefinition, error) {
+	return nil, nil
+}
+
 var _ sql.ReadOnlyDatabase = database{}
 
 func (database) IsReadOnly() bool {
 	return true
 }
 
-func (db database) InitialDBState(ctx context.Context, branch string) (dsess.InitialDbState, error) {
+func (db database) InitialDBState(ctx *sql.Context) (dsess.InitialDbState, error) {
 	// TODO: almost none of this state is actually used, but is necessary because the current session setup requires a
 	//  repo state writer
 	return dsess.InitialDbState{
@@ -92,34 +116,54 @@ func (db database) InitialDBState(ctx context.Context, branch string) (dsess.Ini
 			Rsw: noopRepoStateWriter{},
 		},
 		ReadOnly: true,
+		Remotes:  concurrentmap.New[string, env.Remote](),
 	}, nil
 }
 
-func (db database) GetRoot(context *sql.Context) (*doltdb.RootValue, error) {
+func (db database) WithBranchRevision(requestedName string, branchSpec dsess.SessionDatabaseBranchSpec) (dsess.SqlDatabase, error) {
+	// Nothing to do here, we don't support changing branch revisions
+	return db, nil
+}
+
+func (db database) DoltDatabases() []*doltdb.DoltDB {
+	return nil
+}
+
+func (db database) GetRoot(context *sql.Context) (doltdb.RootValue, error) {
 	return nil, errors.New("unimplemented")
 }
 
 func (db database) DbData() env.DbData {
-	panic("unimplemented")
-}
-
-func (db database) Flush(context *sql.Context) error {
-	return errors.New("unimplemented")
+	return env.DbData{}
 }
 
 func (db database) EditOptions() editor.Options {
 	return editor.Options{}
 }
 
+func (db database) Revision() string {
+	return ""
+}
+
+func (db database) Versioned() bool {
+	return false
+}
+
+func (db database) RevisionType() dsess.RevisionType {
+	return dsess.RevisionTypeNone
+}
+
+func (db database) RevisionQualifiedName() string {
+	return db.Name()
+}
+
+func (db database) RequestedName() string {
+	return db.Name()
+}
+
 type noopRepoStateWriter struct{}
 
-func (n noopRepoStateWriter) UpdateStagedRoot(ctx context.Context, newRoot *doltdb.RootValue) error {
-	return nil
-}
-
-func (n noopRepoStateWriter) UpdateWorkingRoot(ctx context.Context, newRoot *doltdb.RootValue) error {
-	return nil
-}
+var _ env.RepoStateWriter = noopRepoStateWriter{}
 
 func (n noopRepoStateWriter) SetCWBHeadRef(ctx context.Context, marshalableRef ref.MarshalableRef) error {
 	return nil

@@ -43,11 +43,11 @@ func TestEndToEnd(t *testing.T) {
 	tableName := "people"
 	dropCreateStatement := sqlfmt.DropTableIfExistsStmt(tableName) + "\n" +
 		"CREATE TABLE `people` (\n" +
-		"  `id` varchar(16383) NOT NULL,\n" +
-		"  `name` varchar(16383) NOT NULL,\n" +
+		"  `id` varchar(1023) NOT NULL,\n" +
+		"  `name` varchar(1023) NOT NULL,\n" +
 		"  `age` bigint unsigned NOT NULL,\n" +
 		"  `is_married` bigint NOT NULL,\n" +
-		"  `title` varchar(16383),\n" +
+		"  `title` varchar(1023),\n" +
 		"  PRIMARY KEY (`id`),\n" +
 		"  KEY `idx_name` (`name`),\n" +
 		"  CONSTRAINT `test-check` CHECK ((`age` < 123))\n" +
@@ -88,6 +88,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			dEnv := dtestutils.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
 
@@ -102,7 +103,7 @@ func TestEndToEnd(t *testing.T) {
 			tbl, err := doltdb.NewTable(ctx, root.VRW(), root.NodeStore(), tt.sch, empty, indexes, nil)
 			require.NoError(t, err)
 
-			root, err = root.PutTable(ctx, tableName, tbl)
+			root, err = root.PutTable(ctx, doltdb.TableName{Name: tableName}, tbl)
 			require.NoError(t, err)
 
 			var stringWr StringBuilderCloser

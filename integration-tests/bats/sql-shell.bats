@@ -21,43 +21,26 @@ teardown() {
     teardown_common
 }
 
-@test "sql-shell: --user option changes superuser" {
-    # remove config
-    rm -rf .doltcfg
-
-    # default is root@localhost
-    run dolt sql <<< "select user, host from mysql.user"
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "root" ]] || false
-    ! [[ "$output" =~ "dolt" ]] || false
-    [[ "$output" =~ "localhost" ]] || false
-
-    # make it dolt@localhost
-    run dolt sql --user=dolt <<< "select user, host from mysql.user"
-    [ "$status" -eq 0 ]
-    ! [[ "$output" =~ "root" ]] || false
-    [[ "$output" =~ "dolt" ]] || false
-    [[ "$output" =~ "localhost" ]] || false
-
-    # remove config
-    rm -rf .doltcfg
-}
-
 @test "sql-shell: use user without privileges, and no superuser created" {
     rm -rf .doltcfg
 
     # default user is root
     run dolt sql <<< "select user from mysql.user"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "root" ]]
+    [[ "$output" =~ "root" ]] || false
 
     # create user
     run dolt sql <<< "create user new_user@'localhost'"
     [ "$status" -eq 0 ]
 
-    run dolt sql --user=new_user <<< "select user from mysql.user"
+    run dolt --user=new_user sql <<< "select user from mysql.user"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "Access denied for user" ]]
+    # https://github.com/dolthub/dolt/issues/6307 
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      [[ "$output" =~ "Access denied for user 'new_user'@'localhost'" ]] || false
+    else
+      [[ "$output" =~ "command denied to user 'new_user'@'localhost'" ]] || false
+    fi
 
     rm -rf .doltcfg
 }
@@ -69,6 +52,7 @@ teardown() {
     [[ "$output" =~ "test" ]] || false
 }
 
+# bats test_tags=no_lambda
 @test "sql-shell: sql shell writes to disk after every iteration (autocommit)" {
     skiponwindows "Need to install expect and make this script work on windows."
     run $BATS_TEST_DIRNAME/sql-shell.expect
@@ -76,18 +60,105 @@ teardown() {
 
     # 2 tables are created. 1 from above and 1 in the expect file.
     [[ "$output" =~ "+---------------------" ]] || false
-    [[ "$output" =~ "| Tables_in_dolt_repo_" ]] || false
+    [[ "$output" =~ "| Tables_in_dolt-repo-" ]] || false
     [[ "$output" =~ "+---------------------" ]] || false
     [[ "$output" =~ "| test                " ]] || false
     [[ "$output" =~ "| test_expect         " ]] || false
     [[ "$output" =~ "+---------------------" ]] || false
 }
 
+# bats test_tags=no_lambda
+@test "sql-shell: sql shell executes slash commands" {
+    skiponwindows "Need to install expect and make this script work on windows."
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Current test setup results in remote calls having a clean branch, where this expect script expects dirty."
+    fi
+    run $BATS_TEST_DIRNAME/sql-shell-slash-cmds.expect
+    echo "$output"
+
+    [ "$status" -eq 0 ]
+}
+
+# bats test_tags=no_lambda
+@test "sql-shell: sql shell prompt updates" {
+    skiponwindows "Need to install expect and make this script work on windows."
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Presently sql command will not connect to remote server due to lack of lock file where there are not DBs."
+    fi
+
+    # start in an empty directory
+    rm -rf .dolt
+    mkdir sql_shell_test
+    cd sql_shell_test
+
+    $BATS_TEST_DIRNAME/sql-shell-prompt.expect
+}
+
+# bats test_tags=no_lambda
 @test "sql-shell: shell works after failing query" {
     skiponwindows "Need to install expect and make this script work on windows."
     $BATS_TEST_DIRNAME/sql-works-after-failing-query.expect
 }
 
+# bats test_tags=no_lambda
+@test "sql-shell: empty DB in prompt is OK" {
+    skiponwindows "Need to install expect and make this script work on windows."
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Presently sql command will not connect to remote server due to lack of lock file where there are not DBs."
+    fi
+    # ignore common setup. Use an empty db with no server.
+    rm -rf .dolt
+    mkdir emptyDb
+    cd emptyDb
+    $BATS_TEST_DIRNAME/sql-shell-empty-prompt.expect
+}
+
+@test "sql-shell: works with ANSI_QUOTES SQL mode" {
+    if [ $SQL_ENGINE = "remote-engine" ]; then
+      skip "Presently sql command will not connect to remote server due to lack of lock file where there are not DBs."
+    fi
+
+    mkdir doltsql
+    cd doltsql
+    dolt init
+
+    dolt sql << SQL
+SET @@SQL_MODE=ANSI_QUOTES;
+CREATE TABLE "table1"("pk" int primary key, "col1" int DEFAULT ("pk"));
+CREATE TRIGGER trigger1 BEFORE INSERT ON "table1" FOR EACH ROW SET NEW."pk" = NEW."pk" + 1;
+INSERT INTO "table1" ("pk") VALUES (1);
+CREATE VIEW "view1" AS select "pk", "col1" from "table1";
+CREATE PROCEDURE procedure1() SELECT "pk", "col1" from "table1";
+SQL
+
+    # In a new session, with SQL_MODE set back to the default modes, assert that
+    # we can still use the entities we created with ANSI_QUOTES.
+    run dolt sql -q "INSERT INTO table1 (pk) VALUES (111);"
+    [ $status -eq "0" ]
+    [[ $output =~ "Query OK" ]] || false
+
+    run dolt sql -r csv -q "SELECT * from table1;"
+    [ $status -eq "0" ]
+    [[ $output =~ "2,1" ]] || false
+    [[ $output =~ "112,111" ]] || false
+
+    run dolt sql -q "show tables;"
+    [ $status -eq "0" ]
+    [[ $output =~ "table1" ]] || false
+    [[ $output =~ "view1" ]] || false
+
+    run dolt sql -r csv -q "SELECT * from view1;"
+    [ $status -eq "0" ]
+    [[ $output =~ "2,1" ]] || false
+    [[ $output =~ "112,111" ]] || false
+
+    run dolt sql -r csv -q "call procedure1;"
+    [ $status -eq "0" ]
+    [[ $output =~ "2,1" ]] || false
+    [[ $output =~ "112,111" ]] || false
+}
+
+# bats test_tags=no_lambda
 @test "sql-shell: delimiter" {
     skiponwindows "Need to install expect and make this script work on windows."
     mkdir doltsql
@@ -114,6 +185,7 @@ teardown() {
     rm -rf doltsql
 }
 
+# bats test_tags=no_lambda
 @test "sql-shell: use databases" {
     skiponwindows "Need to install expect and make this script work on windows."
     mkdir doltsql
@@ -168,6 +240,10 @@ teardown() {
 }
 
 @test "sql-shell: specify data-dir" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
+
     # remove config files
     rm -rf .doltcfg
     rm -rf db_dir
@@ -195,14 +271,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir <<< "show databases;"
+    run dolt --data-dir=db_dir sql <<< "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -214,11 +290,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir <<< "create user new_user"
+    run dolt --data-dir=db_dir sql <<< "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -258,12 +334,15 @@ teardown() {
 }
 
 @test "sql-shell: specify doltcfg directory" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
     # remove any previous config directories
     rm -rf .doltcfg
     rm -rf doltcfgdir
 
     # show users, expect just root user
-    run dolt sql --doltcfg-dir=doltcfgdir <<< "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -273,11 +352,11 @@ teardown() {
     ! [[ "$output" =~ "doltcfgdir" ]] || false
 
     # create new_user
-    run dolt sql --doltcfg-dir=doltcfgdir <<< "create user new_user"
+    run dolt --doltcfg-dir=doltcfgdir sql <<< "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --doltcfg-dir=doltcfgdir <<< "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -295,12 +374,15 @@ teardown() {
 }
 
 @test "sql-shell: specify privilege file" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
     # remove config files
     rm -rf .doltcfg
     rm -f privs.db
 
     # show users, expect just root user
-    run dolt sql --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
 
@@ -309,11 +391,11 @@ teardown() {
     ! [[ "$output" =~ "privs.db" ]] || false
 
     # create new_user
-    run dolt sql --privilege-file=privs.db <<< "create user new_user"
+    run dolt --privilege-file=privs.db sql <<< "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
 
@@ -332,6 +414,10 @@ teardown() {
 }
 
 @test "sql-shell: specify data-dir and doltcfg-dir" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
+
     # remove config files
     rm -rf .doltcfg
     rm -rf db_dir
@@ -360,14 +446,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir <<< "show databases;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql <<< "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -380,11 +466,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir <<< "create user new_user"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql <<< "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -417,7 +503,7 @@ teardown() {
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --doltcfg-dir=../doltcfgdir <<< "select user from mysql.user"
+    run dolt --doltcfg-dir=../doltcfgdir sql <<< "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -431,6 +517,10 @@ teardown() {
 }
 
 @test "sql-shell: specify data-dir and privilege-file" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
+
     # remove config files
     rm -rf .doltcfg
     rm -rf db_dir
@@ -459,14 +549,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db <<< "show databases;"
+    run dolt --data-dir=db_dir --privilege-file=privs.db sql <<< "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -478,11 +568,10 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db <<< "create user new_user"
-    [ "$status" -eq 0 ]
+    dolt --data-dir=db_dir --privilege-file=privs.db sql <<< "create user new_user"
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -515,7 +604,7 @@ teardown() {
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --privilege-file=../privs.db <<< "select user from mysql.user"
+    run dolt --privilege-file=../privs.db sql <<< "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -529,13 +618,16 @@ teardown() {
 }
 
 @test "sql-shell: specify doltcfg-dir and privilege-file" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
     # remove any previous config directories
     rm -rf .doltcfg
     rm -rf doltcfgdir
     rm -rf privs.db
 
     # show users, expect just root user
-    run dolt sql --doltcfg-dir=doltcfgdir --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -545,11 +637,11 @@ teardown() {
     ! [[ "$output" =~ "doltcfgdir" ]] || false
 
     # create new_user
-    run dolt sql --doltcfg-dir=doltcfgdir --privilege-file=privs.db <<< "create user new_user"
+    run dolt --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql <<< "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --doltcfg-dir=doltcfgdir --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -570,6 +662,10 @@ teardown() {
 }
 
 @test "sql-shell: specify data directory, cfg directory, and privilege file" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
+
     # remove config files
     rm -rf .doltcfg
     rm -rf db_dir
@@ -599,14 +695,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db <<< "show databases;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql <<< "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -619,11 +715,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db <<< "create user new_user"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql <<< "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db <<< "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql <<< "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -659,13 +755,13 @@ teardown() {
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --doltcfg-dir=../doltcfgdir <<< "select user from mysql.user"
+    run dolt --doltcfg-dir=../doltcfgdir sql <<< "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --privilege-file=../privs.db <<< "select user from mysql.user"
+    run dolt --privilege-file=../privs.db sql <<< "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -681,6 +777,10 @@ teardown() {
 
 
 @test "sql-shell: .doltcfg in parent directory errors" {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Remote behavior differs"
+    fi
+
     # remove existing directories
     rm -rf .doltcfg
     rm -rf inner_db
@@ -695,7 +795,7 @@ teardown() {
     [[ "$output" =~ "multiple .doltcfg directories detected" ]] || false
 
     # specifying datadir, resolves issue
-    run dolt sql --data-dir=. <<< "show databases;"
+    run dolt --data-dir=. sql <<< "show databases;"
     [ "$status" -eq 0 ]
 
     # remove existing directories
@@ -769,24 +869,24 @@ teardown() {
     mkdir new_repo
     cd new_repo
 
-    run dolt sql --data-dir=$DATADIR <<< "show databases"
+    run dolt --data-dir=$DATADIR sql <<< "show databases"
     [ $status -eq 0 ]
     [[ $output =~ "db1" ]] || false
     [[ $output =~ "db2" ]] || false
     [[ $output =~ "db3" ]] || false
 
-    run dolt sql --data-dir=$DATADIR <<< "create user new_user"
+    run dolt --data-dir=$DATADIR sql <<< "create user new_user"
     [ $status -eq 0 ]
 
-    run dolt sql --data-dir=$DATADIR <<< "use db1; select user from mysql.user"
-    [ $status -eq 0 ]
-    [[ $output =~ "new_user" ]] || false
-
-    run dolt sql --data-dir=$DATADIR <<< "use db2; select user from mysql.user"
+    run dolt --data-dir=$DATADIR sql <<< "use db1; select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ "new_user" ]] || false
 
-    run dolt sql --data-dir=$DATADIR <<< "use db3; select user from mysql.user"
+    run dolt --data-dir=$DATADIR sql <<< "use db2; select user from mysql.user"
+    [ $status -eq 0 ]
+    [[ $output =~ "new_user" ]] || false
+
+    run dolt --data-dir=$DATADIR sql <<< "use db3; select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ "new_user" ]] || false
 
@@ -820,7 +920,7 @@ teardown() {
 @test "sql-shell: inline query with missing -q flag should error" {
     run dolt sql "SELECT * FROM test;"
     [ $status -eq 1 ]
-    [[ "$output" =~ "Invalid Argument:" ]] || false
+    [[ "$output" =~ "does not take positional arguments, but found 1" ]] || false
 }
 
 @test "sql-shell: validate string formatting" {
@@ -847,9 +947,7 @@ SQL
   dolt sql -q "SELECT * FROM test2" -r json
   run dolt sql -q "SELECT * FROM test2" -r json
   [ $status -eq 0 ]
-  # The golang json encoder escapes < and > and & for HTML compatibility
-  JSON_TESTSTR='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`~!@#$%^\u0026*()){}[]/=?+|,.\u003c\u003e;:_-_%d%s%f'
-  [[ "$output" =~ "$JSON_TESTSTR" ]] || false
+  [[ "$output" =~ "$TESTSTR" ]] || false
 
   dolt add .
   dolt commit -m "added data"

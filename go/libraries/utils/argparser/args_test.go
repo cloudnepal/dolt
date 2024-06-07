@@ -195,13 +195,13 @@ func TestParsing(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			parser := NewArgParser()
+			parser := NewArgParserWithVariableArgs("test")
 
 			for _, opt := range test.options {
 				parser.SupportOption(opt)
 			}
 
-			exp := &ArgParseResults{test.expectedOpts, test.expectedArgs, parser}
+			exp := &ArgParseResults{test.expectedOpts, test.expectedArgs, parser, NO_POSITIONAL_ARGS}
 
 			res, err := parser.Parse(test.args)
 			if test.expectedErr != "" {
@@ -215,7 +215,7 @@ func TestParsing(t *testing.T) {
 }
 
 func TestValidation(t *testing.T) {
-	ap := NewArgParser()
+	ap := NewArgParserWithVariableArgs("test")
 	ap.SupportsString("string", "s", "string_value", "A string")
 	ap.SupportsString("string2", "", "string_value", "Another string")
 	ap.SupportsFlag("flag", "f", "A flag")
@@ -279,4 +279,47 @@ func TestValidation(t *testing.T) {
 	if apr.NArg() != 3 || apr.Arg(0) != "a" || !reflect.DeepEqual(apr.Args, expectedArgs) {
 		t.Error("Arg list issues")
 	}
+}
+
+func TestDropValue(t *testing.T) {
+	ap := NewArgParserWithVariableArgs("test")
+
+	ap.SupportsString("string", "", "string_value", "A string")
+	ap.SupportsFlag("flag", "", "A flag")
+
+	apr, err := ap.Parse([]string{"--string", "str", "--flag", "1234"})
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	newApr1 := apr.DropValue("string")
+	require.NotEqualf(t, apr, newApr1, "Original value and new value are equal")
+
+	_, hasVal := newApr1.GetValue("string")
+	if hasVal {
+		t.Error("DropValue failed to drop string")
+	}
+	_, hasVal = newApr1.GetValue("flag")
+	if !hasVal {
+		t.Error("DropValue dropped the wrong value")
+	}
+	if newApr1.NArg() != 1 || newApr1.Arg(0) != "1234" {
+		t.Error("DropValue didn't preserve args")
+	}
+
+	newApr2 := apr.DropValue("flag")
+	require.NotEqualf(t, apr, newApr2, "DropValue failes to drop flag")
+
+	_, hasVal = newApr2.GetValue("string")
+	if !hasVal {
+		t.Error("DropValue dropped the wrong value")
+	}
+	_, hasVal = newApr2.GetValue("flag")
+	if hasVal {
+		t.Error("DropValue failed to drop flag")
+	}
+	if newApr2.NArg() != 1 || newApr2.Arg(0) != "1234" {
+		t.Error("DropValue didn't preserve args")
+	}
+
 }

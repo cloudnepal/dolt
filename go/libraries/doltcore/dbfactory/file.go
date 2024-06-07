@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/dolthub/dolt/go/store/nbs"
@@ -32,7 +33,7 @@ import (
 
 func init() {
 	// default to chunk journal unless feature flag is set
-	if os.Getenv("DOLT_DISABLE_CHUNK_JOURNAL") != "" {
+	if os.Getenv(dconfig.EnvDisableChunkJournal) != "" {
 		chunkJournalFeatureFlag = false
 	}
 }
@@ -46,11 +47,15 @@ const (
 	// DataDir is the directory internal to the DoltDir which holds the noms files.
 	DataDir = "noms"
 
+	// StatsDir is the directory in DoltDir that holds the database statistics
+	StatsDir = "stats"
+
 	ChunkJournalParam = "journal"
 )
 
 // DoltDataDir is the directory where noms files will be stored
 var DoltDataDir = filepath.Join(DoltDir, DataDir)
+var DoltStatsDir = filepath.Join(DoltDir, StatsDir)
 
 // FileFactory is a DBFactory implementation for creating local filesys backed databases
 type FileFactory struct {
@@ -162,12 +167,16 @@ func (fact FileFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFormat, 
 	}
 
 	oldGenSt, err := nbs.NewLocalStore(ctx, newGenSt.Version(), oldgenPath, defaultMemTableSize, q)
-
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	st := nbs.NewGenerationalCS(oldGenSt, newGenSt)
+	ghostGen, err := nbs.NewGhostBlockStore(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	st := nbs.NewGenerationalCS(oldGenSt, newGenSt, ghostGen)
 	// metrics?
 
 	vrw := types.NewValueStore(st)

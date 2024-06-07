@@ -50,7 +50,7 @@ func RefFromArtifactIndex(ctx context.Context, vrw types.ValueReadWriter, idx Ar
 		return refFromNomsValue(ctx, vrw, b)
 
 	default:
-		return types.Ref{}, errNbfUnkown
+		return types.Ref{}, errNbfUnknown
 	}
 }
 
@@ -69,7 +69,7 @@ func NewEmptyArtifactIndex(ctx context.Context, vrw types.ValueReadWriter, ns tr
 		return ArtifactIndexFromProllyMap(m), nil
 
 	default:
-		return nil, errNbfUnkown
+		return nil, errNbfUnknown
 	}
 }
 
@@ -107,7 +107,7 @@ func artifactIndexFromAddr(ctx context.Context, vrw types.ValueReadWriter, ns tr
 		return ArtifactIndexFromProllyMap(m), nil
 
 	default:
-		return nil, errNbfUnkown
+		return nil, errNbfUnknown
 	}
 }
 
@@ -137,7 +137,11 @@ func (i prollyArtifactIndex) ConflictCount(ctx context.Context) (uint64, error) 
 }
 
 func (i prollyArtifactIndex) ConstraintViolationCount(ctx context.Context) (uint64, error) {
-	return i.index.CountOfTypes(ctx, prolly.ArtifactTypeForeignKeyViol, prolly.ArtifactTypeUniqueKeyViol, prolly.ArtifactTypeChkConsViol)
+	return i.index.CountOfTypes(ctx,
+		prolly.ArtifactTypeForeignKeyViol,
+		prolly.ArtifactTypeUniqueKeyViol,
+		prolly.ArtifactTypeChkConsViol,
+		prolly.ArtifactTypeNullViol)
 }
 
 func (i prollyArtifactIndex) ClearConflicts(ctx context.Context) (ArtifactIndex, error) {

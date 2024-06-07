@@ -73,7 +73,7 @@ func (cmd ReadTablesCmd) RequiresRepo() bool {
 }
 
 func (cmd ReadTablesCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithVariableArgs(cmd.Name())
 	ap.ArgListHelp = [][2]string{
 		{"remote-repo", "Remote repository to retrieve data from"},
 		{"commit", "Branch or commit hash representing a point in time to retrieve tables from"},
@@ -84,7 +84,7 @@ func (cmd ReadTablesCmd) ArgParser() *argparser.ArgParser {
 }
 
 // Exec executes the command
-func (cmd ReadTablesCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd ReadTablesCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, readTablesDocs, ap))
@@ -144,7 +144,7 @@ func (cmd ReadTablesCmd) Exec(ctx context.Context, commandStr string, args []str
 	}
 
 	if len(tblNames) == 0 {
-		tblNames, err = srcRoot.GetTableNames(ctx)
+		tblNames, err = srcRoot.GetTableNames(ctx, doltdb.DefaultSchemaName)
 
 		if err != nil {
 			return BuildVerrAndExit("Unable to read tables.", err)
@@ -168,8 +168,8 @@ func (cmd ReadTablesCmd) Exec(ctx context.Context, commandStr string, args []str
 	return 0
 }
 
-func pullTableValue(ctx context.Context, dEnv *env.DoltEnv, srcDB *doltdb.DoltDB, srcRoot, destRoot *doltdb.RootValue, language progLanguage, tblName, commitStr string) (*doltdb.RootValue, errhand.VerboseError) {
-	tbl, ok, err := srcRoot.GetTable(ctx, tblName)
+func pullTableValue(ctx context.Context, dEnv *env.DoltEnv, srcDB *doltdb.DoltDB, srcRoot, destRoot doltdb.RootValue, language progLanguage, tblName, commitStr string) (doltdb.RootValue, errhand.VerboseError) {
+	tbl, ok, err := srcRoot.GetTable(ctx, doltdb.TableName{Name: tblName})
 	if !ok {
 		return nil, errhand.BuildDError("No table named '%s' at '%s'", tblName, commitStr).Build()
 	} else if err != nil {
@@ -190,7 +190,7 @@ func pullTableValue(ctx context.Context, dEnv *env.DoltEnv, srcDB *doltdb.DoltDB
 	cli.Println("Retrieving", tblName)
 	runProgFunc := buildProgStarter(language)
 	wg, pullerEventCh := runProgFunc(newCtx)
-	err = dEnv.DoltDB.PullChunks(ctx, tmpDir, srcDB, []hash.Hash{tblHash}, pullerEventCh)
+	err = dEnv.DoltDB.PullChunks(ctx, tmpDir, srcDB, []hash.Hash{tblHash}, pullerEventCh, nil)
 	stopProgFuncs(cancelFunc, wg, pullerEventCh)
 	if err != nil {
 		return nil, errhand.BuildDError("Failed reading chunks for remote table '%s' at '%s'", tblName, commitStr).AddCause(err).Build()
@@ -204,7 +204,7 @@ func pullTableValue(ctx context.Context, dEnv *env.DoltEnv, srcDB *doltdb.DoltDB
 	return destRoot, nil
 }
 
-func getRemoteDBAtCommit(ctx context.Context, remoteUrl string, remoteUrlParams map[string]string, commitStr string, dEnv *env.DoltEnv) (*doltdb.DoltDB, *doltdb.RootValue, errhand.VerboseError) {
+func getRemoteDBAtCommit(ctx context.Context, remoteUrl string, remoteUrlParams map[string]string, commitStr string, dEnv *env.DoltEnv) (*doltdb.DoltDB, doltdb.RootValue, errhand.VerboseError) {
 	_, srcDB, verr := createRemote(ctx, "temp", remoteUrl, remoteUrlParams, dEnv)
 
 	if verr != nil {
@@ -217,14 +217,16 @@ func getRemoteDBAtCommit(ctx context.Context, remoteUrl string, remoteUrlParams 
 		return nil, nil, errhand.BuildDError("Invalid Commit '%s'", commitStr).Build()
 	}
 
-	cm, err := srcDB.Resolve(ctx, cs, nil)
-
+	optCmt, err := srcDB.Resolve(ctx, cs, nil)
 	if err != nil {
 		return nil, nil, errhand.BuildDError("Failed to find commit '%s'", commitStr).Build()
 	}
+	cm, ok := optCmt.ToCommit()
+	if !ok {
+		return nil, nil, errhand.BuildDError(doltdb.ErrGhostCommitEncountered.Error()).Build()
+	}
 
 	srcRoot, err := cm.GetRootValue(ctx)
-
 	if err != nil {
 		return nil, nil, errhand.BuildDError("Failed to read from database").AddCause(err).Build()
 	}

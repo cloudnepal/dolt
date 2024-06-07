@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"sync"
 
+	flatbuffers "github.com/dolthub/flatbuffers/v23/go"
 	"github.com/dolthub/go-mysql-server/sql"
-	flatbuffers "github.com/google/flatbuffers/go"
 
 	"github.com/dolthub/dolt/go/gen/fb/serial"
 )
@@ -57,7 +57,7 @@ func newNamespace(accessTbl *Access) *Namespace {
 		Users:     nil,
 		Hosts:     nil,
 		Values:    nil,
-		RWMutex:   &sync.RWMutex{},
+		RWMutex:   accessTbl.RWMutex,
 	}
 }
 
@@ -134,9 +134,6 @@ func (tbl *Namespace) Access() *Access {
 
 // Serialize returns the offset for the Namespace table written to the given builder.
 func (tbl *Namespace) Serialize(b *flatbuffers.Builder) flatbuffers.UOffsetT {
-	tbl.RWMutex.RLock()
-	defer tbl.RWMutex.RUnlock()
-
 	// Serialize the binlog
 	binlog := tbl.binlog.Serialize(b)
 	// Initialize field offset slices
@@ -198,15 +195,17 @@ func (tbl *Namespace) Serialize(b *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return serial.BranchControlNamespaceEnd(b)
 }
 
+func (tbl *Namespace) reinit() {
+	tbl.binlog = NewNamespaceBinlog(nil)
+	tbl.Databases = nil
+	tbl.Branches = nil
+	tbl.Users = nil
+	tbl.Hosts = nil
+	tbl.Values = nil
+}
+
 // Deserialize populates the table with the data from the flatbuffers representation.
 func (tbl *Namespace) Deserialize(fb *serial.BranchControlNamespace) error {
-	tbl.RWMutex.Lock()
-	defer tbl.RWMutex.Unlock()
-
-	// Verify that the table is empty
-	if len(tbl.Values) != 0 {
-		return fmt.Errorf("cannot deserialize to a non-empty namespace table")
-	}
 	// Verify that all fields have the same length
 	if fb.DatabasesLength() != fb.BranchesLength() ||
 		fb.BranchesLength() != fb.UsersLength() ||
@@ -222,6 +221,9 @@ func (tbl *Namespace) Deserialize(fb *serial.BranchControlNamespace) error {
 	if err = tbl.binlog.Deserialize(binlog); err != nil {
 		return err
 	}
+
+	tbl.reinit()
+
 	// Initialize every slice
 	tbl.Databases = make([]MatchExpression, fb.DatabasesLength())
 	tbl.Branches = make([]MatchExpression, fb.BranchesLength())
@@ -231,31 +233,46 @@ func (tbl *Namespace) Deserialize(fb *serial.BranchControlNamespace) error {
 	// Read the databases
 	for i := 0; i < fb.DatabasesLength(); i++ {
 		serialMatchExpr := &serial.BranchControlMatchExpression{}
-		fb.Databases(serialMatchExpr, i)
+		_, err = fb.TryDatabases(serialMatchExpr, i)
+		if err != nil {
+			return err
+		}
 		tbl.Databases[i] = deserializeMatchExpression(serialMatchExpr)
 	}
 	// Read the branches
 	for i := 0; i < fb.BranchesLength(); i++ {
 		serialMatchExpr := &serial.BranchControlMatchExpression{}
-		fb.Branches(serialMatchExpr, i)
+		_, err = fb.TryBranches(serialMatchExpr, i)
+		if err != nil {
+			return err
+		}
 		tbl.Branches[i] = deserializeMatchExpression(serialMatchExpr)
 	}
 	// Read the users
 	for i := 0; i < fb.UsersLength(); i++ {
 		serialMatchExpr := &serial.BranchControlMatchExpression{}
-		fb.Users(serialMatchExpr, i)
+		_, err = fb.TryUsers(serialMatchExpr, i)
+		if err != nil {
+			return err
+		}
 		tbl.Users[i] = deserializeMatchExpression(serialMatchExpr)
 	}
 	// Read the hosts
 	for i := 0; i < fb.HostsLength(); i++ {
 		serialMatchExpr := &serial.BranchControlMatchExpression{}
-		fb.Hosts(serialMatchExpr, i)
+		_, err = fb.TryHosts(serialMatchExpr, i)
+		if err != nil {
+			return err
+		}
 		tbl.Hosts[i] = deserializeMatchExpression(serialMatchExpr)
 	}
 	// Read the values
 	for i := 0; i < fb.ValuesLength(); i++ {
 		serialNamespaceValue := &serial.BranchControlNamespaceValue{}
-		fb.Values(serialNamespaceValue, i)
+		_, err = fb.TryValues(serialNamespaceValue, i)
+		if err != nil {
+			return err
+		}
 		tbl.Values[i] = NamespaceValue{
 			Database: string(serialNamespaceValue.Database()),
 			Branch:   string(serialNamespaceValue.Branch()),

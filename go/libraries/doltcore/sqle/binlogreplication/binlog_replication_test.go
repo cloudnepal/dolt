@@ -49,7 +49,7 @@ var originalWorkingDir string
 
 func teardown(t *testing.T) {
 	if mySqlProcess != nil {
-		mySqlProcess.Kill()
+		stopMySqlServer(t)
 	}
 	if doltProcess != nil {
 		stopDoltSqlServer(t)
@@ -101,6 +101,27 @@ func TestBinlogReplicationSanityCheck(t *testing.T) {
 	assertRepoStateFileExists(t, "db01")
 }
 
+// TestBinlogSystemUserIsLocked tests that the binlog applier user is locked and cannot be used to connect to the server.
+func TestBinlogSystemUserIsLocked(t *testing.T) {
+	defer teardown(t)
+	startSqlServers(t)
+
+	dsn := fmt.Sprintf("%s@tcp(127.0.0.1:%v)/", binlogApplierUser, doltPort)
+	db, err := sqlx.Open("mysql", dsn)
+	require.NoError(t, err)
+
+	// Before starting replication, the system account does not exist
+	err = db.Ping()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "User not found")
+
+	// After starting replication, the system account is locked
+	startReplication(t, mySqlPort)
+	err = db.Ping()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "Access denied for user")
+}
+
 // TestFlushLogs tests that binary logs can be flushed on the primary, which forces a new binlog file to be written,
 // including sending new Rotate and FormatDescription events to the replica. This is a simple sanity tests that we can
 // process the events without errors.
@@ -121,11 +142,9 @@ func TestFlushLogs(t *testing.T) {
 	primaryDatabase.MustExec("insert into t values (1), (2), (3);")
 	waitForReplicaToCatchUp(t)
 
-	rows, err := replicaDatabase.Queryx("select * from db01.t;")
-	require.NoError(t, err)
-	allRows := readAllRows(t, rows)
-	require.Equal(t, 3, len(allRows))
-	require.NoError(t, rows.Close())
+	requireReplicaResults(t, "select * from db01.t;", [][]any{
+		{"1"}, {"2"}, {"3"},
+	})
 }
 
 // TestResetReplica tests that "RESET REPLICA" and "RESET REPLICA ALL" correctly clear out
@@ -146,9 +165,7 @@ func TestResetReplica(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, rows.Close())
 
-	rows, err = replicaDatabase.Queryx("SHOW REPLICA STATUS;")
-	require.NoError(t, err)
-	status := convertByteArraysToStrings(readNextRow(t, rows))
+	status := queryReplicaStatus(t)
 	require.Equal(t, "0", status["Last_Errno"])
 	require.Equal(t, "", status["Last_Error"])
 	require.Equal(t, "0", status["Last_IO_Errno"])
@@ -157,7 +174,6 @@ func TestResetReplica(t *testing.T) {
 	require.Equal(t, "0", status["Last_SQL_Errno"])
 	require.Equal(t, "", status["Last_SQL_Error"])
 	require.Equal(t, "", status["Last_SQL_Error_Timestamp"])
-	require.NoError(t, rows.Close())
 
 	// Calling RESET REPLICA ALL clears out all replica configuration
 	rows, err = replicaDatabase.Queryx("RESET REPLICA ALL;")
@@ -189,15 +205,8 @@ func TestStartReplicaErrors(t *testing.T) {
 	defer teardown(t)
 	startSqlServers(t)
 
-	// START REPLICA returns an error if server_id has not been set to a non-zero value
-	_, err := replicaDatabase.Queryx("START REPLICA;")
-	require.Error(t, err)
-	require.ErrorContains(t, err, "invalid server ID configured")
-
-	replicaDatabase.MustExec("SET @@GLOBAL.server_id=4321")
-
 	// START REPLICA returns an error when no replication source is configured
-	_, err = replicaDatabase.Queryx("START REPLICA;")
+	_, err := replicaDatabase.Queryx("START REPLICA;")
 	require.Error(t, err)
 	require.ErrorContains(t, err, ErrServerNotConfiguredAsReplica.Error())
 
@@ -206,6 +215,13 @@ func TestStartReplicaErrors(t *testing.T) {
 	rows, err := replicaDatabase.Queryx("START REPLICA;")
 	require.Error(t, err)
 	require.ErrorContains(t, err, "Invalid (empty) username")
+	require.Nil(t, rows)
+
+	// SOURCE_AUTO_POSITION cannot be disabled – we only support GTID positioning
+	rows, err = replicaDatabase.Queryx("CHANGE REPLICATION SOURCE TO SOURCE_PORT=1234, " +
+		"SOURCE_HOST='localhost', SOURCE_USER='replicator', SOURCE_AUTO_POSITION=0;")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "Error 1105 (HY000): SOURCE_AUTO_POSITION cannot be disabled")
 	require.Nil(t, rows)
 
 	// START REPLICA logs a warning if replication is already running
@@ -299,7 +315,7 @@ func TestDoltCommits(t *testing.T) {
 	waitForReplicaToCatchUp(t)
 	rows, err := replicaDatabase.Queryx("select count(*) as count from db01.dolt_log;")
 	require.NoError(t, err)
-	row := convertByteArraysToStrings(readNextRow(t, rows))
+	row := convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "5", row["count"])
 	require.NoError(t, rows.Close())
 
@@ -310,31 +326,31 @@ func TestDoltCommits(t *testing.T) {
 	require.NoError(t, err)
 
 	// Fourth transaction
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "1", row["data_change"])
 	require.Equal(t, "0", row["schema_change"])
 	require.Equal(t, "t1", row["table_name"])
 	commitId := row["commit_hash"]
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "1", row["data_change"])
 	require.Equal(t, "0", row["schema_change"])
 	require.Equal(t, "t2", row["table_name"])
 	require.Equal(t, commitId, row["commit_hash"])
 
 	// Third transaction
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "1", row["data_change"])
 	require.Equal(t, "0", row["schema_change"])
 	require.Equal(t, "t2", row["table_name"])
 
 	// Second transaction
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "0", row["data_change"])
 	require.Equal(t, "1", row["schema_change"])
 	require.Equal(t, "t2", row["table_name"])
 
 	// First transaction
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "0", row["data_change"])
 	require.Equal(t, "1", row["schema_change"])
 	require.Equal(t, "t1", row["table_name"])
@@ -344,7 +360,7 @@ func TestDoltCommits(t *testing.T) {
 	// Verify that commit timestamps are unique
 	rows, err = replicaDatabase.Queryx("select distinct date from db01.dolt_log;")
 	require.NoError(t, err)
-	allRows := readAllRows(t, rows)
+	allRows := readAllRowsIntoMaps(t, rows)
 	require.Equal(t, 5, len(allRows)) // 4 transactions + 1 initial commit
 }
 
@@ -384,13 +400,13 @@ func TestForeignKeyChecks(t *testing.T) {
 	waitForReplicaToCatchUp(t)
 	rows, err := replicaDatabase.Queryx("select * from db01.t1 order by pk;")
 	require.NoError(t, err)
-	row := convertByteArraysToStrings(readNextRow(t, rows))
+	row := convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "1", row["pk"])
 	require.Equal(t, "red", row["color"])
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "2", row["pk"])
 	require.Equal(t, "still-not-a-color", row["color"])
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "3", row["pk"])
 	require.Equal(t, "not-a-color", row["color"])
 	require.False(t, rows.Next())
@@ -398,9 +414,9 @@ func TestForeignKeyChecks(t *testing.T) {
 
 	rows, err = replicaDatabase.Queryx("select * from db01.colors order by name;")
 	require.NoError(t, err)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "blue", row["name"])
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "green", row["name"])
 	require.False(t, rows.Next())
 	require.NoError(t, rows.Close())
@@ -420,34 +436,16 @@ func TestCharsetsAndCollations(t *testing.T) {
 	waitForReplicaToCatchUp(t)
 	rows, err := replicaDatabase.Queryx("show create table db01.t1;")
 	require.NoError(t, err)
-	row := convertByteArraysToStrings(readNextRow(t, rows))
+	row := convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Contains(t, row["Create Table"], "ascii_general_ci")
 	require.Contains(t, row["Create Table"], "utf16_general_ci")
 	require.NoError(t, rows.Close())
 
 	rows, err = replicaDatabase.Queryx("select * from db01.t1;")
 	require.NoError(t, err)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "one", row["c1"])
 	require.Equal(t, "\x00o\x00n\x00e", row["c2"])
-	require.NoError(t, rows.Close())
-
-	// Test that we get an error for unsupported charsets/collations
-	primaryDatabase.MustExec("CREATE TABLE t2 (pk int primary key, c1 varchar(255) COLLATE utf16_german2_ci);")
-	waitForReplicaToCatchUp(t)
-	replicaDatabase.MustExec("use db01;")
-	rows, err = replicaDatabase.Queryx("SHOW TABLES WHERE Tables_in_db01 like 't2';")
-	require.NoError(t, err)
-	require.False(t, rows.Next())
-	require.NoError(t, rows.Close())
-
-	rows, err = replicaDatabase.Queryx("SHOW REPLICA STATUS;")
-	require.NoError(t, err)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
-	require.Equal(t, "1105", row["Last_SQL_Errno"])
-	require.NotEmpty(t, row["Last_SQL_Error_Timestamp"])
-	require.Contains(t, row["Last_SQL_Error"], "The collation `utf16_german2_ci` has not yet been implemented")
-	require.False(t, rows.Next())
 	require.NoError(t, rows.Close())
 }
 
@@ -455,7 +453,7 @@ func TestCharsetsAndCollations(t *testing.T) {
 // Test Helper Functions
 //
 
-// waitForReplicaToCatchUp waits (up to 20s) for the replica to catch up with the primary database. The
+// waitForReplicaToCatchUp waits (up to 60s) for the replica to catch up with the primary database. The
 // lag is measured by checking that gtid_executed is the same on the primary and replica.
 func waitForReplicaToCatchUp(t *testing.T) {
 	timeLimit := 60 * time.Second
@@ -512,7 +510,7 @@ func waitForReplicaToReachGtid(t *testing.T, target int) {
 func assertWarning(t *testing.T, database *sqlx.DB, code int, message string) {
 	rows, err := database.Queryx("SHOW WARNINGS;")
 	require.NoError(t, err)
-	warning := convertByteArraysToStrings(readNextRow(t, rows))
+	warning := convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, strconv.Itoa(code), warning["Code"])
 	require.Equal(t, message, warning["Message"])
 	require.False(t, rows.Next())
@@ -523,7 +521,7 @@ func queryGtid(t *testing.T, database *sqlx.DB) string {
 	rows, err := database.Queryx("SELECT @@global.gtid_executed as gtid_executed;")
 	require.NoError(t, err)
 	defer rows.Close()
-	row := convertByteArraysToStrings(readNextRow(t, rows))
+	row := convertMapScanResultToStrings(readNextRow(t, rows))
 	if row["gtid_executed"] == nil {
 		t.Fatal("no value for @@GLOBAL.gtid_executed")
 	}
@@ -538,7 +536,9 @@ func readNextRow(t *testing.T, rows *sqlx.Rows) map[string]interface{} {
 	return row
 }
 
-func readAllRows(t *testing.T, rows *sqlx.Rows) []map[string]interface{} {
+// readAllRowsIntoMaps reads all data from |rows| and returns a slice of maps, where each key
+// in the map is the field name, and each value is the string representation of the field value.
+func readAllRowsIntoMaps(t *testing.T, rows *sqlx.Rows) []map[string]interface{} {
 	result := make([]map[string]interface{}, 0)
 	for {
 		row := make(map[string]interface{})
@@ -547,12 +547,36 @@ func readAllRows(t *testing.T, rows *sqlx.Rows) []map[string]interface{} {
 		}
 		err := rows.MapScan(row)
 		require.NoError(t, err)
-		row = convertByteArraysToStrings(row)
+		row = convertMapScanResultToStrings(row)
 		result = append(result, row)
 	}
 }
 
+// readAllRowsIntoSlices reads all data from |rows| and returns a slice of slices, with
+// all values converted to strings.
+func readAllRowsIntoSlices(t *testing.T, rows *sqlx.Rows) [][]any {
+	result := make([][]any, 0)
+	for {
+		if rows.Next() == false {
+			return result
+		}
+		row, err := rows.SliceScan()
+		require.NoError(t, err)
+		row = convertSliceScanResultToStrings(row)
+		result = append(result, row)
+	}
+}
+
+// startSqlServers starts a MySQL server and a Dolt sql-server for use in tests.
 func startSqlServers(t *testing.T) {
+	startSqlServersWithDoltSystemVars(t, nil)
+}
+
+// startSqlServersWithDoltSystemVars starts a MySQL server and a Dolt sql-server for use in tests. Before the
+// Dolt sql-server is started, the specified |doltPersistentSystemVars| are persisted in the Dolt sql-server's
+// local configuration. These are useful when you need to set system variables that must be available when the
+// sql-server starts up, such as replication system variables.
+func startSqlServersWithDoltSystemVars(t *testing.T, doltPersistentSystemVars map[string]string) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping binlog replication integ tests on Windows OS")
 	} else if runtime.GOOS == "darwin" && os.Getenv("CI") == "true" {
@@ -574,10 +598,18 @@ func startSqlServers(t *testing.T) {
 	// Start up primary and replica databases
 	mySqlPort, mySqlProcess, err = startMySqlServer(testDir)
 	require.NoError(t, err)
-	doltPort, doltProcess, err = startDoltSqlServer(testDir)
+	doltPort, doltProcess, err = startDoltSqlServer(testDir, doltPersistentSystemVars)
 	require.NoError(t, err)
 }
 
+// stopMySqlServer stops the running MySQL server. If any errors are encountered while stopping
+// the MySQL server, this function will fail the current test.
+func stopMySqlServer(t *testing.T) {
+	require.NoError(t, mySqlProcess.Kill())
+}
+
+// stopDoltSqlServer stops the running Dolt sql-server. If any errors are encountered while
+// stopping the Dolt sql-server, this function will fail the current test.
 func stopDoltSqlServer(t *testing.T) {
 	// Use the negative process ID so that we grab the entire process group.
 	// This is necessary to kill all the processes the child spawns.
@@ -589,13 +621,29 @@ func stopDoltSqlServer(t *testing.T) {
 	err = p.Signal(syscall.SIGKILL)
 	require.NoError(t, err)
 	time.Sleep(250 * time.Millisecond)
+
+	// Remove the sql-server lock file so that we can restart cleanly
+	lockFilepath := filepath.Join(testDir, "dolt", "db01", ".dolt", "sql-server.lock")
+	stat, _ := os.Stat(lockFilepath)
+	if stat != nil {
+		err = os.Remove(lockFilepath)
+		require.NoError(t, err)
+	}
+	// Remove the global sql-server lock file as well
+	lockFilepath = filepath.Join(testDir, "dolt", ".dolt", "sql-server.lock")
+	stat, _ = os.Stat(lockFilepath)
+	if stat != nil {
+		err = os.Remove(lockFilepath)
+		require.NoError(t, err)
+	}
 }
 
 func startReplication(_ *testing.T, port int) {
 	replicaDatabase.MustExec("SET @@GLOBAL.server_id=123;")
 	replicaDatabase.MustExec(
-		fmt.Sprintf("change replication source to SOURCE_HOST='localhost', SOURCE_USER='replicator', "+
-			"SOURCE_PASSWORD='Zqr8_blrGm1!', SOURCE_PORT=%v;", port))
+		fmt.Sprintf("change replication source to SOURCE_HOST='localhost', "+
+			"SOURCE_USER='replicator', SOURCE_PASSWORD='Zqr8_blrGm1!', "+
+			"SOURCE_PORT=%v, SOURCE_AUTO_POSITION=1, SOURCE_CONNECT_RETRY=5;", port))
 
 	replicaDatabase.MustExec("start replica;")
 }
@@ -675,16 +723,21 @@ func startMySqlServer(dir string) (int, *os.Process, error) {
 		username = "mysql"
 	}
 
-	// Create a fresh MySQL server for the primary
-	chmodCmd := exec.Command("mysqld",
-		"--no-defaults",
-		"--user="+username,
-		"--initialize-insecure",
-		"--datadir="+dataDir,
-		"--default-authentication-plugin=mysql_native_password")
-	output, err = chmodCmd.CombinedOutput()
-	if err != nil {
-		return -1, nil, fmt.Errorf("unable to execute command %v: %v – %v", cmd.String(), err.Error(), string(output))
+	// Check to see if the MySQL data directory has the "mysql" directory in it, which
+	// tells us whether this MySQL instance has been initialized yet or not.
+	initialized := directoryExists(filepath.Join(dataDir, "mysql"))
+	if !initialized {
+		// Create a fresh MySQL server for the primary
+		chmodCmd := exec.Command("mysqld",
+			"--no-defaults",
+			"--user="+username,
+			"--initialize-insecure",
+			"--datadir="+dataDir,
+			"--default-authentication-plugin=mysql_native_password")
+		output, err = chmodCmd.CombinedOutput()
+		if err != nil {
+			return -1, nil, fmt.Errorf("unable to execute command %v: %v – %v", cmd.String(), err.Error(), string(output))
+		}
 	}
 
 	cmd = exec.Command("mysqld",
@@ -692,6 +745,7 @@ func startMySqlServer(dir string) (int, *os.Process, error) {
 		"--user="+username,
 		"--datadir="+dataDir,
 		"--gtid-mode=ON",
+		"--skip-replica-start=ON",
 		"--enforce-gtid-consistency=ON",
 		fmt.Sprintf("--port=%v", mySqlPort),
 		"--server-id=11223344",
@@ -723,8 +777,12 @@ func startMySqlServer(dir string) (int, *os.Process, error) {
 		return -1, nil, err
 	}
 
-	// Create the initial database on the MySQL server
-	primaryDatabase.MustExec("create database db01;")
+	// Create the initial database and replication user on the MySQL server if this is the first launch
+	if !initialized {
+		primaryDatabase.MustExec("create database db01;")
+		primaryDatabase.MustExec("CREATE USER 'replicator'@'%' IDENTIFIED BY 'Zqr8_blrGm1!';")
+		primaryDatabase.MustExec("GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'%';")
+	}
 
 	dsn = fmt.Sprintf("root@tcp(127.0.0.1:%v)/db01", mySqlPort)
 	primaryDatabase = sqlx.MustOpen("mysql", dsn)
@@ -732,13 +790,26 @@ func startMySqlServer(dir string) (int, *os.Process, error) {
 	os.Chdir(originalCwd)
 	fmt.Printf("MySQL server started on port %v \n", mySqlPort)
 
-	primaryDatabase.MustExec("CREATE USER 'replicator'@'%' IDENTIFIED BY 'Zqr8_blrGm1!';")
-	primaryDatabase.MustExec("GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'%';")
-
 	return mySqlPort, cmd.Process, nil
 }
 
+// directoryExists returns true if the specified |path| is to a directory that exists, otherwise,
+// if the path doesn't exist or isn't a directory, false is returned.
+func directoryExists(path string) bool {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return info.IsDir()
+}
+
+var cachedDoltDevBuildPath = ""
+
 func initializeDevDoltBuild(dir string, goDirPath string) string {
+	if cachedDoltDevBuildPath != "" {
+		return cachedDoltDevBuildPath
+	}
+
 	// If we're not in a CI environment, don't worry about building a dev build
 	if os.Getenv("CI") != "true" {
 		return ""
@@ -760,17 +831,26 @@ func initializeDevDoltBuild(dir string, goDirPath string) string {
 	if err != nil {
 		panic("unable to build dolt for binlog integration tests: " + err.Error() + "\nFull output: " + string(output) + "\n")
 	}
-	return fullpath
+	cachedDoltDevBuildPath = fullpath
+
+	return cachedDoltDevBuildPath
 }
 
-func startDoltSqlServer(dir string) (int, *os.Process, error) {
+// startDoltSqlServer starts a Dolt sql-server on a free port from the specified directory |dir|. If
+// |doltPeristentSystemVars| is populated, then those system variables will be set, persistently, for
+// the Dolt database, before the Dolt sql-server is started.
+func startDoltSqlServer(dir string, doltPersistentSystemVars map[string]string) (int, *os.Process, error) {
 	dir = filepath.Join(dir, "dolt")
 	err := os.MkdirAll(dir, 0777)
 	if err != nil {
 		return -1, nil, err
 	}
 
-	doltPort = findFreePort()
+	// If we already assigned a port, re-use it. This is useful when testing restarting a primary, since
+	// we want the primary to come back up on the same port, so the replica can reconnect.
+	if doltPort == 0 {
+		doltPort = findFreePort()
+	}
 	fmt.Printf("Starting Dolt sql-server on port: %d, with data dir %s\n", doltPort, dir)
 
 	// take the CWD and move up four directories to find the go directory
@@ -789,9 +869,28 @@ func startDoltSqlServer(dir string) (int, *os.Process, error) {
 
 	socketPath := filepath.Join("/tmp", fmt.Sprintf("dolt.%v.sock", doltPort))
 
+	// use an admin user NOT named "root" to test that we don't require the "root" account
+	adminUser := "admin"
+
+	if doltPersistentSystemVars != nil && len(doltPersistentSystemVars) > 0 {
+		// Initialize the dolt directory first
+		err = runDoltCommand(dir, goDirPath, "init")
+		if err != nil {
+			return -1, nil, err
+		}
+
+		for systemVar, value := range doltPersistentSystemVars {
+			query := fmt.Sprintf("SET @@PERSIST.%s=%s;", systemVar, value)
+			err = runDoltCommand(dir, goDirPath, "sql", fmt.Sprintf("-q=%s", query))
+			if err != nil {
+				return -1, nil, err
+			}
+		}
+	}
+
 	args := []string{"go", "run", "./cmd/dolt",
 		"sql-server",
-		"-uroot",
+		fmt.Sprintf("-u%s", adminUser),
 		"--loglevel=TRACE",
 		fmt.Sprintf("--data-dir=%s", dir),
 		fmt.Sprintf("--port=%v", doltPort),
@@ -837,7 +936,7 @@ func startDoltSqlServer(dir string) (int, *os.Process, error) {
 
 	fmt.Printf("Dolt CMD: %s\n", cmd.String())
 
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%v)/", doltPort)
+	dsn := fmt.Sprintf("%s@tcp(127.0.0.1:%v)/", adminUser, doltPort)
 	replicaDatabase = sqlx.MustOpen("mysql", dsn)
 
 	err = waitForSqlServerToStart(replicaDatabase)
@@ -848,6 +947,31 @@ func startDoltSqlServer(dir string) (int, *os.Process, error) {
 	fmt.Printf("Dolt server started on port %v \n", doltPort)
 
 	return doltPort, cmd.Process, nil
+}
+
+// runDoltCommand runs a short-lived dolt CLI command with the specified arguments from |doltArgs|. The Dolt data
+// directory is specified from |doltDataDir| and |goDirPath| is the path to the go directory within the Dolt repo.
+// This function will only return when the Dolt CLI command has completed, so it is not suitable for running
+// long-lived commands such as "sql-server". If the command fails, an error is returned with the combined output.
+func runDoltCommand(doltDataDir string, goDirPath string, doltArgs ...string) error {
+	// If we're running in CI, use a precompiled dolt binary instead of go run
+	devDoltPath := initializeDevDoltBuild(doltDataDir, goDirPath)
+
+	args := append([]string{"go", "run", "./cmd/dolt",
+		fmt.Sprintf("--data-dir=%s", doltDataDir)},
+		doltArgs...)
+	if devDoltPath != "" {
+		args[2] = devDoltPath
+		args = args[2:]
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	fmt.Printf("Running Dolt CMD: %s\n", cmd.String())
+	output, err := cmd.CombinedOutput()
+	fmt.Printf("Dolt CMD output: %s\n", string(output))
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(output))
+	}
+	return nil
 }
 
 // waitForSqlServerToStart polls the specified database to wait for it to become available, pausing
@@ -897,4 +1021,41 @@ func assertRepoStateFileExists(t *testing.T, db string) {
 
 	_, err := os.Stat(repoStateFile)
 	require.NoError(t, err)
+}
+
+// requireReplicaResults runs the specified |query| on the replica database and asserts that the results match
+// |expectedResults|. Note that the actual results are converted to string values in almost all cases, due to
+// limitations in the SQL library we use to query the replica database, so |expectedResults| should generally
+// be expressed in strings.
+func requireReplicaResults(t *testing.T, query string, expectedResults [][]any) {
+	requireResults(t, replicaDatabase, query, expectedResults)
+}
+
+// requireReplicaResults runs the specified |query| on the primary database and asserts that the results match
+// |expectedResults|. Note that the actual results are converted to string values in almost all cases, due to
+// limitations in the SQL library we use to query the replica database, so |expectedResults| should generally
+// be expressed in strings.
+func requirePrimaryResults(t *testing.T, query string, expectedResults [][]any) {
+	requireResults(t, primaryDatabase, query, expectedResults)
+}
+
+func requireResults(t *testing.T, db *sqlx.DB, query string, expectedResults [][]any) {
+	rows, err := db.Queryx(query)
+	require.NoError(t, err)
+	allRows := readAllRowsIntoSlices(t, rows)
+	require.Equal(t, len(expectedResults), len(allRows), "Expected %v, got %v", expectedResults, allRows)
+	for i := range expectedResults {
+		require.Equal(t, expectedResults[i], allRows[i], "Expected %v, got %v", expectedResults[i], allRows[i])
+	}
+	require.NoError(t, rows.Close())
+}
+
+// queryReplicaStatus returns the results of `SHOW REPLICA STATUS` as a map, for the replica
+// database. If any errors are encountered, this function will fail the current test.
+func queryReplicaStatus(t *testing.T) map[string]any {
+	rows, err := replicaDatabase.Queryx("SHOW REPLICA STATUS;")
+	require.NoError(t, err)
+	status := convertMapScanResultToStrings(readNextRow(t, rows))
+	require.NoError(t, rows.Close())
+	return status
 }

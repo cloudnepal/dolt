@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"runtime"
 	"runtime/debug"
 	"sync/atomic"
@@ -35,39 +34,26 @@ var (
 	ErrWrongCopySize   = errors.New("could not copy enough bytes")
 )
 
-// By setting the environment variable DOLT_ASSERT_TABLE_FILES_CLOSED to any
-// non-empty string, dolt will run some sanity checks on table file lifecycle
-// management. In particular, dolt will install a GC finalizer on the table
-// file index buffer to assert that it has been properly closed at the time
-// that it gets garbage collected.
-//
-// This is mostly intended for developers. It isa recommended mode in tests and
-// can make sense in other contexts as well. At the time of this writing---
-// (2023/02, aaron@)---lifecycle management in tests in particular is not good
-// enough to globally enable this.
+// By setting this to false, you can make tablefile index creation cheaper. In
+// exchange, the panics which leaked table files create do not come with as
+// much information.
 
-var TableIndexAssertClosedWithGCFinalizer bool
-
-func init() {
-	if os.Getenv("DOLT_ASSERT_TABLE_FILES_CLOSED") != "" {
-		TableIndexAssertClosedWithGCFinalizer = true
-	}
-}
+var TableIndexGCFinalizerWithStackTrace = true
 
 type tableIndex interface {
 	// entrySuffixMatches returns true if the entry at index |idx| matches
 	// the suffix of the address |h|. Used by |lookup| after finding
 	// matching indexes based on |Prefixes|.
-	entrySuffixMatches(idx uint32, h *addr) (bool, error)
+	entrySuffixMatches(idx uint32, h *hash.Hash) (bool, error)
 
 	// indexEntry returns the |indexEntry| at |idx|. Optionally puts the
 	// full address of that entry in |a| if |a| is not |nil|.
-	indexEntry(idx uint32, a *addr) (indexEntry, error)
+	indexEntry(idx uint32, a *hash.Hash) (indexEntry, error)
 
 	// lookup returns an |indexEntry| for the chunk corresponding to the
 	// provided address |h|. Second returns is |true| if an entry exists
 	// and |false| otherwise.
-	lookup(h *addr) (indexEntry, bool, error)
+	lookup(h *hash.Hash) (indexEntry, bool, error)
 
 	// Ordinals returns a slice of indexes which maps the |i|th chunk in
 	// the indexed file to its corresponding entry in index. The |i|th
@@ -112,6 +98,12 @@ func ReadTableFooter(rd io.ReadSeeker) (chunkCount uint32, totalUncompressedData
 	}
 
 	if string(footer[uint32Size+uint64Size:]) != magicNumber {
+		// Give a nice error message if this is a table file format which we will support in the future.
+		possibleDarc := string(footer[len(footer)-doltMagicSize:])
+		if possibleDarc == doltMagicNumber {
+			return 0, 0, ErrUnsupportedTableFileFormat
+		}
+
 		return 0, 0, ErrInvalidTableFile
 	}
 
@@ -203,18 +195,6 @@ func readTableIndexByCopy(ctx context.Context, rd io.ReadSeeker, q MemoryQuotaPr
 	return idx, err
 }
 
-func hashSetFromTableIndex(idx tableIndex) (hash.HashSet, error) {
-	set := hash.NewHashSet()
-	for i := uint32(0); i < idx.chunkCount(); i++ {
-		var a addr
-		if _, err := idx.indexEntry(i, &a); err != nil {
-			return nil, err
-		}
-		set.Insert(hash.Hash(a))
-	}
-	return set, nil
-}
-
 type onHeapTableIndex struct {
 	// prefixTuples is a packed array of 12 byte tuples:
 	// (8 byte addr prefix, 4 byte uint32 ordinal)
@@ -278,10 +258,15 @@ func newOnHeapTableIndex(indexBuff []byte, offsetsBuff1 []byte, count uint32, to
 
 	refCnt := new(int32)
 	*refCnt = 1
-	if TableIndexAssertClosedWithGCFinalizer {
+
+	if TableIndexGCFinalizerWithStackTrace {
 		stack := string(debug.Stack())
 		runtime.SetFinalizer(refCnt, func(i *int32) {
-			panic(fmt.Sprintf("OnHeapTableIndex not closed:\n%s", stack))
+			panic(fmt.Sprintf("OnHeapTableIndex %x not closed:\n%s", refCnt, stack))
+		})
+	} else {
+		runtime.SetFinalizer(refCnt, func(i *int32) {
+			panic(fmt.Sprintf("OnHeapTableIndex %x was not closed", refCnt))
 		})
 	}
 
@@ -298,22 +283,22 @@ func newOnHeapTableIndex(indexBuff []byte, offsetsBuff1 []byte, count uint32, to
 	}, nil
 }
 
-func (ti onHeapTableIndex) entrySuffixMatches(idx uint32, h *addr) (bool, error) {
+func (ti onHeapTableIndex) entrySuffixMatches(idx uint32, h *hash.Hash) (bool, error) {
 	ord := ti.ordinalAt(idx)
-	o := ord * addrSuffixSize
-	b := ti.suffixes[o : o+addrSuffixSize]
-	return bytes.Equal(h[addrPrefixSize:], b), nil
+	o := ord * hash.SuffixLen
+	b := ti.suffixes[o : o+hash.SuffixLen]
+	return bytes.Equal(h[hash.PrefixLen:], b), nil
 }
 
-func (ti onHeapTableIndex) indexEntry(idx uint32, a *addr) (entry indexEntry, err error) {
+func (ti onHeapTableIndex) indexEntry(idx uint32, a *hash.Hash) (entry indexEntry, err error) {
 	prefix, ord := ti.tupleAt(idx)
 
 	if a != nil {
 		binary.BigEndian.PutUint64(a[:], prefix)
 
-		o := int64(addrSuffixSize * ord)
-		b := ti.suffixes[o : o+addrSuffixSize]
-		copy(a[addrPrefixSize:], b)
+		o := int64(hash.SuffixLen * ord)
+		b := ti.suffixes[o : o+hash.SuffixLen]
+		copy(a[hash.PrefixLen:], b)
 	}
 
 	return ti.getIndexEntry(ord), nil
@@ -329,12 +314,12 @@ func (ti onHeapTableIndex) getIndexEntry(ord uint32) indexEntry {
 	ordOff := ti.offsetAt(ord)
 	length := uint32(ordOff - prevOff)
 	return indexResult{
-		o: prevOff,
-		l: length,
+		offset: prevOff,
+		length: length,
 	}
 }
 
-func (ti onHeapTableIndex) lookup(h *addr) (indexEntry, bool, error) {
+func (ti onHeapTableIndex) lookup(h *hash.Hash) (indexEntry, bool, error) {
 	ord, err := ti.lookupOrdinal(h)
 	if err != nil {
 		return indexResult{}, false, err
@@ -347,7 +332,7 @@ func (ti onHeapTableIndex) lookup(h *addr) (indexEntry, bool, error) {
 
 // lookupOrdinal returns the ordinal of |h| if present. Returns |ti.count|
 // if absent.
-func (ti onHeapTableIndex) lookupOrdinal(h *addr) (uint32, error) {
+func (ti onHeapTableIndex) lookupOrdinal(h *hash.Hash) (uint32, error) {
 	prefix := h.Prefix()
 
 	for idx := ti.findPrefix(prefix); idx < ti.count && ti.prefixAt(idx) == prefix; idx++ {
@@ -373,7 +358,7 @@ func (ti onHeapTableIndex) findPrefix(prefix uint64) (idx uint32) {
 		h := idx + (j-idx)/2 // avoid overflow when computing h
 		// i ≤ h < j
 		o := int64(prefixTupleSize * h)
-		tmp := binary.BigEndian.Uint64(ti.prefixTuples[o : o+addrPrefixSize])
+		tmp := binary.BigEndian.Uint64(ti.prefixTuples[o : o+hash.PrefixLen])
 		if tmp < prefix {
 			idx = h + 1 // preserves f(i-1) == false
 		} else {
@@ -388,18 +373,18 @@ func (ti onHeapTableIndex) tupleAt(idx uint32) (prefix uint64, ord uint32) {
 	b := ti.prefixTuples[off : off+prefixTupleSize]
 
 	prefix = binary.BigEndian.Uint64(b[:])
-	ord = binary.BigEndian.Uint32(b[addrPrefixSize:])
+	ord = binary.BigEndian.Uint32(b[hash.PrefixLen:])
 	return prefix, ord
 }
 
 func (ti onHeapTableIndex) prefixAt(idx uint32) uint64 {
 	off := int64(prefixTupleSize * idx)
-	b := ti.prefixTuples[off : off+addrPrefixSize]
+	b := ti.prefixTuples[off : off+hash.PrefixLen]
 	return binary.BigEndian.Uint64(b)
 }
 
 func (ti onHeapTableIndex) ordinalAt(idx uint32) uint32 {
-	off := int64(prefixTupleSize*idx) + addrPrefixSize
+	off := int64(prefixTupleSize*idx) + hash.PrefixLen
 	b := ti.prefixTuples[off : off+ordinalSize]
 	return binary.BigEndian.Uint32(b)
 }
@@ -422,7 +407,7 @@ func (ti onHeapTableIndex) ordinals() ([]uint32, error) {
 	// todo: |o| is not accounted for in the memory quota
 	o := make([]uint32, ti.count)
 	for i, off := uint32(0), 0; i < ti.count; i, off = i+1, off+prefixTupleSize {
-		b := ti.prefixTuples[off+addrPrefixSize : off+prefixTupleSize]
+		b := ti.prefixTuples[off+hash.PrefixLen : off+prefixTupleSize]
 		o[i] = binary.BigEndian.Uint32(b)
 	}
 	return o, nil
@@ -432,7 +417,7 @@ func (ti onHeapTableIndex) prefixes() ([]uint64, error) {
 	// todo: |p| is not accounted for in the memory quota
 	p := make([]uint64, ti.count)
 	for i, off := uint32(0), 0; i < ti.count; i, off = i+1, off+prefixTupleSize {
-		b := ti.prefixTuples[off : off+addrPrefixSize]
+		b := ti.prefixTuples[off : off+hash.PrefixLen]
 		p[i] = binary.BigEndian.Uint64(b)
 	}
 	return p, nil
@@ -444,14 +429,14 @@ func (ti onHeapTableIndex) hashAt(idx uint32) hash.Hash {
 	tuple := ti.prefixTuples[off : off+prefixTupleSize]
 
 	// Get prefix, ordinal, and suffix
-	prefix := tuple[:addrPrefixSize]
-	ord := binary.BigEndian.Uint32(tuple[addrPrefixSize:]) * addrSuffixSize
-	suffix := ti.suffixes[ord : ord+addrSuffixSize] // suffix is 12 bytes
+	prefix := tuple[:hash.PrefixLen]
+	ord := binary.BigEndian.Uint32(tuple[hash.PrefixLen:]) * hash.SuffixLen
+	suffix := ti.suffixes[ord : ord+hash.SuffixLen] // suffix is 12 bytes
 
 	// Combine prefix and suffix to get hash
 	buf := [hash.ByteLen]byte{}
-	copy(buf[:addrPrefixSize], prefix)
-	copy(buf[addrPrefixSize:], suffix)
+	copy(buf[:hash.PrefixLen], prefix)
+	copy(buf[hash.PrefixLen:], suffix)
 
 	return buf
 }
@@ -493,20 +478,21 @@ func (ti onHeapTableIndex) prefixIdxUBound(prefix uint64) (idx uint32) {
 }
 
 func (ti onHeapTableIndex) padStringAndDecode(s string, p string) uint64 {
-	// Pad string
-	if p == "0" {
-		for i := len(s); i < 16; i++ {
-			s = s + p
-		}
-	} else {
-		for i := len(s); i < 16; i++ {
-			s = p + s
+	if len(p) != 1 {
+		panic("pad string must be of length 1") // This is a programmer error that should never get out of PR.
+	}
+
+	for len(s) < hash.StringLen {
+		if p == "0" {
+			s = s + p // Pad on the right side.
+		} else {
+			s = p + s // pad on the left side.
 		}
 	}
 
 	// Decode
-	h, _ := encoding.DecodeString(s)
-	return binary.BigEndian.Uint64(h)
+	h := hash.Parse(s)
+	return binary.BigEndian.Uint64(h[:])
 }
 
 func (ti onHeapTableIndex) chunkCount() uint32 {
@@ -539,9 +525,7 @@ func (ti onHeapTableIndex) Close() error {
 		return nil
 	}
 
-	if TableIndexAssertClosedWithGCFinalizer {
-		runtime.SetFinalizer(ti.refCnt, nil)
-	}
+	runtime.SetFinalizer(ti.refCnt, nil)
 	ti.q.ReleaseQuotaBytes(len(ti.prefixTuples) + len(ti.offsets1) + len(ti.offsets2) + len(ti.suffixes) + len(ti.footer))
 	return nil
 }

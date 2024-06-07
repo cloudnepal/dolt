@@ -22,7 +22,7 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" =~ "On branch main" ]] || false
     [[ "$output" =~ "nothing to commit, working tree clean" ]] || false
-    [[ ! "$output" =~ "Untracked files:" ]] || false
+    [[ ! "$output" =~ "Untracked tables:" ]] || false
     [[ ! "$output" =~ "LICENSE.md" ]] || false
     [[ ! "$output" =~ "README.md" ]] || false
 }
@@ -132,7 +132,7 @@ teardown() {
     [ "$output" = "Already on branch 'main'" ]
 }
 
-@test "empty-repo: dolt checkout non-existant branch" {
+@test "empty-repo: dolt checkout non-existent branch" {
     run dolt checkout foo
     [ "$status" -ne 0 ]
     [ "$output" = "error: could not find foo" ]

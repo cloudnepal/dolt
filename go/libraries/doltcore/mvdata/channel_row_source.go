@@ -15,7 +15,6 @@
 package mvdata
 
 import (
-	"fmt"
 	"io"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -26,6 +25,8 @@ type ChannelRowSource struct {
 	schema     sql.Schema
 	rowChannel chan sql.Row
 }
+
+var _ sql.ExecSourceRel = (*ChannelRowSource)(nil)
 
 // NewChannelRowSource returns a ChannelRowSource object.
 func NewChannelRowSource(schema sql.Schema, rowChannel chan sql.Row) *ChannelRowSource {
@@ -39,9 +40,13 @@ func (c *ChannelRowSource) Resolved() bool {
 	return true
 }
 
+func (c *ChannelRowSource) IsReadOnly() bool {
+	return true
+}
+
 // String implements the sql.Node interface.
 func (c *ChannelRowSource) String() string {
-	return fmt.Sprintf("ChannelRowSource()")
+	return "ChannelRowSource()"
 }
 
 // Schema implements the sql.Node interface.

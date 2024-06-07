@@ -23,8 +23,8 @@ import (
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/parse"
 	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
 	"github.com/fatih/color"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
@@ -87,14 +87,14 @@ func (cmd DumpCmd) Description() string {
 	return "Export all tables in the working set into a file."
 }
 
-// CreateMarkdown creates a markdown file containing the help text for the command at the given path
+// Docs returns the documentation for this command, or nil if it's undocumented
 func (cmd DumpCmd) Docs() *cli.CommandDocumentation {
 	ap := cmd.ArgParser()
 	return cli.NewCommandDocumentation(dumpDocs, ap)
 }
 
 func (cmd DumpCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 0)
 	ap.SupportsString(FormatFlag, "r", "result_file_type", "Define the type of the output file. Defaults to sql. Valid values are sql, csv, json and parquet.")
 	ap.SupportsString(filenameFlag, "fn", "file_name", "Define file name for dump file. Defaults to `doltdump.sql`.")
 	ap.SupportsString(directoryFlag, "d", "directory_name", "Define directory name to dump the files in. Defaults to `doltdump/`.")
@@ -113,14 +113,10 @@ func (cmd DumpCmd) EventType() eventsapi.ClientEventType {
 }
 
 // Exec executes the command
-func (cmd DumpCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd DumpCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, dumpDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
-
-	if apr.NArg() > 0 {
-		return HandleVErrAndExitCode(errhand.BuildDError("too many arguments").SetPrintUsage().Build(), usage)
-	}
 
 	root, verr := GetWorkingWithVErr(dEnv)
 	if verr != nil {
@@ -141,7 +137,7 @@ func (cmd DumpCmd) Exec(ctx context.Context, commandStr string, args []string, d
 	resFormat, _ := apr.GetValue(FormatFlag)
 	resFormat = strings.TrimPrefix(resFormat, ".")
 
-	outputFileOrDirName, vErr := validateArgs(apr)
+	outputFileOrDirName, vErr := validateDumpArgs(apr)
 	if vErr != nil {
 		return HandleVErrAndExitCode(vErr, usage)
 	}
@@ -150,9 +146,9 @@ func (cmd DumpCmd) Exec(ctx context.Context, commandStr string, args []string, d
 	case emptyFileExt, sqlFileExt:
 		var defaultName string
 		if schemaOnly {
-			defaultName = fmt.Sprintf("doltdump_schema_only.sql")
+			defaultName = "doltdump_schema_only.sql"
 		} else {
-			defaultName = fmt.Sprintf("doltdump.sql")
+			defaultName = "doltdump.sql"
 		}
 
 		if outputFileOrDirName == emptyStr {
@@ -257,8 +253,8 @@ func dumpSchemaElements(ctx context.Context, dEnv *env.DoltEnv, path string) err
 	return nil
 }
 
-func dumpProcedures(sqlCtx *sql.Context, engine *engine.SqlEngine, root *doltdb.RootValue, writer io.WriteCloser) (rerr error) {
-	_, _, ok, err := root.GetTableInsensitive(sqlCtx, doltdb.ProceduresTableName)
+func dumpProcedures(sqlCtx *sql.Context, engine *engine.SqlEngine, root doltdb.RootValue, writer io.WriteCloser) (rerr error) {
+	_, _, ok, err := doltdb.GetTableInsensitive(sqlCtx, root, doltdb.TableName{Name: doltdb.ProceduresTableName})
 	if err != nil {
 		return err
 	}
@@ -273,6 +269,8 @@ func dumpProcedures(sqlCtx *sql.Context, engine *engine.SqlEngine, root *doltdb.
 	}
 
 	stmtColIdx := sch.IndexOfColName(doltdb.ProceduresTableCreateStmtCol)
+	// Note: 'sql_mode' column of `dolt_procedures` table is not present in databases that were created before this column got added
+	sqlModeIdx := sch.IndexOfColName(doltdb.ProceduresTableSqlModeCol)
 
 	defer func(iter sql.RowIter, context *sql.Context) {
 		err := iter.Close(context)
@@ -289,7 +287,19 @@ func dumpProcedures(sqlCtx *sql.Context, engine *engine.SqlEngine, root *doltdb.
 			return err
 		}
 
-		err = iohelp.WriteLine(writer, fmt.Sprintf("delimiter END_PROCEDURE"))
+		sqlMode := ""
+		if sqlModeIdx >= 0 {
+			if s, ok := row[sqlModeIdx].(string); ok {
+				sqlMode = s
+			}
+		}
+
+		modeChanged, err := changeSqlMode(sqlCtx, writer, sqlMode)
+		if err != nil {
+			return err
+		}
+
+		err = iohelp.WriteLine(writer, "delimiter END_PROCEDURE")
 		if err != nil {
 			return err
 		}
@@ -299,17 +309,23 @@ func dumpProcedures(sqlCtx *sql.Context, engine *engine.SqlEngine, root *doltdb.
 			return err
 		}
 
-		err = iohelp.WriteLine(writer, fmt.Sprintf("END_PROCEDURE\ndelimiter ;"))
+		err = iohelp.WriteLine(writer, "END_PROCEDURE\ndelimiter ;")
 		if err != nil {
 			return err
+		}
+
+		if modeChanged {
+			if err := resetSqlMode(writer); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-func dumpTriggers(sqlCtx *sql.Context, engine *engine.SqlEngine, root *doltdb.RootValue, writer io.WriteCloser) (rerr error) {
-	_, _, ok, err := root.GetTableInsensitive(sqlCtx, doltdb.SchemasTableName)
+func dumpTriggers(sqlCtx *sql.Context, engine *engine.SqlEngine, root doltdb.RootValue, writer io.WriteCloser) (rerr error) {
+	_, _, ok, err := doltdb.GetTableInsensitive(sqlCtx, root, doltdb.TableName{Name: doltdb.SchemasTableName})
 	if err != nil {
 		return err
 	}
@@ -325,6 +341,8 @@ func dumpTriggers(sqlCtx *sql.Context, engine *engine.SqlEngine, root *doltdb.Ro
 
 	typeColIdx := sch.IndexOfColName(doltdb.SchemasTablesTypeCol)
 	fragColIdx := sch.IndexOfColName(doltdb.SchemasTablesFragmentCol)
+	// Note: some columns of `dolt_schemas` table are not present in databases that were created before those columns got added
+	sqlModeIdx := sch.IndexOfColName(doltdb.SchemasTablesSqlModeCol)
 
 	defer func(iter sql.RowIter, context *sql.Context) {
 		err := iter.Close(context)
@@ -345,17 +363,35 @@ func dumpTriggers(sqlCtx *sql.Context, engine *engine.SqlEngine, root *doltdb.Ro
 			continue
 		}
 
+		sqlMode := ""
+		if sqlModeIdx >= 0 {
+			if s, ok := row[sqlModeIdx].(string); ok {
+				sqlMode = s
+			}
+		}
+
+		modeChanged, err := changeSqlMode(sqlCtx, writer, sqlMode)
+		if err != nil {
+			return err
+		}
+
 		err = iohelp.WriteLine(writer, fmt.Sprintf("%s;", row[fragColIdx]))
 		if err != nil {
 			return err
+		}
+
+		if modeChanged {
+			if err := resetSqlMode(writer); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-func dumpViews(ctx *sql.Context, engine *engine.SqlEngine, root *doltdb.RootValue, writer io.WriteCloser) (rerr error) {
-	_, _, ok, err := root.GetTableInsensitive(ctx, doltdb.SchemasTableName)
+func dumpViews(ctx *sql.Context, engine *engine.SqlEngine, root doltdb.RootValue, writer io.WriteCloser) (rerr error) {
+	_, _, ok, err := doltdb.GetTableInsensitive(ctx, root, doltdb.TableName{Name: doltdb.SchemasTableName})
 	if err != nil {
 		return err
 	}
@@ -372,6 +408,8 @@ func dumpViews(ctx *sql.Context, engine *engine.SqlEngine, root *doltdb.RootValu
 	typeColIdx := sch.IndexOfColName(doltdb.SchemasTablesTypeCol)
 	fragColIdx := sch.IndexOfColName(doltdb.SchemasTablesFragmentCol)
 	nameColIdx := sch.IndexOfColName(doltdb.SchemasTablesNameCol)
+	// Note: some columns of `dolt_schemas` table are not present in databases that were created before those columns got added
+	sqlModeIdx := sch.IndexOfColName(doltdb.SchemasTablesSqlModeCol)
 
 	defer func(iter sql.RowIter, context *sql.Context) {
 		err := iter.Close(context)
@@ -392,8 +430,21 @@ func dumpViews(ctx *sql.Context, engine *engine.SqlEngine, root *doltdb.RootValu
 			continue
 		}
 
+		sqlMode := ""
+		if sqlModeIdx >= 0 {
+			if s, ok := row[sqlModeIdx].(string); ok {
+				sqlMode = s
+			}
+		}
 		// We used to store just the SELECT part of a view, but now we store the entire CREATE VIEW statement
-		cv, err := parse.Parse(ctx, row[fragColIdx].(string))
+		sqlEngine := engine.GetUnderlyingEngine()
+		binder := planbuilder.New(ctx, sqlEngine.Analyzer.Catalog, sqlEngine.Parser)
+		binder.SetParserOptions(sql.NewSqlModeFromString(sqlMode).ParserOptions())
+		cv, _, _, err := binder.Parse(row[fragColIdx].(string), false)
+		if err != nil {
+			return err
+		}
+		modeChanged, err := changeSqlMode(ctx, writer, sqlMode)
 		if err != nil {
 			return err
 		}
@@ -410,9 +461,58 @@ func dumpViews(ctx *sql.Context, engine *engine.SqlEngine, root *doltdb.RootValu
 				return err
 			}
 		}
+
+		if modeChanged {
+			if err := resetSqlMode(writer); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
+}
+
+// changeSqlMode checks if the current SQL session's @@SQL_MODE is different from the requested |newSqlMode| and if so,
+// outputs a SQL statement to |writer| to save the current @@SQL_MODE to the @previousSqlMode variable and then outputs
+// a SQL statement to set the @@SQL_MODE to |sqlMode|. If |newSqlMode| is the identical to the current session's
+// SQL_MODE (the default, global @@SQL_MODE), then no statements are written to |writer|. The boolean return code
+// indicates if any statements were written.
+func changeSqlMode(ctx *sql.Context, writer io.WriteCloser, newSqlMode string) (bool, error) {
+	if newSqlMode == "" {
+		return false, nil
+	}
+
+	variable, err := ctx.Session.GetSessionVariable(ctx, "SQL_MODE")
+	if err != nil {
+		return false, err
+	}
+	currentSqlMode, ok := variable.(string)
+	if !ok {
+		return false, fmt.Errorf("unable to read @@SQL_MODE system variable from value '%v'", currentSqlMode)
+	}
+
+	if currentSqlMode == newSqlMode {
+		return false, nil
+	}
+
+	err = iohelp.WriteLine(writer, "SET @previousSqlMode=@@SQL_MODE;")
+	if err != nil {
+		return false, err
+	}
+
+	err = iohelp.WriteLine(writer, fmt.Sprintf("SET @@SQL_MODE='%s';", newSqlMode))
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// resetSqlMode outputs a SQL statement to |writer| to reset @@SQL_MODE back to the previous value stored
+// by the last call to changeSqlMode. This function should only be called after changeSqlMode, otherwise the
+// @previousSqlMode variable will not be set correctly.
+func resetSqlMode(writer io.WriteCloser) error {
+	return iohelp.WriteLine(writer, "SET @@SQL_MODE=@previousSqlMode;")
 }
 
 type dumpOptions struct {
@@ -516,7 +616,7 @@ func getTableWriter(ctx context.Context, dEnv *env.DoltEnv, tblOpts *tableOption
 }
 
 // checkAndCreateOpenDestFile returns filePath to created dest file after checking for any existing file and handles it
-func checkAndCreateOpenDestFile(ctx context.Context, root *doltdb.RootValue, dEnv *env.DoltEnv, force bool, dumpOpts *dumpOptions, fileName string) (string, errhand.VerboseError) {
+func checkAndCreateOpenDestFile(ctx context.Context, root doltdb.RootValue, dEnv *env.DoltEnv, force bool, dumpOpts *dumpOptions, fileName string) (string, errhand.VerboseError) {
 	ow, err := checkOverwrite(ctx, root, dEnv.FS, force, dumpOpts.dest)
 	if err != nil {
 		return emptyStr, errhand.VerboseErrorFromError(err)
@@ -543,7 +643,7 @@ func checkAndCreateOpenDestFile(ctx context.Context, root *doltdb.RootValue, dEn
 
 // checkOverwrite returns TRUE if the file exists and force flag not given and
 // FALSE if the file is stream data / file does not exist / file exists and force flag is given
-func checkOverwrite(ctx context.Context, root *doltdb.RootValue, fs filesys.ReadableFS, force bool, dest mvdata.DataLocation) (bool, error) {
+func checkOverwrite(ctx context.Context, root doltdb.RootValue, fs filesys.ReadableFS, force bool, dest mvdata.DataLocation) (bool, error) {
 	if _, isStream := dest.(mvdata.StreamDataLocation); isStream {
 		return false, nil
 	}
@@ -579,9 +679,9 @@ func getDumpDestination(path string) mvdata.DataLocation {
 	return destLoc
 }
 
-// validateArgs returns either filename of directory name after checking each cases of user input arguments,
+// validateDumpArgs returns either filename of directory name after checking each cases of user input arguments,
 // handling errors for invalid arguments
-func validateArgs(apr *argparser.ArgParseResults) (string, errhand.VerboseError) {
+func validateDumpArgs(apr *argparser.ArgParseResults) (string, errhand.VerboseError) {
 	rf, _ := apr.GetValue(FormatFlag)
 	rf = strings.TrimPrefix(rf, ".")
 	fn, fnOk := apr.GetValue(filenameFlag)
@@ -610,7 +710,7 @@ func validateArgs(apr *argparser.ArgParseResults) (string, errhand.VerboseError)
 	}
 }
 
-// getDumpArgs returns dumpOptions of result format and dest file location corresponding to the input parameters
+// getDumpOptions returns dumpOptions of result format and dest file location corresponding to the input parameters
 func getDumpOptions(fileName string, rf string, schemaOnly bool) *dumpOptions {
 	fileLoc := getDumpDestination(fileName)
 
@@ -638,10 +738,10 @@ func newTableArgs(tblName string, destination mvdata.DataLocation, batched, auto
 
 // dumpNonSqlTables returns nil if all tables is dumped successfully, and it returns err if there is one.
 // It handles only csv and json file types(rf).
-func dumpNonSqlTables(ctx context.Context, root *doltdb.RootValue, dEnv *env.DoltEnv, force bool, tblNames []string, rf string, dirName string, batched bool) errhand.VerboseError {
+func dumpNonSqlTables(ctx context.Context, root doltdb.RootValue, dEnv *env.DoltEnv, force bool, tblNames []string, rf string, dirName string, batched bool) errhand.VerboseError {
 	var fName string
 	if dirName == emptyStr {
-		dirName = fmt.Sprintf("doltdump/")
+		dirName = "doltdump/"
 	} else {
 		if !strings.HasSuffix(dirName, "/") {
 			dirName = fmt.Sprintf("%s/", dirName)
@@ -713,7 +813,7 @@ func addCreateDatabaseHeader(dEnv *env.DoltEnv, fPath, dbName string) errhand.Ve
 // TODO: find a more elegant way to get database name, possibly implement a method in DoltEnv
 // getActiveDatabaseName returns the name of the current active database
 func getActiveDatabaseName(ctx context.Context, dEnv *env.DoltEnv) (string, errhand.VerboseError) {
-	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	if err != nil {
 		return "", errhand.VerboseErrorFromError(err)
 	}

@@ -36,7 +36,11 @@ func initializeConfigs(dEnv *env.DoltEnv, element env.ConfigScope) {
 		globalCfg, _ := dEnv.Config.GetConfig(env.GlobalConfig)
 		globalCfg.SetStrings(map[string]string{"title": "senior dufus"})
 	case env.LocalConfig:
-		dEnv.Config.CreateLocalConfig(map[string]string{"title": "senior dufus"})
+		configDir, err := dEnv.FS.Abs(".")
+		if err != nil {
+			panic("Unable to resolve current path to create repo local config file: " + err.Error())
+		}
+		dEnv.Config.CreateLocalConfig(configDir, map[string]string{"title": "senior dufus"})
 	}
 }
 func TestConfigAdd(t *testing.T) {
@@ -51,25 +55,25 @@ func TestConfigAdd(t *testing.T) {
 			Name:   "local",
 			CfgSet: localCfg,
 			Scope:  env.LocalConfig,
-			Args:   []string{"title", "senior dufus"},
+			Args:   []string{"user.name", "senior dufus"},
 		},
 		{
 			Name:   "global",
 			CfgSet: globalCfg,
 			Scope:  env.GlobalConfig,
-			Args:   []string{"title", "senior dufus"},
+			Args:   []string{"user.name", "senior dufus"},
 		},
 		{
 			Name:   "default",
 			CfgSet: &set.StrSet{},
 			Scope:  env.LocalConfig,
-			Args:   []string{"title", "senior dufus"},
+			Args:   []string{"user.name", "senior dufus"},
 		},
 		{
 			Name:   "multi error",
 			CfgSet: multiCfg,
 			Scope:  env.LocalConfig,
-			Args:   []string{"title", "senior dufus"},
+			Args:   []string{"user.name", "senior dufus"},
 			Code:   1,
 		},
 		{
@@ -83,7 +87,7 @@ func TestConfigAdd(t *testing.T) {
 			Name:   "odd args",
 			CfgSet: multiCfg,
 			Scope:  env.LocalConfig,
-			Args:   []string{"title"},
+			Args:   []string{"user.name"},
 			Code:   1,
 		},
 	}
@@ -97,7 +101,7 @@ func TestConfigAdd(t *testing.T) {
 				assert.Equal(t, tt.Code, resCode)
 
 			} else if cfg, ok := dEnv.Config.GetConfig(tt.Scope); ok {
-				resVal := cfg.GetStringOrDefault("title", "")
+				resVal := cfg.GetStringOrDefault("user.name", "")
 				assert.Equal(t, "senior dufus", resVal)
 			} else {
 				t.Error("comparison config not found")
@@ -280,12 +284,12 @@ func TestConfig(t *testing.T) {
 
 	// test setting global config with --add
 	configCmd := ConfigCmd{}
-	ret := configCmd.Exec(ctx, "dolt config", []string{"-global", "--add", "name", "bheni"}, dEnv)
-	ret += configCmd.Exec(ctx, "dolt config", []string{"-global", "--add", "title", "dufus"}, dEnv)
+	ret := configCmd.Exec(ctx, "dolt config", []string{"-global", "--add", "user.name", "bheni"}, dEnv, nil)
+	ret += configCmd.Exec(ctx, "dolt config", []string{"-global", "--add", "user.email", "dufus@example.com"}, dEnv, nil)
 
 	expectedGlobal := map[string]string{
-		"name":  "bheni",
-		"title": "dufus",
+		"user.name":  "bheni",
+		"user.email": "dufus@example.com",
 	}
 
 	if ret != 0 {
@@ -295,11 +299,11 @@ func TestConfig(t *testing.T) {
 	}
 
 	// test setting global config with --set
-	ret = configCmd.Exec(ctx, "dolt config", []string{"-global", "--set", "name", "steph"}, dEnv)
+	ret = configCmd.Exec(ctx, "dolt config", []string{"-global", "--set", "user.name", "steph"}, dEnv, nil)
 
 	expectedGlobal = map[string]string{
-		"name":  "steph",
-		"title": "dufus",
+		"user.name":  "steph",
+		"user.email": "dufus@example.com",
 	}
 
 	if ret != 0 {
@@ -309,40 +313,40 @@ func TestConfig(t *testing.T) {
 	}
 
 	// test setting local config with --add
-	ret = configCmd.Exec(ctx, "dolt config", []string{"-local", "--add", "title", "senior dufus"}, dEnv)
+	ret = configCmd.Exec(ctx, "dolt config", []string{"-local", "--add", "user.name", "senior dufus"}, dEnv, nil)
 
 	expectedLocal := map[string]string{
-		"title": "senior dufus",
+		"user.name": "senior dufus",
 	}
 
 	if ret != 0 {
 		t.Error("Failed to set local config")
 	} else if cfg, ok := dEnv.Config.GetConfig(env.LocalConfig); !ok || !config.Equals(cfg, expectedLocal) {
 		t.Error("config -add did not yield expected local results")
-	} else if val, err := cfg.GetString("title"); err != nil || val != "senior dufus" {
-		t.Error("Unexpected value of \"title\" retrieved from the config hierarchy")
+	} else if val, err := cfg.GetString("user.name"); err != nil || val != "senior dufus" {
+		t.Error("Unexpected value of \"user.name\" retrieved from the config hierarchy")
 	}
 
 	// test setting local config with --set
-	ret = configCmd.Exec(ctx, "dolt config", []string{"-local", "--set", "name", "steph"}, dEnv)
+	ret = configCmd.Exec(ctx, "dolt config", []string{"-local", "--set", "user.email", "dufus@example.com"}, dEnv, nil)
 
 	expectedLocal = map[string]string{
-		"name":  "steph",
-		"title": "senior dufus",
+		"user.name":  "senior dufus",
+		"user.email": "dufus@example.com",
 	}
 
 	if ret != 0 {
 		t.Error("Failed to set local config")
 	} else if cfg, ok := dEnv.Config.GetConfig(env.LocalConfig); !ok || !config.Equals(cfg, expectedLocal) {
 		t.Error("config -set did not yield expected local results")
-	} else if val, err := cfg.GetString("name"); err != nil || val != "steph" {
-		t.Error("Unexpected value of \"name\" retrieved from the config hierarchy")
+	} else if val, err := cfg.GetString("user.email"); err != nil || val != "dufus@example.com" {
+		t.Error("Unexpected value of \"user.email\" retrieved from the config hierarchy")
 	}
 
-	ret = configCmd.Exec(ctx, "dolt config", []string{"-global", "--unset", "name"}, dEnv)
+	ret = configCmd.Exec(ctx, "dolt config", []string{"-global", "--unset", "user.name"}, dEnv, nil)
 
 	expectedGlobal = map[string]string{
-		"title": "dufus",
+		"user.email": "dufus@example.com",
 	}
 
 	if ret != 0 {
@@ -351,7 +355,7 @@ func TestConfig(t *testing.T) {
 		t.Error("config -add did not yield expected global results")
 	}
 
-	expectedGlobal = map[string]string{"title": "dufus"}
+	expectedGlobal = map[string]string{"user.email": "dufus@example.com"}
 	globalProperties := map[string]string{}
 	ret = listOperation(dEnv, globalCfg, []string{}, func() {}, func(k string, v string) {
 		globalProperties[k] = v
@@ -363,7 +367,7 @@ func TestConfig(t *testing.T) {
 		t.Error("listOperation did not yield expected global results")
 	}
 
-	expectedLocal = map[string]string{"name": "steph", "title": "senior dufus"}
+	expectedLocal = map[string]string{"user.name": "senior dufus", "user.email": "dufus@example.com"}
 	localProperties := map[string]string{}
 	ret = listOperation(dEnv, localCfg, []string{}, func() {}, func(k string, v string) {
 		localProperties[k] = v
@@ -375,8 +379,8 @@ func TestConfig(t *testing.T) {
 		t.Error("listOperation did not yield expected local results")
 	}
 
-	ret = getOperation(dEnv, globalCfg, []string{"title"}, func(k string, v *string) {
-		if v == nil || *v != "dufus" {
+	ret = getOperation(dEnv, globalCfg, []string{"user.email"}, func(k string, v *string) {
+		if v == nil || *v != "dufus@example.com" {
 			t.Error("Failed to get expected value for title.")
 		}
 	})
@@ -385,9 +389,9 @@ func TestConfig(t *testing.T) {
 		t.Error("get operation failed")
 	}
 
-	ret = getOperation(dEnv, globalCfg, []string{"name"}, func(k string, v *string) {
+	ret = getOperation(dEnv, globalCfg, []string{"user.name"}, func(k string, v *string) {
 		if v != nil {
-			t.Error("Failed to get expected value for \"name\" which should not be set in the config.")
+			t.Error("Failed to get expected value for \"user.name\" which should not be set in the config.")
 		}
 	})
 
@@ -402,14 +406,14 @@ func TestInvalidConfigArgs(t *testing.T) {
 	configCmd := ConfigCmd{}
 
 	// local and global flags passed together is invalid
-	ret := configCmd.Exec(ctx, "dolt config", []string{"--global", "--local", "--add", "name", "bheni"}, dEnv)
+	ret := configCmd.Exec(ctx, "dolt config", []string{"--global", "--local", "--add", "name", "bheni"}, dEnv, nil)
 
 	if ret == 0 {
 		t.Error("Invalid commands should fail. Command has both local and global")
 	}
 
 	// both -add and -get are used
-	ret = configCmd.Exec(ctx, "dolt config", []string{"-global", "--get", "--add", "title"}, dEnv)
+	ret = configCmd.Exec(ctx, "dolt config", []string{"-global", "--get", "--add", "title"}, dEnv, nil)
 
 	if ret == 0 {
 		t.Error("Invalid commands should fail. Command is missing local/global")

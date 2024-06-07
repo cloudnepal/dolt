@@ -26,7 +26,10 @@ import (
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-func FromDoltSchema(tableName string, sch schema.Schema) (sql.PrimaryKeySchema, error) {
+// TODO: Many callers only care about field names and types, not the table or db names.
+// Those callers may be passing in "" for these values, or may be passing in incorrect values
+// that are currently unused.
+func FromDoltSchema(dbName, tableName string, sch schema.Schema) (sql.PrimaryKeySchema, error) {
 	cols := make(sql.Schema, sch.GetAllCols().Size())
 
 	var i int
@@ -37,21 +40,31 @@ func FromDoltSchema(tableName string, sch schema.Schema) (sql.PrimaryKeySchema, 
 			extra = "auto_increment"
 		}
 
-		var deflt *sql.ColumnDefaultValue
+		var deflt, generated, onUpdate *sql.ColumnDefaultValue
 		if col.Default != "" {
 			deflt = sql.NewUnresolvedColumnDefaultValue(col.Default)
 		}
+		if col.Generated != "" {
+			generated = sql.NewUnresolvedColumnDefaultValue(col.Generated)
+		}
+		if col.OnUpdate != "" {
+			onUpdate = sql.NewUnresolvedColumnDefaultValue(col.OnUpdate)
+		}
 
 		cols[i] = &sql.Column{
-			Name:          col.Name,
-			Type:          sqlType,
-			Default:       deflt,
-			Nullable:      col.IsNullable(),
-			Source:        tableName,
-			PrimaryKey:    col.IsPartOfPK,
-			AutoIncrement: col.AutoIncrement,
-			Comment:       col.Comment,
-			Extra:         extra,
+			Name:           col.Name,
+			Type:           sqlType,
+			Default:        deflt,
+			Generated:      generated,
+			OnUpdate:       onUpdate,
+			Nullable:       col.IsNullable(),
+			DatabaseSource: dbName,
+			Source:         tableName,
+			PrimaryKey:     col.IsPartOfPK,
+			AutoIncrement:  col.AutoIncrement,
+			Comment:        col.Comment,
+			Virtual:        col.Virtual,
+			Extra:          extra,
 		}
 		i++
 		return false, nil
@@ -61,13 +74,12 @@ func FromDoltSchema(tableName string, sch schema.Schema) (sql.PrimaryKeySchema, 
 }
 
 // ToDoltSchema returns a dolt Schema from the sql schema given, suitable for use in creating a table.
-// For result set schemas, see ToDoltResultSchema.
 func ToDoltSchema(
 	ctx context.Context,
-	root *doltdb.RootValue,
+	root doltdb.RootValue,
 	tableName string,
 	sqlSchema sql.PrimaryKeySchema,
-	headRoot *doltdb.RootValue,
+	headRoot doltdb.RootValue,
 	collation sql.CollationID,
 ) (schema.Schema, error) {
 	var cols []schema.Column
@@ -85,7 +97,7 @@ func ToDoltSchema(
 		kinds = append(kinds, ti.NomsKind())
 	}
 
-	tags, err := root.GenerateTagsForNewColumns(ctx, tableName, names, kinds, headRoot)
+	tags, err := doltdb.GenerateTagsForNewColumns(ctx, root, tableName, names, kinds, headRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -133,20 +145,36 @@ func ToDoltCol(tag uint64, col *sql.Column) (schema.Column, error) {
 		return schema.Column{}, err
 	}
 
-	return schema.NewColumnWithTypeInfo(col.Name, tag, typeInfo, col.PrimaryKey, col.Default.String(), col.AutoIncrement, col.Comment, constraints...)
-}
-
-// ToDoltResultSchema returns a dolt Schema from the sql schema given, suitable for use as a result set
-func ToDoltResultSchema(sqlSchema sql.Schema) (schema.Schema, error) {
-	var cols []schema.Column
-	for i, col := range sqlSchema {
-		convertedCol, err := ToDoltCol(uint64(i), col)
-		if err != nil {
-			return nil, err
-		}
-		cols = append(cols, convertedCol)
+	var defaultVal, generatedVal, onUpdateVal string
+	if col.Default != nil {
+		defaultVal = col.Default.String()
+	} else {
+		generatedVal = col.Generated.String()
 	}
 
-	colColl := schema.NewColCollection(cols...)
-	return schema.UnkeyedSchemaFromCols(colColl), nil
+	if col.OnUpdate != nil {
+		onUpdateVal = col.OnUpdate.String()
+	}
+
+	c := schema.Column{
+		Name:          col.Name,
+		Tag:           tag,
+		Kind:          typeInfo.NomsKind(),
+		IsPartOfPK:    col.PrimaryKey,
+		TypeInfo:      typeInfo,
+		Default:       defaultVal,
+		Generated:     generatedVal,
+		OnUpdate:      onUpdateVal,
+		Virtual:       col.Virtual,
+		AutoIncrement: col.AutoIncrement,
+		Comment:       col.Comment,
+		Constraints:   constraints,
+	}
+
+	err = schema.ValidateColumn(c)
+	if err != nil {
+		return schema.Column{}, err
+	}
+
+	return c, nil
 }

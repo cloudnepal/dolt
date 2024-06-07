@@ -29,13 +29,13 @@ import (
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-func makeTestChunkJournal(t *testing.T) *chunkJournal {
+func makeTestChunkJournal(t *testing.T) *ChunkJournal {
 	cacheOnce.Do(makeGlobalCaches)
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "")
 	require.NoError(t, err)
 	t.Cleanup(func() { file.RemoveAll(dir) })
-	m, err := getFileManifest(ctx, dir, syncFlush)
+	m, err := newJournalManifest(ctx, dir)
 	require.NoError(t, err)
 	q := NewUnlimitedMemQuotaProvider()
 	p := newFSTablePersister(dir, q)
@@ -112,17 +112,17 @@ func TestReadRecordRanges(t *testing.T) {
 	require.NoError(t, err)
 
 	for h, rng := range ranges {
-		b, err := jcs.get(ctx, addr(h), &Stats{})
+		b, err := jcs.get(ctx, h, &Stats{})
 		assert.NoError(t, err)
 		ch1 := chunks.NewChunkWithHash(h, b)
-		assert.Equal(t, data[addr(h)], ch1)
+		assert.Equal(t, data[h], ch1)
 
 		start, stop := rng.Offset, uint32(rng.Offset)+rng.Length
 		cc2, err := NewCompressedChunk(h, buf[start:stop])
 		assert.NoError(t, err)
 		ch2, err := cc2.ToChunk()
 		assert.NoError(t, err)
-		assert.Equal(t, data[addr(h)], ch2)
+		assert.Equal(t, data[h], ch2)
 	}
 }
 

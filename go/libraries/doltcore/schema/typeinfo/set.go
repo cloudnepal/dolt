@@ -40,31 +40,34 @@ type setType struct {
 var _ TypeInfo = (*setType)(nil)
 
 func CreateSetTypeFromParams(params map[string]string) (TypeInfo, error) {
-	var collation sql.CollationID
-	var err error
-	if collationStr, ok := params[setTypeParam_Collation]; ok {
-		collation, err = sql.ParseCollation(nil, &collationStr, false)
-		if err != nil {
-			return nil, err
-		}
-	} else {
+	collationStr, ok := params[setTypeParam_Collation]
+	if !ok {
 		return nil, fmt.Errorf(`create set type info is missing param "%v"`, setTypeParam_Collation)
 	}
-	var values []string
-	if valuesStr, ok := params[setTypeParam_Values]; ok {
-		dec := gob.NewDecoder(strings.NewReader(valuesStr))
-		err = dec.Decode(&values)
-		if err != nil {
-			return nil, err
-		}
-	} else {
+	collation, err := sql.ParseCollation("", collationStr, false)
+	if err != nil {
+		return nil, err
+	}
+
+	valuesStr, ok := params[setTypeParam_Values]
+	if !ok {
 		return nil, fmt.Errorf(`create set type info is missing param "%v"`, setTypeParam_Values)
 	}
+	var values []string
+	dec := gob.NewDecoder(strings.NewReader(valuesStr))
+	if err = dec.Decode(&values); err != nil {
+		return nil, err
+	}
+
 	sqlSetType, err := gmstypes.CreateSetType(values, collation)
 	if err != nil {
 		return nil, err
 	}
-	return &setType{sqlSetType}, nil
+	return CreateSetTypeFromSqlSetType(sqlSetType), nil
+}
+
+func CreateSetTypeFromSqlSetType(sqlSetType sql.SetType) TypeInfo {
+	return &setType{sqlSetType}
 }
 
 // ConvertNomsValueToValue implements TypeInfo interface.
@@ -96,7 +99,7 @@ func (ti *setType) ConvertValueToNomsValue(ctx context.Context, vrw types.ValueR
 	if v == nil {
 		return types.NullValue, nil
 	}
-	val, err := ti.sqlSetType.Convert(v)
+	val, _, err := ti.sqlSetType.Convert(v)
 	if err != nil {
 		return nil, err
 	}

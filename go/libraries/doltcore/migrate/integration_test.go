@@ -170,10 +170,12 @@ func setupMigrationTest(t *testing.T, ctx context.Context, test migrationTest) *
 		dEnv, err = test.hook(ctx, dEnv)
 		require.NoError(t, err)
 	}
+	cliCtx, err := commands.NewArgFreeCliContext(ctx, dEnv)
+	require.NoError(t, err)
 
 	cmd := commands.SqlCmd{}
 	for _, query := range test.setup {
-		code := cmd.Exec(ctx, cmd.Name(), []string{"-q", query}, dEnv)
+		code := cmd.Exec(ctx, cmd.Name(), []string{"-q", query}, dEnv, cliCtx)
 		require.Equal(t, 0, code)
 	}
 	return dEnv
@@ -197,7 +199,7 @@ func SetupHookRefKeys(ctx context.Context, dEnv *env.DoltEnv) (*env.DoltEnv, err
 	if err != nil {
 		return nil, err
 	}
-	root, err := ws.WorkingRoot().CreateEmptyTable(ctx, "test", sch)
+	root, err := doltdb.CreateEmptyTable(ctx, ws.WorkingRoot(), doltdb.TableName{Name: "test"}, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -241,14 +243,13 @@ func initTestMigrationDB(ctx context.Context) (*doltdb.DoltDB, error) {
 	if err != nil {
 		return nil, err
 	}
-	nv := doltdb.HackNomsValuesFromRootValues(rv)
 
 	ds, err := db.GetDataset(ctx, ref.NewInternalRef("migration").String())
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = db.Commit(ctx, ds, nv, datas.CommitOptions{Meta: meta})
+	_, err = db.Commit(ctx, ds, rv.NomsValue(), datas.CommitOptions{Meta: meta})
 	if err != nil {
 		return nil, err
 	}

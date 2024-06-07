@@ -3,24 +3,36 @@
 # Dolt is Git for Data!
 
 Dolt is a SQL database that you can fork, clone, branch, merge, push
-and pull just like a Git repository. Connect to Dolt just like any
-MySQL database to run queries or update the data using SQL
-commands. Use the command line interface to import CSV files, commit
-your changes, push them to a remote, or merge your teammate's changes.
+and pull just like a Git repository. 
 
-All the commands you know for Git work exactly the same for Dolt. Git
-versions files, Dolt versions tables. It's like Git and MySQL had a
+Connect to Dolt just like any MySQL database to read or modify schema 
+and data. Version control functionality is exposed in SQL via system 
+tables, functions, and procedures. 
+
+Or, use the Git-like command line interface to import CSV files, commit 
+your changes, push them to a remote, or merge your teammate's changes.
+All the commands you know for Git work exactly the same for Dolt. 
+
+Git versions files. Dolt versions tables. It's like Git and MySQL had a
 baby.
 
 We also built [DoltHub](https://www.dolthub.com), a place to share
 Dolt databases. We host public data for free. If you want to host
-your own version of DoltHub, we have [DoltLab](https://www.doltlab.com). If you want us to run a Dolt server for you, we have [Hosted Dolt](https://hosted.doltdb.com).
+your own version of DoltHub, we have [DoltLab](https://www.doltlab.com). 
+If you want us to run a Dolt server for you, we have [Hosted Dolt](https://hosted.doltdb.com). 
+If you are looking for a Postgres version of Dolt, we built 
+[DoltgreSQL](https://github.com/dolthub/doltgresql). Warning, it's 
+early Alpha. Dolt is production-ready.
 
 [Join us on Discord](https://discord.com/invite/RFwfYpu) to say hi and
 ask questions, or [check out our roadmap](https://docs.dolthub.com/other/roadmap) 
 to see what we're building next.
 
-## What's it for?
+# Video Introduction
+
+[![Dolt Explainer Video](https://img.youtube.com/vi/H2iZy0Cme10/maxresdefault.jpg)](https://www.youtube.com/watch?v=H2iZy0Cme10)
+
+# What's it for?
 
 Lots of things! Dolt is a generally useful tool with countless
 applications. But if you want some ideas, [here's how people are using
@@ -81,11 +93,11 @@ Valid commands for dolt are
 
 # Installation
 
-Dolt is a single ~68 megabyte program. 
+Dolt is a single ~103 megabyte program. 
 
 ```bash
-dolt $ du -h /Users/timsehn//go/bin/dolt
- 68M	/Users/timsehn/go/bin/dolt
+dolt $ du -h /Users/timsehn/go/bin/dolt
+103M	/Users/timsehn/go/bin/dolt
 ```
 
 It's really easy to install. Download it and put it on your `PATH`. 
@@ -107,6 +119,16 @@ The install script needs sudo in order to put `dolt` in `/usr/local/bin`. If you
 privileges or aren't comfortable running a script with them, you can download the dolt binary
 for your platform from [the latest release](https://github.com/dolthub/dolt/releases), unzip it,
 and put the binary somewhere on your `$PATH`.
+
+### Linux
+
+#### Arch Linux
+
+Dolt is packaged in the official repositories for Arch Linux.
+
+```
+pacman -S dolt
+```
 
 ### Mac
 
@@ -151,12 +173,18 @@ as CLI tool.
 
 ## From Source
 
-Make sure you have Go installed, and that `go` is in your path.
+Make sure you have Go installed, and that `go` is in your path. Dolt has a dependency on [cgo](https://pkg.go.dev/cmd/cgo), so you will need a working C compiler and toolchain as well.
 
 Clone this repository and cd into the `go` directory. Then run:
 
 ```
 go install ./cmd/dolt
+```
+
+The output will be in `$GOPATH/bin`, which defaults to `~/go/bin`. To test your build, try:
+
+```
+~/go/bin/dolt version
 ```
 
 # Configuration
@@ -210,7 +238,7 @@ Your terminal will just hang there. This means the server is running. Any errors
 In the new terminal, we will now connect to the running database server using a client. Dolt also ships with a MySQL compatible client. 
 
 ```bash
-% dolt sql-client -u root
+% dolt -u root -p "" sql
 # Welcome to the Dolt MySQL client.
 # Statements must be terminated with ';'.
 # "exit" or "quit" (or Ctrl-D) to exit.
@@ -516,9 +544,8 @@ mysql> show tables;
 3 rows in set (0.01 sec)
 ```
 
-Dolt makes operating databases less error prone. You can always back out changes you have in progress or rewind to a known good state. You also have the ability to undo specific commits using [`dolt_revert()`](https://docs.dolthub.com/sql-reference/version-control/dolt-sql-procedures#dolt_revert).
+Dolt makes operating databases less error prone. You can always back out changes you have in progress or rewind to a known good state. You also have the ability to undo specific commits using [`dolt_revert()`](https://docs.dolthub.com/sql-reference/version-control/dolt-sql-procedures#dolt_revert). Even if you accidentally run `drop database` on the wrong database, Dolt lets you undo that by calling the [`dolt_undrop()` stored procedure](https://docs.dolthub.com/sql-reference/version-control/dolt-sql-procedures#dolt_undrop).
 
-Note, the only unrecoverable SQL statement in Dolt is `drop database`. This deletes the database and all of its history on disk. `drop database` works this way for SQL tool compatibility as it is common for import tools to issue a `drop database` to clear all database state before an import. Dolt implements [remotes](https://docs.dolthub.com/concepts/dolt/remotes) like in Git so you can maintain an offline copy for backup using clone, fetch, push, and pull. Maintaining a remote copy allows you to restore in the case of an errant `drop database` query. 
 
 ## See the data in a SQL Workbench
 
@@ -804,6 +831,10 @@ Dolt provides powerful data audit capabilities down to individual cells. When, h
 # Additional Reading
 
 Head over to [our documentation](https://docs.dolthub.com/introduction/what-is-dolt) now that you have a feel for Dolt. You can also read about what we've been working on in [our blog](https://www.dolthub.com/blog/).
+
+# Security Policy
+
+[Dolt's current security policy](https://github.com/dolthub/dolt/blob/main/SECURITY.md) is maintained in this repository. Please follow the disclosure instructions there. Please do not initially report security issues in this repository's public GitHub issues.
 
 # Credits and License
 

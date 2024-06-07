@@ -32,8 +32,8 @@ import (
 	"github.com/dolthub/dolt/go/store/val"
 )
 
-func newProllyCVTable(ctx *sql.Context, tblName string, root *doltdb.RootValue, rs RootSetter) (sql.Table, error) {
-	tbl, tblName, ok, err := root.GetTableInsensitive(ctx, tblName)
+func newProllyCVTable(ctx *sql.Context, tblName string, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
+	tbl, tblName, ok, err := doltdb.GetTableInsensitive(ctx, root, doltdb.TableName{Name: tblName})
 	if err != nil {
 		return nil, err
 	} else if !ok {
@@ -43,7 +43,7 @@ func newProllyCVTable(ctx *sql.Context, tblName string, root *doltdb.RootValue, 
 	if err != nil {
 		return nil, err
 	}
-	sqlSch, err := sqlutil.FromDoltSchema(doltdb.DoltConstViolTablePrefix+tblName, cvSch)
+	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConstViolTablePrefix+tblName, cvSch)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +67,7 @@ func newProllyCVTable(ctx *sql.Context, tblName string, root *doltdb.RootValue, 
 // for a user table for the v1 format.
 type prollyConstraintViolationsTable struct {
 	tblName string
-	root    *doltdb.RootValue
+	root    doltdb.RootValue
 	sqlSch  sql.PrimaryKeySchema
 	tbl     *doltdb.Table
 	rs      RootSetter
@@ -117,6 +117,12 @@ func (cvt *prollyConstraintViolationsTable) PartitionRows(ctx *sql.Context, part
 		return nil, err
 	}
 	kd, vd := sch.GetMapDescriptors()
+
+	// value tuples encoded in ConstraintViolationMeta may
+	// violate the not null constraints assumed by fixed access
+	kd = kd.WithoutFixedAccess()
+	vd = vd.WithoutFixedAccess()
+
 	return prollyCVIter{
 		itr: itr,
 		sch: sch,
@@ -154,9 +160,19 @@ func (itr prollyCVIter) Next(ctx *sql.Context) (sql.Row, error) {
 		return nil, err
 	}
 
-	r := make(sql.Row, itr.sch.GetAllCols().Size()+3)
-	r[0] = art.TheirRootIsh.String()
-	r[1] = mapCVType(art.ArtType)
+	// In addition to the table's columns, the constraint violations table adds
+	// three more columns: from_root_ish, violation_type, and violation_info
+	additionalColumns := 3
+	if schema.IsKeyless(itr.sch) {
+		// If this is for a keyless table, then there is no PK in the schema, so we
+		// add one additional column for the generated hash. This is necessary for
+		// being able to uniquely identify rows in the constraint violations table.
+		additionalColumns++
+	}
+
+	r := make(sql.Row, itr.sch.GetAllCols().Size()+additionalColumns)
+	r[0] = art.SourceRootish.String()
+	r[1] = merge.MapCVType(art.ArtType)
 
 	var meta prolly.ConstraintViolationMeta
 	err = json.Unmarshal(art.Metadata, &meta)
@@ -167,7 +183,7 @@ func (itr prollyCVIter) Next(ctx *sql.Context) (sql.Row, error) {
 	o := 2
 	if !schema.IsKeyless(itr.sch) {
 		for i := 0; i < itr.kd.Count(); i++ {
-			r[o+i], err = index.GetField(ctx, itr.kd, i, art.Key, itr.ns)
+			r[o+i], err = tree.GetField(ctx, itr.kd, i, art.SourceKey, itr.ns)
 			if err != nil {
 				return nil, err
 			}
@@ -175,15 +191,23 @@ func (itr prollyCVIter) Next(ctx *sql.Context) (sql.Row, error) {
 		o += itr.kd.Count()
 
 		for i := 0; i < itr.vd.Count(); i++ {
-			r[o+i], err = index.GetField(ctx, itr.vd, i, meta.Value, itr.ns)
+			r[o+i], err = tree.GetField(ctx, itr.vd, i, meta.Value, itr.ns)
 			if err != nil {
 				return nil, err
 			}
 		}
 		o += itr.vd.Count()
 	} else {
+		// For a keyless table, we still need a key to uniquely identify the row in the constraint
+		// violation table, so we add in the unique hash for the row.
+		r[o], err = tree.GetField(ctx, itr.kd, 0, art.SourceKey, itr.ns)
+		if err != nil {
+			return nil, err
+		}
+		o += 1
+
 		for i := 0; i < itr.vd.Count()-1; i++ {
-			r[o+i], err = index.GetField(ctx, itr.vd, i+1, meta.Value, itr.ns)
+			r[o+i], err = tree.GetField(ctx, itr.vd, i+1, meta.Value, itr.ns)
 			if err != nil {
 				return nil, err
 			}
@@ -201,6 +225,20 @@ func (itr prollyCVIter) Next(ctx *sql.Context) (sql.Row, error) {
 		r[o] = m
 	case prolly.ArtifactTypeUniqueKeyViol:
 		var m merge.UniqCVMeta
+		err = json.Unmarshal(meta.VInfo, &m)
+		if err != nil {
+			return nil, err
+		}
+		r[o] = m
+	case prolly.ArtifactTypeNullViol:
+		var m merge.NullViolationMeta
+		err = json.Unmarshal(meta.VInfo, &m)
+		if err != nil {
+			return nil, err
+		}
+		r[o] = m
+	case prolly.ArtifactTypeChkConsViol:
+		var m merge.CheckCVMeta
 		err = json.Unmarshal(meta.VInfo, &m)
 		if err != nil {
 			return nil, err
@@ -225,9 +263,11 @@ var _ sql.RowDeleter = (*prollyCVDeleter)(nil)
 
 // Delete implements the interface sql.RowDeleter.
 func (d *prollyCVDeleter) Delete(ctx *sql.Context, r sql.Row) error {
-	// first part of the artifact key is the keys of the source table
+	// When we delete a row, we need to build the primary key from the row data.
+	// The PK has 3+ fields: from_root_ish, violation_type, plus all PK fields from the source table.
+	// If the source table is keyless and has no PK, then we use the unique row hash provided by keyless tables.
 	for i := 0; i < d.kd.Count()-2; i++ {
-		err := index.PutField(ctx, d.cvt.artM.NodeStore(), d.kb, i, r[i+2])
+		err := tree.PutField(ctx, d.cvt.artM.NodeStore(), d.kb, i, r[i+2])
 		if err != nil {
 			return err
 		}
@@ -238,7 +278,7 @@ func (d *prollyCVDeleter) Delete(ctx *sql.Context, r sql.Row) error {
 	d.kb.PutCommitAddr(d.kd.Count()-2, h)
 
 	// Finally the artifact type
-	artType := unmapCVType(merge.CvType(r[1].(uint64)))
+	artType := merge.UnmapCVType(merge.CvType(r[1].(uint64)))
 	d.kb.PutUint8(d.kd.Count()-1, uint8(artType))
 
 	key := d.kb.Build(d.pool)
@@ -279,40 +319,12 @@ func (d *prollyCVDeleter) Close(ctx *sql.Context) error {
 		return err
 	}
 
-	updatedRoot, err := d.cvt.root.PutTable(ctx, d.cvt.tblName, updatedTbl)
+	updatedRoot, err := d.cvt.root.PutTable(ctx, doltdb.TableName{Name: d.cvt.tblName}, updatedTbl)
 	if err != nil {
 		return err
 	}
 
 	return d.cvt.rs.SetRoot(ctx, updatedRoot)
-}
-
-func mapCVType(artifactType prolly.ArtifactType) (outType uint64) {
-	switch artifactType {
-	case prolly.ArtifactTypeForeignKeyViol:
-		outType = uint64(merge.CvType_ForeignKey)
-	case prolly.ArtifactTypeUniqueKeyViol:
-		outType = uint64(merge.CvType_UniqueIndex)
-	case prolly.ArtifactTypeChkConsViol:
-		outType = uint64(merge.CvType_CheckConstraint)
-	default:
-		panic("unhandled cv type")
-	}
-	return
-}
-
-func unmapCVType(in merge.CvType) (out prolly.ArtifactType) {
-	switch in {
-	case merge.CvType_ForeignKey:
-		out = prolly.ArtifactTypeForeignKeyViol
-	case merge.CvType_UniqueIndex:
-		out = prolly.ArtifactTypeUniqueKeyViol
-	case merge.CvType_CheckConstraint:
-		out = prolly.ArtifactTypeChkConsViol
-	default:
-		panic("unhandled cv type")
-	}
-	return
 }
 
 func (itr prollyCVIter) Close(ctx *sql.Context) error {

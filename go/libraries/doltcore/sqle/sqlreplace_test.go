@@ -230,7 +230,7 @@ var BasicReplaceTests = []ReplaceTest{
 	{
 		Name: "replace partial columns existing pk",
 		AdditionalSetup: ExecuteSetupSQL(context.Background(), `
-			CREATE TABLE temppeople (id bigint primary key, first_name varchar(16383), last_name varchar(16383), num bigint);
+			CREATE TABLE temppeople (id bigint primary key, first_name varchar(1023), last_name varchar(1023), num bigint);
 			INSERT INTO temppeople VALUES (2, 'Bart', 'Simpson', 44);`),
 		ReplaceQuery: "replace into temppeople (id, first_name, last_name, num) values (2, 'Bart', 'Simpson', 88)",
 		SelectQuery:  "select id, first_name, last_name, num from temppeople where id = 2 ORDER BY id",
@@ -273,10 +273,10 @@ var systemTableReplaceTests = []ReplaceTest{
 	{
 		Name: "replace into dolt_schemas",
 		AdditionalSetup: CreateTableFn(doltdb.SchemasTableName, schemaTableSchema,
-			"INSERT INTO dolt_schemas VALUES ('view', 'name', 'create view name as select 2+2 from dual', NULL)"),
+			"INSERT INTO dolt_schemas VALUES ('view', 'name', 'create view name as select 2+2 from dual', NULL, NULL)"),
 		ReplaceQuery:   "replace into dolt_schemas (type, name, fragment) values ('view', 'name', 'create view name as select 1+1 from dual')",
-		SelectQuery:    "select type, name, fragment, extra from dolt_schemas",
-		ExpectedRows:   []sql.Row{{"view", "name", "create view name as select 1+1 from dual", nil}},
+		SelectQuery:    "select type, name, fragment, extra, sql_mode from dolt_schemas",
+		ExpectedRows:   []sql.Row{{"view", "name", "create view name as select 1+1 from dual", nil, nil}},
 		ExpectedSchema: CompressSchema(schemaTableSchema),
 	},
 }
@@ -302,6 +302,7 @@ func testReplaceQuery(t *testing.T, test ReplaceTest) {
 
 	dEnv, err := CreateEmptyTestDatabase()
 	require.NoError(t, err)
+	defer dEnv.DoltDB.Close()
 
 	if test.AdditionalSetup != nil {
 		test.AdditionalSetup(t, dEnv)

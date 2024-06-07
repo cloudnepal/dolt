@@ -16,9 +16,12 @@ package dtestutils
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/types"
 )
@@ -35,25 +38,74 @@ func CreateTestEnv() *env.DoltEnv {
 	return CreateTestEnvWithName("test")
 }
 
+// CreateTestEnvForLocalFilesystem creates a new DoltEnv for testing, using a local FS, instead of an in-memory
+// filesystem, for persisting files. This is useful for tests that require a disk-based filesystem and will not
+// work correctly with an in-memory filesystem and in-memory blob store (e.g. dolt_undrop() tests).
+func CreateTestEnvForLocalFilesystem() *env.DoltEnv {
+	tempDir, err := os.MkdirTemp(os.TempDir(), "dolt-*")
+	if err != nil {
+		panic(err)
+	}
+
+	fs, err := filesys.LocalFilesysWithWorkingDir(tempDir)
+	if err != nil {
+		panic(err)
+	}
+
+	err = fs.MkDirs("test")
+	if err != nil {
+		panic(err)
+	}
+
+	fs, err = fs.WithWorkingDir("test")
+	if err != nil {
+		panic(err)
+	}
+
+	homeDir := filepath.Join(tempDir, "home")
+	err = fs.MkDirs("home")
+	if err != nil {
+		panic(err)
+	}
+	homeDirFunc := func() (string, error) { return homeDir, nil }
+
+	return createTestEnvWithNameAndFilesystem("test", fs, homeDirFunc)
+}
+
 // CreateTestEnvWithName creates a new DoltEnv suitable for testing and uses
 // the specified name to distinguish it from other test envs. This function
 // should generally be preferred over CreateTestEnv, especially when working with
 // tests using multiple databases within a MultiRepoEnv.
 func CreateTestEnvWithName(envName string) *env.DoltEnv {
+	initialDirs := []string{TestHomeDirPrefix + envName, WorkingDirPrefix + envName}
+	fs := filesys.NewInMemFS(initialDirs, nil, WorkingDirPrefix+envName)
+	homeDirFunc := func() (string, error) { return TestHomeDirPrefix + envName, nil }
+
+	return createTestEnvWithNameAndFilesystem(envName, fs, homeDirFunc)
+}
+
+// createTestEnvWithNameAndFilesystem creates a Dolt environment for testing, using the |envName| for the name, the
+// specified |fs| for persisting files, and |homeDirFunc| for finding the location to load global Dolt configuration.
+func createTestEnvWithNameAndFilesystem(envName string, fs filesys.Filesys, homeDirFunc func() (string, error)) *env.DoltEnv {
 	const name = "billy bob"
 	const email = "bigbillieb@fake.horse"
-	initialDirs := []string{TestHomeDirPrefix + envName, WorkingDirPrefix + envName}
-	homeDirFunc := func() (string, error) { return TestHomeDirPrefix + envName, nil }
-	fs := filesys.NewInMemFS(initialDirs, nil, WorkingDirPrefix+envName)
-	dEnv := env.Load(context.Background(), homeDirFunc, fs, doltdb.InMemDoltDB+envName, "test")
+
+	var urlStr string
+	_, isInMemFs := fs.(*filesys.InMemFS)
+	if isInMemFs {
+		urlStr = doltdb.InMemDoltDB + envName
+	} else {
+		urlStr = doltdb.LocalDirDoltDB
+	}
+
+	dEnv := env.Load(context.Background(), homeDirFunc, fs, urlStr, "test")
 	cfg, _ := dEnv.Config.GetConfig(env.GlobalConfig)
 	cfg.SetStrings(map[string]string{
-		env.UserNameKey:  name,
-		env.UserEmailKey: email,
+		config.UserNameKey:  name,
+		config.UserEmailKey: email,
 	})
 
 	err := dEnv.InitRepo(context.Background(), types.Format_Default, name, email, env.DefaultInitBranch)
-
 	if err != nil {
 		panic("Failed to initialize environment:" + err.Error())
 	}

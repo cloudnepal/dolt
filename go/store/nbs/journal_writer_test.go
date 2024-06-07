@@ -16,6 +16,7 @@ package nbs
 
 import (
 	"context"
+	"encoding/base32"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -184,7 +185,7 @@ func newTestJournalWriter(t *testing.T, path string) *journalWriter {
 	j, err := createJournalWriter(ctx, path)
 	require.NoError(t, err)
 	require.NotNil(t, j)
-	_, err = j.bootstrapJournal(ctx)
+	_, err = j.bootstrapJournal(ctx, nil)
 	require.NoError(t, err)
 	return j
 }
@@ -199,9 +200,7 @@ func TestJournalWriterWriteCompressedChunk(t *testing.T) {
 		r, _ := j.ranges.get(a)
 		validateLookup(t, j, r, cc)
 	}
-	j.ranges.iter(func(a addr, r Range) {
-		validateLookup(t, j, r, data[a])
-	})
+	validateAllLookups(t, j, data)
 }
 
 func TestJournalWriterBootstrap(t *testing.T) {
@@ -216,15 +215,16 @@ func TestJournalWriterBootstrap(t *testing.T) {
 		last = cc.Hash()
 	}
 	require.NoError(t, j.commitRootHash(last))
+	require.NoError(t, j.Close())
 
 	j, _, err := openJournalWriter(ctx, path)
 	require.NoError(t, err)
-	_, err = j.bootstrapJournal(ctx)
+	reflogBuffer := newReflogRingBuffer(10)
+	last, err = j.bootstrapJournal(ctx, reflogBuffer)
 	require.NoError(t, err)
+	assertExpectedIterationOrder(t, reflogBuffer, []string{last.String()})
 
-	j.ranges.iter(func(a addr, r Range) {
-		validateLookup(t, j, r, data[a])
-	})
+	validateAllLookups(t, j, data)
 
 	source := journalChunkSource{journal: j}
 	for a, cc := range data {
@@ -234,6 +234,27 @@ func TestJournalWriterBootstrap(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, ch.Data(), buf)
 	}
+}
+
+func validateAllLookups(t *testing.T, j *journalWriter, data map[hash.Hash]CompressedChunk) {
+	// move |data| to addr16-keyed map
+	prefixMap := make(map[addr16]CompressedChunk, len(data))
+	var prefix addr16
+	for a, cc := range data {
+		copy(prefix[:], a[:])
+		prefixMap[prefix] = cc
+	}
+	iterRangeIndex(j.ranges, func(a addr16, r Range) (stop bool) {
+		validateLookup(t, j, r, prefixMap[a])
+		return
+	})
+}
+
+func iterRangeIndex(idx rangeIndex, cb func(addr16, Range) (stop bool)) {
+	idx.novel.Iter(func(a hash.Hash, r Range) (stop bool) {
+		return cb(toAddr16(a), r)
+	})
+	idx.cached.Iter(cb)
 }
 
 func validateLookup(t *testing.T, j *journalWriter, r Range, cc CompressedChunk) {
@@ -266,12 +287,12 @@ func newTestFilePath(t *testing.T) string {
 func TestJournalIndexBootstrap(t *testing.T) {
 	// potentially indexed region of a journal
 	type epoch struct {
-		records map[addr]CompressedChunk
+		records map[hash.Hash]CompressedChunk
 		last    hash.Hash
 	}
 
 	makeEpoch := func() (e epoch) {
-		e.records = randomCompressedChunks(64)
+		e.records = randomCompressedChunks(8)
 		for h := range e.records {
 			e.last = hash.Hash(h)
 			break
@@ -315,9 +336,11 @@ func TestJournalIndexBootstrap(t *testing.T) {
 			path := newTestFilePath(t)
 			j := newTestJournalWriter(t, path)
 			// setup
+			var recordCnt int
 			epochs := append(test.epochs, test.novel)
 			for i, e := range epochs {
 				for _, cc := range e.records {
+					recordCnt++
 					assert.NoError(t, j.writeCompressedChunk(cc))
 					if rand.Int()%10 == 0 { // periodic commits
 						assert.NoError(t, j.commitRootHash(cc.H))
@@ -325,18 +348,20 @@ func TestJournalIndexBootstrap(t *testing.T) {
 				}
 				o := j.offset()                             // precommit offset
 				assert.NoError(t, j.commitRootHash(e.last)) // commit |e.last|
-				if i == len(epochs)-1 {
+				if i == len(epochs) {
 					break // don't index |test.novel|
 				}
 				assert.NoError(t, j.flushIndexRecord(e.last, o)) // write index record
 			}
+			err := j.Close()
+			require.NoError(t, err)
 
 			validateJournal := func(p string, expected []epoch) {
 				journal, ok, err := openJournalWriter(ctx, p)
 				require.NoError(t, err)
 				require.True(t, ok)
 				// bootstrap journal and validate chunk records
-				last, err := journal.bootstrapJournal(ctx)
+				last, err := journal.bootstrapJournal(ctx, nil)
 				assert.NoError(t, err)
 				for _, e := range expected {
 					var act CompressedChunk
@@ -347,16 +372,17 @@ func TestJournalIndexBootstrap(t *testing.T) {
 					}
 				}
 				assert.Equal(t, expected[len(expected)-1].last, last)
+				assert.NoError(t, journal.Close())
 			}
+
 			idxPath := filepath.Join(filepath.Dir(path), journalIndexFileName)
 
 			before, err := os.Stat(idxPath)
 			require.NoError(t, err)
-			if len(test.epochs) > 0 { // expect index
-				assert.True(t, before.Size() > 0)
-			} else {
-				assert.Equal(t, int64(0), before.Size())
-			}
+
+			lookupSize := int64(recordCnt * (1 + lookupSz))
+			metaSize := int64(len(epochs)) * (1 + lookupMetaSz)
+			assert.Equal(t, lookupSize+metaSize, before.Size())
 
 			// bootstrap journal using index
 			validateJournal(path, epochs)
@@ -365,19 +391,26 @@ func TestJournalIndexBootstrap(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, before.Size(), info.Size())
 
-			// bootstrap journal without index
+			// bootstrap journal with corrupted index
 			corruptJournalIndex(t, idxPath)
-			validateJournal(path, epochs)
-			// assert corrupt index cleaned up
-			info, err = os.Stat(idxPath)
+			jnl, ok, err := openJournalWriter(ctx, idxPath)
 			require.NoError(t, err)
-			assert.Equal(t, int64(0), info.Size())
+			require.True(t, ok)
+			_, err = jnl.bootstrapJournal(ctx, nil)
+			assert.Error(t, err)
 		})
 	}
 }
 
-func randomCompressedChunks(cnt int) (compressed map[addr]CompressedChunk) {
-	compressed = make(map[addr]CompressedChunk)
+var encoding = base32.NewEncoding("0123456789abcdefghijklmnopqrstuv")
+
+// encode returns the base32 encoding in the Dolt alphabet.
+func encode(data []byte) string {
+	return encoding.EncodeToString(data)
+}
+
+func randomCompressedChunks(cnt int) (compressed map[hash.Hash]CompressedChunk) {
+	compressed = make(map[hash.Hash]CompressedChunk)
 	var buf []byte
 	for i := 0; i < cnt; i++ {
 		k := rand.Intn(51) + 50
@@ -387,7 +420,7 @@ func randomCompressedChunks(cnt int) (compressed map[addr]CompressedChunk) {
 		}
 		c := chunks.NewChunk(buf[:k])
 		buf = buf[k:]
-		compressed[addr(c.Hash())] = ChunkToCompressedChunk(c)
+		compressed[c.Hash()] = ChunkToCompressedChunk(c)
 	}
 	return
 }
@@ -407,15 +440,15 @@ func TestRangeIndex(t *testing.T) {
 	data := randomCompressedChunks(1024)
 	idx := newRangeIndex()
 	for _, c := range data {
-		idx.put(addr(c.Hash()), Range{})
+		idx.put(c.Hash(), Range{})
 	}
 	for _, c := range data {
-		_, ok := idx.get(addr(c.Hash()))
+		_, ok := idx.get(c.Hash())
 		assert.True(t, ok)
 	}
 	assert.Equal(t, len(data), idx.novelCount())
 	assert.Equal(t, len(data), int(idx.count()))
-	idx.flatten()
+	idx = idx.flatten()
 	assert.Equal(t, 0, idx.novelCount())
 	assert.Equal(t, len(data), int(idx.count()))
 }

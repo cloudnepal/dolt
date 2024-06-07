@@ -359,7 +359,7 @@ SQL
     cd workspace
     dolt init
     cd ..
-    dolt sql --data-dir ./ -b -q "USE workspace;CREATE TABLE mytable LIKE otherdb.othertable;"
+    dolt --data-dir ./ sql -b -q "USE workspace;CREATE TABLE mytable LIKE otherdb.othertable;"
     cd workspace
     run dolt schema show mytable
     [ "$status" -eq 0 ]
@@ -377,7 +377,7 @@ CREATE TABLE test1 (
 );
 SQL
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "same name" ]] || false
+    [[ "$output" =~ "duplicate column name" ]] || false
 
     run dolt sql <<SQL
 CREATE TABLE test1 (
@@ -386,7 +386,7 @@ CREATE TABLE test1 (
 );
 SQL
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "same name" ]] || false
+    [[ "$output" =~ "duplicate column name" ]] || false
 
     dolt sql <<SQL
 CREATE TABLE test1 (
@@ -705,7 +705,7 @@ SQL
     cd repo2
     dolt init
     cd ..
-    run dolt sql --data-dir ./ -b -q "USE repo2;CREATE TEMPORARY TABLE temp2 LIKE repo1.tableone;"
+    run dolt --data-dir ./ sql -b -q "USE repo2;CREATE TEMPORARY TABLE temp2 LIKE repo1.tableone;"
     [ "$status" -eq 0 ]
     cd repo2
 
@@ -765,7 +765,7 @@ DROP TABLE myTempTABLE;
 SELECT * FROM myTempTable;
 SQL
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "table not found: myTempTable" ]] || false
+    [[ "$output" =~ "table not found: mytemptable" ]] || false
 }
 
 @test "sql-create-tables: BINARY attributes" {
@@ -775,4 +775,19 @@ CREATE TABLE budgets2(id CHAR(36) BINARY);
 SQL
     dolt sql -q "INSERT INTO budgets VALUES (UUID());"
     dolt sql -q "INSERT INTO budgets2 VALUES (UUID());"
+}
+
+@test "sql-create-tables: tables should not reuse constraint names" {
+    run dolt sql -r csv <<SQL
+CREATE TABLE t1 (
+    pk int PRIMARY KEY,
+    val int CHECK (val > 0)
+);
+CREATE TABLE t2 LIKE t1;
+SELECT count(CONSTRAINT_NAME), count(distinct CONSTRAINT_NAME) FROM information_schema.table_constraints WHERE CONSTRAINT_TYPE="CHECK";
+SQL
+
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "2,2" ]] || false
+
 }

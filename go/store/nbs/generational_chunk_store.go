@@ -31,18 +31,31 @@ var _ chunks.GenerationalCS = (*GenerationalNBS)(nil)
 var _ chunks.TableFileStore = (*GenerationalNBS)(nil)
 
 type GenerationalNBS struct {
-	oldGen *NomsBlockStore
-	newGen *NomsBlockStore
+	oldGen   *NomsBlockStore
+	newGen   *NomsBlockStore
+	ghostGen *GhostBlockStore
 }
 
-func NewGenerationalCS(oldGen, newGen *NomsBlockStore) *GenerationalNBS {
+func (gcs *GenerationalNBS) PersistGhostHashes(ctx context.Context, refs hash.HashSet) error {
+	if gcs.ghostGen == nil {
+		return gcs.ghostGen.PersistGhostHashes(ctx, refs)
+	}
+	return fmt.Errorf("runtime error. ghostGen is nil but an attempt to persist ghost hashes was made")
+}
+
+func (gcs *GenerationalNBS) GhostGen() chunks.ChunkStore {
+	return gcs.ghostGen
+}
+
+func NewGenerationalCS(oldGen, newGen *NomsBlockStore, ghostGen *GhostBlockStore) *GenerationalNBS {
 	if oldGen.Version() != "" && oldGen.Version() != newGen.Version() {
 		panic("oldgen and newgen chunkstore versions vary")
 	}
 
 	return &GenerationalNBS{
-		oldGen: oldGen,
-		newGen: newGen,
+		oldGen:   oldGen,
+		newGen:   newGen,
+		ghostGen: ghostGen,
 	}
 }
 
@@ -63,7 +76,17 @@ func (gcs *GenerationalNBS) Get(ctx context.Context, h hash.Hash) (chunks.Chunk,
 	}
 
 	if c.IsEmpty() {
-		return gcs.newGen.Get(ctx, h)
+		c, err = gcs.newGen.Get(ctx, h)
+	}
+	if err != nil {
+		return chunks.EmptyChunk, err
+	}
+
+	if c.IsEmpty() && gcs.ghostGen != nil {
+		c, err = gcs.ghostGen.Get(ctx, h)
+		if err != nil {
+			return chunks.EmptyChunk, err
+		}
 	}
 
 	return c, nil
@@ -73,26 +96,45 @@ func (gcs *GenerationalNBS) Get(ctx context.Context, h hash.Hash) (chunks.Chunk,
 // which have been found. Any non-present chunks will silently be ignored.
 func (gcs *GenerationalNBS) GetMany(ctx context.Context, hashes hash.HashSet, found func(context.Context, *chunks.Chunk)) error {
 	mu := &sync.Mutex{}
-	notInOldGen := hashes.Copy()
+	notFound := hashes.Copy()
 	err := gcs.oldGen.GetMany(ctx, hashes, func(ctx context.Context, chunk *chunks.Chunk) {
 		func() {
 			mu.Lock()
 			defer mu.Unlock()
-			delete(notInOldGen, chunk.Hash())
+			delete(notFound, chunk.Hash())
 		}()
 
 		found(ctx, chunk)
 	})
-
 	if err != nil {
 		return err
 	}
-
-	if len(notInOldGen) == 0 {
+	if len(notFound) == 0 {
 		return nil
 	}
 
-	return gcs.newGen.GetMany(ctx, notInOldGen, found)
+	err = gcs.newGen.GetMany(ctx, notFound, func(ctx context.Context, chunk *chunks.Chunk) {
+		func() {
+			mu.Lock()
+			defer mu.Unlock()
+			delete(notFound, chunk.Hash())
+		}()
+
+		found(ctx, chunk)
+	})
+	if err != nil {
+		return err
+	}
+	if len(notFound) == 0 {
+		return nil
+	}
+
+	// Last ditch effort to see if the requested objects are commits we've decided to ignore. Note the function spec
+	// considers non-present chunks to be silently ignored, so we don't need to return an error here
+	if gcs.ghostGen == nil {
+		return nil
+	}
+	return gcs.ghostGen.GetMany(ctx, notFound, found)
 }
 
 func (gcs *GenerationalNBS) GetManyCompressed(ctx context.Context, hashes hash.HashSet, found func(context.Context, CompressedChunk)) error {
@@ -122,16 +164,23 @@ func (gcs *GenerationalNBS) GetManyCompressed(ctx context.Context, hashes hash.H
 // Has returns true iff the value at the address |h| is contained in the store
 func (gcs *GenerationalNBS) Has(ctx context.Context, h hash.Hash) (bool, error) {
 	has, err := gcs.oldGen.Has(ctx, h)
-
-	if err != nil {
-		return false, err
+	if err != nil || has {
+		return has, err
 	}
 
-	if has {
-		return true, nil
+	has, err = gcs.newGen.Has(ctx, h)
+	if err != nil || has {
+		return has, err
 	}
 
-	return gcs.newGen.Has(ctx, h)
+	// Possibly a truncated commit.
+	if gcs.ghostGen != nil {
+		has, err = gcs.ghostGen.Has(ctx, h)
+		if err != nil {
+			return has, err
+		}
+	}
+	return has, nil
 }
 
 // HasMany returns a new HashSet containing any members of |hashes| that are absent from the store.
@@ -149,34 +198,42 @@ func (gcs *GenerationalNBS) hasMany(recs []hasRecord) (absent hash.HashSet, err 
 		return absent, nil
 	}
 
-	gcs.oldGen.mu.RLock()
-	defer gcs.oldGen.mu.RUnlock()
-	return gcs.oldGen.hasMany(recs)
-}
-
-func (gcs *GenerationalNBS) errorIfDangling(ctx context.Context, addrs hash.HashSet) error {
-	absent, err := gcs.HasMany(ctx, addrs)
+	absent, err = func() (hash.HashSet, error) {
+		gcs.oldGen.mu.RLock()
+		defer gcs.oldGen.mu.RUnlock()
+		return gcs.oldGen.hasMany(recs)
+	}()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(absent) != 0 {
-		s := absent.String()
-		return fmt.Errorf("Found dangling references to %s", s)
+
+	if len(absent) == 0 || gcs.ghostGen == nil {
+		return absent, nil
 	}
-	return nil
+
+	return gcs.ghostGen.hasMany(absent)
 }
 
 // Put caches c in the ChunkSource. Upon return, c must be visible to
 // subsequent Get and Has calls, but must not be persistent until a call
 // to Flush(). Put may be called concurrently with other calls to Put(),
 // Get(), GetMany(), Has() and HasMany().
-func (gcs *GenerationalNBS) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCb) error {
+func (gcs *GenerationalNBS) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCurry) error {
 	return gcs.newGen.putChunk(ctx, c, getAddrs, gcs.hasMany)
 }
 
 // Returns the NomsBinFormat with which this ChunkSource is compatible.
 func (gcs *GenerationalNBS) Version() string {
 	return gcs.newGen.Version()
+}
+
+func (gcs *GenerationalNBS) AccessMode() chunks.ExclusiveAccessMode {
+	newGenMode := gcs.newGen.AccessMode()
+	oldGenMode := gcs.oldGen.AccessMode()
+	if oldGenMode > newGenMode {
+		return oldGenMode
+	}
+	return newGenMode
 }
 
 // Rebase brings this ChunkStore into sync with the persistent storage's
@@ -224,7 +281,8 @@ func (gcs *GenerationalNBS) StatsSummary() string {
 	return sb.String()
 }
 
-// Close tears down any resources in use by the implementation. After // Close(), the ChunkStore may not be used again. It is NOT SAFE to call
+// Close tears down any resources in use by the implementation. After
+// Close(), the ChunkStore may not be used again. It is NOT SAFE to call
 // Close() concurrently with any other ChunkStore method; behavior is
 // undefined and probably crashy.
 func (gcs *GenerationalNBS) Close() error {
@@ -248,8 +306,8 @@ func (gcs *GenerationalNBS) copyToOldGen(ctx context.Context, hashes hash.HashSe
 	var putErr error
 	err = gcs.newGen.GetMany(ctx, notInOldGen, func(ctx context.Context, chunk *chunks.Chunk) {
 		if putErr == nil {
-			putErr = gcs.oldGen.Put(ctx, *chunk, func(ctx context.Context, c chunks.Chunk) (hash.HashSet, error) {
-				return nil, nil
+			putErr = gcs.oldGen.Put(ctx, *chunk, func(c chunks.Chunk) chunks.GetAddrsCb {
+				return func(ctx context.Context, addrs hash.HashSet, _ chunks.PendingRefExists) error { return nil }
 			})
 		}
 	})
@@ -266,8 +324,8 @@ type prefixedTableFile struct {
 	prefix string
 }
 
-func (p prefixedTableFile) FileID() string {
-	return filepath.ToSlash(filepath.Join(p.prefix, p.TableFile.FileID()))
+func (p prefixedTableFile) LocationPrefix() string {
+	return p.prefix + "/"
 }
 
 // Sources retrieves the current root hash, a list of all the table files (which may include appendix table files),

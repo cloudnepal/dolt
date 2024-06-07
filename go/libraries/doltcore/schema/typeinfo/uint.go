@@ -120,7 +120,7 @@ func (ti *uintType) ConvertValueToNomsValue(ctx context.Context, vrw types.Value
 	if v == nil {
 		return types.NullValue, nil
 	}
-	uintVal, err := ti.sqlUintType.Convert(v)
+	uintVal, _, err := ti.sqlUintType.Convert(v)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,8 @@ func (ti *uintType) Equals(other TypeInfo) bool {
 		return false
 	}
 	if ti2, ok := other.(*uintType); ok {
-		return ti.sqlUintType.Type() == ti2.sqlUintType.Type()
+		return ti.sqlUintType.Type() == ti2.sqlUintType.Type() &&
+			ti.sqlUintType.DisplayWidth() == ti2.sqlUintType.DisplayWidth()
 	}
 	return false
 }
@@ -204,7 +205,7 @@ func (ti *uintType) GetTypeParams() map[string]string {
 // IsValid implements TypeInfo interface.
 func (ti *uintType) IsValid(v types.Value) bool {
 	if val, ok := v.(types.Uint); ok {
-		_, err := ti.sqlUintType.Convert(uint64(val))
+		_, _, err := ti.sqlUintType.Convert(uint64(val))
 		if err != nil {
 			return false
 		}

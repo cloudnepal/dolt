@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/dolthub/dolt/go/gen/fb/serial"
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/prolly"
@@ -47,6 +48,7 @@ var (
 	ErrOptimisticLockFailed = errors.New("optimistic lock failed on database Root update")
 	ErrMergeNeeded          = errors.New("dataset head is not ancestor of commit")
 	ErrAlreadyCommitted     = errors.New("dataset head already pointing at given commit")
+	ErrDirtyWorkspace       = errors.New("target has uncommitted changes. --force required to overwrite")
 )
 
 // rootTracker is a narrowing of the ChunkStore interface, to keep Database disciplined about working directly with Chunks
@@ -189,7 +191,21 @@ func (db *database) GetDataset(ctx context.Context, datasetID string) (Dataset, 
 	return db.datasetFromMap(ctx, datasetID, datasets)
 }
 
-func (db *database) GetDatasetsByRootHash(ctx context.Context, rootHash hash.Hash) (DatasetsMap, error) {
+func (db *database) GetDatasetByRootHash(ctx context.Context, datasetID string, rootHash hash.Hash) (Dataset, error) {
+	// precondition checks
+	if err := ValidateDatasetId(datasetID); err != nil {
+		return Dataset{}, fmt.Errorf("%w: %s", err, datasetID)
+	}
+
+	datasets, err := db.DatasetsByRootHash(ctx, rootHash)
+	if err != nil {
+		return Dataset{}, err
+	}
+
+	return db.datasetFromMap(ctx, datasetID, datasets)
+}
+
+func (db *database) DatasetsByRootHash(ctx context.Context, rootHash hash.Hash) (DatasetsMap, error) {
 
 	if db.Format().UsesFlatbuffers() {
 		rm, err := db.loadDatasetsRefmap(ctx, rootHash)
@@ -253,11 +269,11 @@ func (db *database) Close() error {
 	return db.ValueStore.Close()
 }
 
-func (db *database) SetHead(ctx context.Context, ds Dataset, newHeadAddr hash.Hash) (Dataset, error) {
-	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error { return db.doSetHead(ctx, ds, newHeadAddr) })
+func (db *database) SetHead(ctx context.Context, ds Dataset, newHeadAddr hash.Hash, workingSetPath string) (Dataset, error) {
+	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error { return db.doSetHead(ctx, ds, newHeadAddr, workingSetPath) })
 }
 
-func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash) error {
+func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash, workingSetPath string) error {
 	newHead, err := db.readHead(ctx, addr)
 	if err != nil {
 		return err
@@ -268,7 +284,7 @@ func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash) e
 	headType := newHead.TypeName()
 	switch headType {
 	case commitName:
-		iscommit, err := IsCommit(ctx, newVal)
+		iscommit, err := IsCommit(newVal)
 		if err != nil {
 			return err
 		}
@@ -291,7 +307,7 @@ func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash) e
 		if err != nil {
 			return err
 		}
-		iscommit, err := IsCommit(ctx, commitval)
+		iscommit, err := IsCommit(commitval)
 		if err != nil {
 			return err
 		}
@@ -350,20 +366,70 @@ func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash) e
 		if err != nil {
 			return prolly.AddressMap{}, err
 		}
+
+		var newWSHash hash.Hash
+		if workingSetPath != "" {
+			hasWS, err := am.Has(ctx, workingSetPath)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+			// If the current root has a working set, update it. Do nothing if it doesn't exist.
+			if hasWS {
+				currWSHash, err := am.Get(ctx, workingSetPath)
+				if err != nil {
+					return prolly.AddressMap{}, err
+				}
+
+				targetCmt, err := db.ReadValue(ctx, currWSHash)
+				if err != nil {
+					return prolly.AddressMap{}, err
+				}
+
+				if _, ok := targetCmt.(types.SerialMessage); ok {
+					cmtRtHsh, err := GetCommitRootHash(newVal)
+					if err != nil {
+						return prolly.AddressMap{}, err
+					}
+
+					// TODO - construct new meta instance rather than using the default
+					updateWS := workingset_flatbuffer(cmtRtHsh, &cmtRtHsh, nil, nil, nil)
+					ref, err := db.WriteValue(ctx, types.SerialMessage(updateWS))
+					if err != nil {
+						return prolly.AddressMap{}, err
+					}
+					newWSHash = ref.TargetHash()
+				} else {
+					// This _should_ never happen. We've already ended up on this code path because we are on
+					// modern storage.
+					return prolly.AddressMap{}, errors.New("Modern Dolt Database required.")
+				}
+			}
+		}
+
 		ae := am.Editor()
 		err = ae.Update(ctx, ds.ID(), h)
 		if err != nil {
 			return prolly.AddressMap{}, err
 		}
+
+		if workingSetPath != "" && newWSHash != (hash.Hash{}) {
+			err = ae.Update(ctx, workingSetPath, newWSHash)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+		}
+
 		return ae.Flush(ctx)
 	})
 }
 
-func (db *database) FastForward(ctx context.Context, ds Dataset, newHeadAddr hash.Hash) (Dataset, error) {
-	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error { return db.doFastForward(ctx, ds, newHeadAddr) })
+func (db *database) FastForward(ctx context.Context, ds Dataset, newHeadAddr hash.Hash, wsPath string) (Dataset, error) {
+	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error {
+		return db.doFastForward(ctx, ds, newHeadAddr, wsPath)
+	})
 }
 
-func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr hash.Hash) error {
+func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr hash.Hash, workingSetPath string) error {
 	newHead, err := db.readHead(ctx, newHeadAddr)
 	if err != nil {
 		return err
@@ -375,8 +441,8 @@ func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr h
 		return fmt.Errorf("FastForward: target value of new head address %v is not a commit.", newHeadAddr)
 	}
 
-	v := newHead.value()
-	iscommit, err := IsCommit(ctx, v)
+	cmtValue := newHead.value()
+	iscommit, err := IsCommit(cmtValue)
 	if err != nil {
 		return err
 	}
@@ -384,7 +450,7 @@ func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr h
 		return fmt.Errorf("FastForward: target value of new head address %v is not a commit.", newHeadAddr)
 	}
 
-	newCommit, err := commitFromValue(db.Format(), v)
+	newCommit, err := CommitFromValue(db.Format(), cmtValue)
 	if err != nil {
 		return err
 	}
@@ -392,7 +458,7 @@ func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr h
 	currentHeadAddr, ok := ds.MaybeHeadAddr()
 	if ok {
 		currentHeadValue, _ := ds.MaybeHead()
-		currCommit, err := commitFromValue(db.Format(), currentHeadValue)
+		currCommit, err := CommitFromValue(db.Format(), currentHeadValue)
 		if err != nil {
 			return err
 		}
@@ -405,23 +471,147 @@ func (db *database) doFastForward(ctx context.Context, ds Dataset, newHeadAddr h
 		}
 	}
 
-	err = db.doCommit(ctx, ds.ID(), currentHeadAddr, v)
+	err = db.update(ctx,
+		buildClassicCommitFunc(db, ds.ID(), currentHeadAddr, cmtValue),
+		func(ctx context.Context, am prolly.AddressMap) (prolly.AddressMap, error) {
+			curr, err := am.Get(ctx, ds.ID())
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+			if curr != currentHeadAddr {
+				return prolly.AddressMap{}, ErrMergeNeeded
+			}
+			h, err := cmtValue.Hash(db.Format())
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+			if curr != (hash.Hash{}) {
+				if curr == h {
+					return prolly.AddressMap{}, ErrAlreadyCommitted
+				}
+			}
+
+			var newWSHash hash.Hash
+			if workingSetPath != "" {
+				hasWS, err := am.Has(ctx, workingSetPath)
+				if err != nil {
+					return prolly.AddressMap{}, err
+				}
+				// If the current root has a working set, update it. Do nothing if it doesn't exist.
+				if hasWS {
+					currWSHash, err := am.Get(ctx, workingSetPath)
+					if err != nil {
+						return prolly.AddressMap{}, err
+					}
+
+					targetCmt, err := db.ReadValue(ctx, currWSHash)
+					if err != nil {
+						return prolly.AddressMap{}, err
+					}
+
+					if sm, ok := targetCmt.(types.SerialMessage); ok {
+						msg, err := serial.TryGetRootAsWorkingSet(sm, serial.MessagePrefixSz)
+						if err != nil {
+							return prolly.AddressMap{}, err
+						}
+
+						stagedHash := hash.New(msg.StagedRootAddrBytes())
+						workingSetHash := hash.New(msg.WorkingRootAddrBytes())
+						if stagedHash != workingSetHash {
+							return prolly.AddressMap{}, ErrDirtyWorkspace
+						}
+
+						targetHead, err := db.ReadValue(ctx, curr)
+						if err != nil {
+							return prolly.AddressMap{}, err
+						}
+						targetRootHash, err := GetCommitRootHash(targetHead)
+						if err != nil {
+							return prolly.AddressMap{}, err
+						}
+
+						if stagedHash != targetRootHash {
+							return prolly.AddressMap{}, ErrDirtyWorkspace
+						}
+
+						cmtRtHsh, err := GetCommitRootHash(cmtValue)
+						if err != nil {
+							return prolly.AddressMap{}, err
+						}
+
+						// TODO - construct new meta instance rather than using the default
+						updateWS := workingset_flatbuffer(cmtRtHsh, &cmtRtHsh, nil, nil, nil)
+						ref, err := db.WriteValue(ctx, types.SerialMessage(updateWS))
+						if err != nil {
+							return prolly.AddressMap{}, err
+						}
+						newWSHash = ref.TargetHash()
+					} else {
+						// This _should_ never happen. We've already ended up on this code path because we are on
+						// modern storage.
+						return prolly.AddressMap{}, errors.New("Modern Dolt Database required.")
+					}
+				}
+			}
+
+			// This is the bit where we construct the new root. The Editor.Update call below will update the
+			// branch reference directly. If we've been given a working set, we'll update the ID based on what was returned
+			// calculated for the newWSHash.
+			ae := am.Editor()
+			err = ae.Update(ctx, ds.ID(), h)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+
+			if workingSetPath != "" && newWSHash != (hash.Hash{}) {
+				err = ae.Update(ctx, workingSetPath, newWSHash)
+				if err != nil {
+					return prolly.AddressMap{}, err
+				}
+			}
+
+			return ae.Flush(ctx)
+		})
+
 	if err == ErrAlreadyCommitted {
 		return nil
 	}
+
 	return err
 }
 
+func (db *database) BuildNewCommit(ctx context.Context, ds Dataset, v types.Value, opts CommitOptions) (*Commit, error) {
+	if len(opts.Parents) == 0 {
+		headAddr, ok := ds.MaybeHeadAddr()
+		if ok {
+			opts.Parents = []hash.Hash{headAddr}
+		}
+	} else {
+		curr, ok := ds.MaybeHeadAddr()
+		if ok {
+			if !hasParentHash(opts, curr) {
+				return nil, ErrMergeNeeded
+			}
+		}
+	}
+
+	return newCommitForValue(ctx, ds.db.chunkStore(), ds.db, ds.db.nodeStore(), v, opts)
+}
+
 func (db *database) Commit(ctx context.Context, ds Dataset, v types.Value, opts CommitOptions) (Dataset, error) {
-	currentAddr, _ := ds.MaybeHeadAddr()
-	commit, err := buildNewCommit(ctx, ds, v, opts)
+	commit, err := db.BuildNewCommit(ctx, ds, v, opts)
 	if err != nil {
 		return Dataset{}, err
 	}
+	return db.WriteCommit(ctx, ds, commit)
+}
+
+func (db *database) WriteCommit(ctx context.Context, ds Dataset, commit *Commit) (Dataset, error) {
+	currentAddr, _ := ds.MaybeHeadAddr()
 
 	val := commit.NomsValue()
 
-	_, err = db.WriteValue(ctx, val)
+	_, err := db.WriteValue(ctx, val)
 	if err != nil {
 		return Dataset{}, err
 	}
@@ -440,8 +630,10 @@ func CommitValue(ctx context.Context, db Database, ds Dataset, v types.Value) (D
 	return db.Commit(ctx, ds, v, CommitOptions{})
 }
 
-func (db *database) doCommit(ctx context.Context, datasetID string, datasetCurrentAddr hash.Hash, newCommitValue types.Value) error {
-	return db.update(ctx, func(ctx context.Context, datasets types.Map) (types.Map, error) {
+// buildClassicCommitFunc There are a lot of embedded functions in the file, and one of them was duplicated. This builder method gets
+// a function which is intended for use updating a commit in the classic storage format. Hopefully we can delete this soon.
+func buildClassicCommitFunc(db Database, datasetID string, datasetCurrentAddr hash.Hash, newCommitValue types.Value) func(context.Context, types.Map) (types.Map, error) {
+	return func(ctx context.Context, datasets types.Map) (types.Map, error) {
 		curr, hasHead, err := datasets.MaybeGet(ctx, types.String(datasetID))
 		if err != nil {
 			return types.Map{}, err
@@ -470,30 +662,38 @@ func (db *database) doCommit(ctx context.Context, datasetID string, datasetCurre
 		}
 
 		return datasets.Edit().Set(types.String(datasetID), newCommitValueRef).Map(ctx)
-	}, func(ctx context.Context, am prolly.AddressMap) (prolly.AddressMap, error) {
-		curr, err := am.Get(ctx, datasetID)
-		if err != nil {
-			return prolly.AddressMap{}, err
-		}
-		if curr != datasetCurrentAddr {
-			return prolly.AddressMap{}, ErrMergeNeeded
-		}
-		h, err := newCommitValue.Hash(db.Format())
-		if err != nil {
-			return prolly.AddressMap{}, err
-		}
-		if curr != (hash.Hash{}) {
-			if curr == h {
-				return prolly.AddressMap{}, ErrAlreadyCommitted
+	}
+}
+
+func (db *database) doCommit(ctx context.Context, datasetID string, datasetCurrentAddr hash.Hash, newCommitValue types.Value) error {
+	return db.update(ctx,
+		buildClassicCommitFunc(db, datasetID, datasetCurrentAddr, newCommitValue),
+		func(ctx context.Context, am prolly.AddressMap) (prolly.AddressMap, error) {
+			curr, err := am.Get(ctx, datasetID)
+			if err != nil {
+				return prolly.AddressMap{}, err
 			}
-		}
-		ae := am.Editor()
-		err = ae.Update(ctx, datasetID, h)
-		if err != nil {
-			return prolly.AddressMap{}, err
-		}
-		return ae.Flush(ctx)
-	})
+			if curr != datasetCurrentAddr {
+				return prolly.AddressMap{}, ErrMergeNeeded
+			}
+			h, err := newCommitValue.Hash(db.Format())
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+			if curr != (hash.Hash{}) {
+				if curr == h {
+					return prolly.AddressMap{}, ErrAlreadyCommitted
+				}
+			}
+
+			ae := am.Editor()
+			err = ae.Update(ctx, datasetID, h)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+
+			return ae.Flush(ctx)
+		})
 }
 
 func mergeNeeded(currentAddr hash.Hash, ancestorAddr hash.Hash) bool {
@@ -544,6 +744,26 @@ func (db *database) doTag(ctx context.Context, datasetID string, tagAddr hash.Ha
 	})
 }
 
+func (db *database) SetStatsRef(ctx context.Context, ds Dataset, mapAddr hash.Hash) (Dataset, error) {
+	statAddr, _, err := newStat(ctx, db, mapAddr)
+	if err != nil {
+		return Dataset{}, err
+	}
+	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error {
+		return db.update(ctx, func(_ context.Context, datasets types.Map) (types.Map, error) {
+			// this is for old format, so this should not happen
+			return datasets, errors.New("SetStatsRef: stash is not supported for old storage format")
+		}, func(ctx context.Context, am prolly.AddressMap) (prolly.AddressMap, error) {
+			ae := am.Editor()
+			err := ae.Update(ctx, ds.ID(), statAddr)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+			return ae.Flush(ctx)
+		})
+	})
+}
+
 // UpdateStashList updates the stash list dataset only with given address hash to the updated stash list.
 // The new/updated stash list address should be obtained before calling this function depending on
 // whether add or remove a stash actions have been performed. This function does not perform any actions
@@ -566,12 +786,12 @@ func (db *database) UpdateStashList(ctx context.Context, ds Dataset, stashListAd
 	})
 }
 
-func (db *database) UpdateWorkingSet(ctx context.Context, ds Dataset, workingSet WorkingSetSpec, prevHash hash.Hash) (Dataset, error) {
+func (db *database) UpdateWorkingSet(ctx context.Context, ds Dataset, workingSetSpec WorkingSetSpec, prevHash hash.Hash) (Dataset, error) {
 	return db.doHeadUpdate(
 		ctx,
 		ds,
 		func(ds Dataset) error {
-			addr, ref, err := newWorkingSet(ctx, db, workingSet.Meta, workingSet.WorkingRoot, workingSet.StagedRoot, workingSet.MergeState)
+			addr, ref, err := newWorkingSet(ctx, db, workingSetSpec)
 			if err != nil {
 				return err
 			}
@@ -632,6 +852,19 @@ func assertDatasetHash(
 	return curr.(types.Ref).TargetHash().Equal(currHash), nil
 }
 
+func (db *database) PersistGhostCommitIDs(ctx context.Context, ghosts hash.HashSet) error {
+	cs := db.ChunkStore()
+
+	gcs, ok := cs.(chunks.GenerationalCS)
+	if !ok {
+		return errors.New("Generational Chunk Store expected. database does not support shallow clone instances.")
+	}
+
+	err := gcs.GhostGen().PersistGhostHashes(ctx, ghosts)
+
+	return err
+}
+
 // CommitWithWorkingSet updates two Datasets atomically: the working set, and its corresponding HEAD. Uses the same
 // global locking mechanism as UpdateWorkingSet.
 // The current dataset head will be filled in as the first parent of the new commit if not already present.
@@ -641,7 +874,7 @@ func (db *database) CommitWithWorkingSet(
 	val types.Value, workingSetSpec WorkingSetSpec,
 	prevWsHash hash.Hash, opts CommitOptions,
 ) (Dataset, Dataset, error) {
-	wsAddr, wsValRef, err := newWorkingSet(ctx, db, workingSetSpec.Meta, workingSetSpec.WorkingRoot, workingSetSpec.StagedRoot, workingSetSpec.MergeState)
+	wsAddr, wsValRef, err := newWorkingSet(ctx, db, workingSetSpec)
 	if err != nil {
 		return Dataset{}, Dataset{}, err
 	}
@@ -657,7 +890,7 @@ func (db *database) CommitWithWorkingSet(
 		}
 	}
 
-	commit, err := buildNewCommit(ctx, commitDS, val, opts)
+	commit, err := db.BuildNewCommit(ctx, commitDS, val, opts)
 	if err != nil {
 		return Dataset{}, Dataset{}, err
 	}
@@ -749,8 +982,8 @@ func (db *database) CommitWithWorkingSet(
 	return commitDS, workingSetDS, nil
 }
 
-func (db *database) Delete(ctx context.Context, ds Dataset) (Dataset, error) {
-	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error { return db.doDelete(ctx, ds.ID()) })
+func (db *database) Delete(ctx context.Context, ds Dataset, wsIDStr string) (Dataset, error) {
+	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error { return db.doDelete(ctx, ds.ID(), wsIDStr) })
 }
 
 func (db *database) update(ctx context.Context,
@@ -814,10 +1047,9 @@ func (db *database) update(ctx context.Context,
 	return err
 }
 
-func (db *database) doDelete(ctx context.Context, datasetIDstr string) error {
+func (db *database) doDelete(ctx context.Context, datasetIDstr string, workingsetIDstr string) error {
 	var first types.Value
 	var firstHash hash.Hash
-
 	datasetID := types.String(datasetIDstr)
 	return db.update(ctx, func(ctx context.Context, datasets types.Map) (types.Map, error) {
 		curr, ok, err := datasets.MaybeGet(ctx, datasetID)
@@ -845,11 +1077,72 @@ func (db *database) doDelete(ctx context.Context, datasetIDstr string) error {
 		if curr != firstHash {
 			return prolly.AddressMap{}, ErrMergeNeeded
 		}
+
+		if workingsetIDstr != "" {
+			// We verify that the working set is clean before deleting the branch. If this block doesn't return,
+			// the implication that it's safe to delete the branch ref and working set.
+			hasWs, err := am.Has(ctx, workingsetIDstr)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+
+			if hasWs {
+				currWSHash, err := am.Get(ctx, workingsetIDstr)
+				if err != nil {
+					return prolly.AddressMap{}, err
+				}
+				targetCmt, err := db.ReadValue(ctx, currWSHash)
+				if err != nil {
+					return prolly.AddressMap{}, err
+				}
+
+				if sm, ok := targetCmt.(types.SerialMessage); ok {
+
+					msg, err := serial.TryGetRootAsWorkingSet(sm, serial.MessagePrefixSz)
+					if err != nil {
+						return prolly.AddressMap{}, err
+					}
+
+					stagedHash := hash.New(msg.StagedRootAddrBytes())
+					workingSetHash := hash.New(msg.WorkingRootAddrBytes())
+					if stagedHash != workingSetHash {
+						return prolly.AddressMap{}, ErrDirtyWorkspace
+					}
+
+					targetHead, err := db.ReadValue(ctx, curr)
+					if err != nil {
+						return prolly.AddressMap{}, err
+					}
+					targetRootHash, err := GetCommitRootHash(targetHead)
+					if err != nil {
+						return prolly.AddressMap{}, err
+					}
+
+					if stagedHash != targetRootHash {
+						return prolly.AddressMap{}, ErrDirtyWorkspace
+					}
+
+					// No reason found to prevent deletion. Continue.
+				} else {
+					// This _should_ never happen. We've already ended up on this code path because we are on
+					// modern storage.
+					return prolly.AddressMap{}, errors.New("Modern Dolt Database required.")
+				}
+			}
+		}
+
 		ae := am.Editor()
 		err = ae.Delete(ctx, datasetIDstr)
 		if err != nil {
 			return prolly.AddressMap{}, err
 		}
+		if workingsetIDstr != "" {
+			err = ae.Delete(ctx, workingsetIDstr)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+		}
+
 		return ae.Flush(ctx)
 	})
 }
@@ -883,7 +1176,7 @@ func (db *database) validateRefAsCommit(ctx context.Context, r types.Ref) (types
 	var v types.Value
 	v = rHead.(nomsHead).st
 
-	is, err := IsCommit(ctx, v)
+	is, err := IsCommit(v)
 
 	if err != nil {
 		return types.Struct{}, err
@@ -894,24 +1187,6 @@ func (db *database) validateRefAsCommit(ctx context.Context, r types.Ref) (types
 	}
 
 	return v.(types.Struct), nil
-}
-
-func buildNewCommit(ctx context.Context, ds Dataset, v types.Value, opts CommitOptions) (*Commit, error) {
-	if len(opts.Parents) == 0 {
-		headAddr, ok := ds.MaybeHeadAddr()
-		if ok {
-			opts.Parents = []hash.Hash{headAddr}
-		}
-	} else {
-		curr, ok := ds.MaybeHeadAddr()
-		if ok {
-			if !hasParentHash(opts, curr) {
-				return nil, ErrMergeNeeded
-			}
-		}
-	}
-
-	return newCommitForValue(ctx, ds.db.chunkStore(), ds.db, ds.db.nodeStore(), v, opts)
 }
 
 func hasParentHash(opts CommitOptions, curr hash.Hash) bool {

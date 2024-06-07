@@ -122,12 +122,15 @@ func TestMerge(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			dEnv := dtu.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 
 			for _, tc := range setupCommon {
-				tc.exec(t, ctx, dEnv)
+				exit := tc.exec(t, ctx, dEnv)
+				require.Equal(t, 0, exit)
 			}
 			for _, tc := range test.setup {
-				tc.exec(t, ctx, dEnv)
+				exit := tc.exec(t, ctx, dEnv)
+				require.Equal(t, 0, exit)
 			}
 
 			root, err := dEnv.WorkingRoot(ctx)
@@ -241,12 +244,21 @@ func TestMergeConflicts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			dEnv := dtu.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 
 			for _, tc := range setupCommon {
-				tc.exec(t, ctx, dEnv)
+				exit := tc.exec(t, ctx, dEnv)
+				// allow merge to fail with conflicts
+				if _, ok := tc.cmd.(cmd.MergeCmd); !ok {
+					require.Equal(t, 0, exit)
+				}
 			}
 			for _, tc := range test.setup {
-				tc.exec(t, ctx, dEnv)
+				exit := tc.exec(t, ctx, dEnv)
+				// allow merge to fail with conflicts
+				if _, ok := tc.cmd.(cmd.MergeCmd); !ok {
+					require.Equal(t, 0, exit)
+				}
 			}
 
 			root, err := dEnv.WorkingRoot(ctx)
@@ -281,6 +293,7 @@ const (
 func TestMergeConcurrency(t *testing.T) {
 	ctx := context.Background()
 	dEnv := setupConcurrencyTest(t, ctx)
+	defer dEnv.DoltDB.Close()
 	_, eng := engineFromEnvironment(ctx, dEnv)
 
 	eg, ctx := errgroup.WithContext(ctx)
@@ -350,12 +363,12 @@ func setupConcurrencyTest(t *testing.T, ctx context.Context) (dEnv *env.DoltEnv)
 }
 
 func engineFromEnvironment(ctx context.Context, dEnv *env.DoltEnv) (dbName string, eng *engine.SqlEngine) {
-	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	if err != nil {
 		panic(err)
 	}
 
-	eng, err = engine.NewSqlEngine(ctx, mrEnv, engine.FormatNull, &engine.SqlEngineConfig{
+	eng, err = engine.NewSqlEngine(ctx, mrEnv, &engine.SqlEngineConfig{
 		IsReadOnly: false,
 		ServerUser: "root",
 		ServerHost: "localhost",

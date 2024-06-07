@@ -15,6 +15,7 @@
 package binlogreplication
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -48,13 +49,13 @@ func TestBinlogReplicationForAllTypes(t *testing.T) {
 	waitForReplicaToCatchUp(t)
 	rows, err := replicaDatabase.Queryx("select * from db01.alltypes order by pk asc;")
 	require.NoError(t, err)
-	row := convertByteArraysToStrings(readNextRow(t, rows))
+	row := convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "1", row["pk"])
 	assertValues(t, 0, row)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "2", row["pk"])
 	assertValues(t, 1, row)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "3", row["pk"])
 	assertNullValues(t, row)
 	require.False(t, rows.Next())
@@ -70,13 +71,13 @@ func TestBinlogReplicationForAllTypes(t *testing.T) {
 	replicaDatabase.MustExec("use db01;")
 	rows, err = replicaDatabase.Queryx("select * from db01.alltypes order by pk asc;")
 	require.NoError(t, err)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "1", row["pk"])
 	assertNullValues(t, row)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "2", row["pk"])
 	assertValues(t, 0, row)
-	row = convertByteArraysToStrings(readNextRow(t, rows))
+	row = convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "3", row["pk"])
 	assertValues(t, 1, row)
 	require.False(t, rows.Next())
@@ -500,7 +501,7 @@ var allTypes = []typeDescription{
 		TypeDefinition: "json",
 		Assertions: [2]typeDescriptionAssertion{
 			newTypeDescriptionAssertion("{}"),
-			newTypeDescriptionAssertion("{\"name\":\"BillyBob\",\"os\":\"Mac\",\"resolution\":{\"x\":1920,\"y\":1080}}"),
+			newTypeDescriptionAssertion("{\"os\":\"Mac\",\"name\":\"BillyBob\",\"resolution\":{\"x\":1920,\"y\":1080}}"),
 		},
 	},
 }
@@ -516,16 +517,21 @@ func assertValues(t *testing.T, assertionIndex int, row map[string]interface{}) 
 
 		actualValue := ""
 		if row[typeDesc.ColumnName()] != nil {
-			actualValue = row[typeDesc.ColumnName()].(string)
+			actualValue = fmt.Sprintf("%v", row[typeDesc.ColumnName()])
 		}
 		if typeDesc.TypeDefinition == "json" {
 			// LD_1 and DOLT storage formats return JSON strings slightly differently; DOLT removes spaces
 			// while LD_1 add whitespace, so for json comparison, we sanitize by removing whitespace.
-			actualValue = strings.ReplaceAll(actualValue, " ", "")
+			var actual interface{}
+			json.Unmarshal([]byte(actualValue), &actual)
+			var expected interface{}
+			json.Unmarshal([]byte(expectedValue.(string)), &expected)
+			require.EqualValues(t, expected, actual,
+				"Failed on assertion %d for for column %q", assertionIndex, typeDesc.ColumnName())
+		} else {
+			require.EqualValues(t, expectedValue, actualValue,
+				"Failed on assertion %d for for column %q", assertionIndex, typeDesc.ColumnName())
 		}
-
-		require.EqualValues(t, expectedValue, actualValue,
-			"Failed on assertion %d for for column %q", assertionIndex, typeDesc.ColumnName())
 	}
 }
 

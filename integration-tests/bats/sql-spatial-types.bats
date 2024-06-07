@@ -74,6 +74,71 @@ teardown() {
     [[ "$output" =~ "POLYGON((0.123 0.456,1.22 1.33,1.11 0.99,0.123 0.456))" ]] || false
 }
 
+@test "sql-spatial-types: can create large geometry" {
+    run dolt sql < $BATS_TEST_DIRNAME/helper/big_spatial.sql
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Query OK" ]] || false
+
+    run dolt sql -q "select count(*) from t"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "1" ]] || false
+}
+
+@test "sql-spatial-types: geometry survives dolt gc" {
+    # create geometry table
+    run dolt sql -q "create table geom_tbl (g geometry)"
+    [ "$status" -eq 0 ]
+    [ "$output" = "" ] || false
+
+    # inserting point
+    run dolt sql -q "insert into geom_tbl values (point(1,2))"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Query OK" ]] || false
+
+    run dolt sql -q "select st_aswkt(g) from geom_tbl"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "POINT(1 2)" ]] || false
+
+    run dolt gc
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "select st_aswkt(g) from geom_tbl"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "POINT(1 2)" ]] || false
+}
+
+@test "sql-spatial-types: geometry survives dolt push" {
+    # create geometry table
+    run dolt sql -q "create table geom_tbl (g geometry)"
+    [ "$status" -eq 0 ]
+    [ "$output" = "" ] || false
+
+    # inserting point
+    run dolt sql -q "insert into geom_tbl values (point(1,2))"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Query OK" ]] || false
+
+    run dolt add .
+    [ "$status" -eq 0 ]
+    run dolt commit -m "creating geometry table"
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "select st_aswkt(g) from geom_tbl"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "POINT(1 2)" ]] || false
+
+    mkdir rem1
+    dolt remote add origin file://rem1
+    dolt push origin main
+
+    dolt clone file://rem1 repo2
+    cd repo2
+
+    run dolt sql -q "select st_aswkt(g) from geom_tbl"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "POINT(1 2)" ]] || false
+}
+
 @test "sql-spatial-types: create geometry table and insert existing spatial types" {
 
     # create geometry table
@@ -164,13 +229,13 @@ teardown() {
 @test "sql-spatial-types: SRID defined in column definition in CREATE TABLE" {
     run dolt sql -q "CREATE TABLE pt (i int primary key, p POINT NOT NULL SRID 1)"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "unsupported feature: unsupported SRID value" ]] || false
+    [[ "$output" =~ "There's no spatial reference with SRID 1" ]] || false
 
     run dolt sql -q "CREATE TABLE pt (i int primary key, p POINT NOT NULL SRID 0)"
     [ "$status" -eq 0 ]
 
     run dolt sql -q "SHOW CREATE TABLE pt"
-    [[ "$output" =~ "\`p\` point NOT NULL SRID 0" ]] || false
+    [[ "$output" =~ "\`p\` point NOT NULL /*!80003 SRID 0 */" ]] || false
 
     dolt sql -q "INSERT INTO pt VALUES (1, POINT(5,6))"
     run dolt sql -q "SELECT ST_ASWKT(p) FROM pt"
@@ -203,7 +268,7 @@ SQL
     [ "$status" -eq 0 ]
 
     run dolt sql -q "SHOW CREATE TABLE table1"
-    [[ "$output" =~ "\`p\` geometry NOT NULL SRID 4326" ]] || false
+    [[ "$output" =~ "\`p\` geometry NOT NULL /*!80003 SRID 4326 */" ]] || false
 
     run dolt sql -q "SELECT ST_ASWKT(p) FROM table1"
     [[ "$output" =~ "LINESTRING(0 0,1 2)" ]] || false

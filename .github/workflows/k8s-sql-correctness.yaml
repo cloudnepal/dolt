@@ -10,14 +10,14 @@ jobs:
     name: Dolt SQL Correctness
     strategy:
       matrix:
-        dolt_fmt: [ "__LD_1__", "__DOLT__" ]
+        dolt_fmt: [ "__DOLT__" ]
     steps:
-      - uses: actions/checkout@v3
-      - uses: azure/setup-kubectl@v3.0
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
         with:
           version: 'v1.23.6'
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@567d4149d67f15f52b09796bea6573fc32952783
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -39,7 +39,10 @@ jobs:
       - name: Create SQL Correctness K8s Job
         run: ./.github/scripts/sql-correctness/run-correctness.sh
         env:
-          TO_VERSION: ${{ github.event.client_payload.to_version }}
+          PR_BRANCH_REF: ${{ github.event.client_payload.branch_ref }}
+          REGRESS_COMP: ${{ github.event.client_payload.regress_comp }}
+          PR_NUMBER: ${{ github.event.client_payload.issue_number }}
+          VERSION: ${{ github.event.client_payload.version }}
           MODE: ${{ github.event.client_payload.mode }}
           ACTOR: ${{ github.event.client_payload.actor }}
           ACTOR_EMAIL: ${{ github.event.client_payload.actor_email }}

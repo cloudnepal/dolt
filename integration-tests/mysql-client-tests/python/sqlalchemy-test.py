@@ -8,19 +8,19 @@ import sys
 QUERY_RESPONSE = [
     {"create table test (pk int, `value` int, primary key(pk))": []},
     {"describe test": [
-        ('pk', 'int', 'NO', 'PRI', 'NULL', ''),
-        ('value', 'int', 'YES', '', 'NULL', '')
+        ('pk', 'int', 'NO', 'PRI', None, ''),
+        ('value', 'int', 'YES', '', None, '')
     ]},
     {"insert into test (pk, `value`) values (0,0)": ()},
     {"select * from test": [(0, 0)]},
     {"call dolt_add('-A');": [(0,)]},
     {"call dolt_commit('-m', 'my commit')": [('',)]},
     {"select COUNT(*) FROM dolt_log": [(2,)]},
-    {"call dolt_checkout('-b', 'mybranch')": [(0,)]},
+    {"call dolt_checkout('-b', 'mybranch')": [(0, "Switched to branch 'mybranch'")]},
     {"insert into test (pk, `value`) values (1,1)": []},
     {"call dolt_commit('-a', '-m', 'my commit2')": [('',)]},
-    {"call dolt_checkout('main')": [(0,)]},
-    {"call dolt_merge('mybranch')": [(1,0,)]},
+    {"call dolt_checkout('main')": [(0, "Switched to branch 'main'")]},
+    {"call dolt_merge('mybranch')": [('',1,0,)]},
     {"select COUNT(*) FROM dolt_log": [(3,)]},
 ]
 
@@ -47,7 +47,7 @@ def main():
 
             try:
                 results = result_proxy.fetchall()
-                if (results != exp_results) and ("dolt_commit" not in query):
+                if (results != exp_results) and ("dolt_commit" not in query) and ("dolt_merge" not in query):
                     print("Query:")
                     print(query)
                     print("Expected:")

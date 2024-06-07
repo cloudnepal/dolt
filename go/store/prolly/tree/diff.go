@@ -36,10 +36,15 @@ type Diff struct {
 
 type DiffFn func(context.Context, Diff) error
 
+// Differ computes the diff between two prolly trees.
+// If `considerAllRowsModified` is true, it will consider every leaf to be modified and generate a diff for every leaf. (This
+// is useful in cases where the schema has changed and we want to consider a leaf changed even if the byte representation
+// of the leaf is the same.
 type Differ[K ~[]byte, O Ordering[K]] struct {
-	from, to         *Cursor
-	fromStop, toStop *Cursor
-	order            O
+	from, to                *cursor
+	fromStop, toStop        *cursor
+	order                   O
+	considerAllRowsModified bool
 }
 
 func DifferFromRoots[K ~[]byte, O Ordering[K]](
@@ -47,8 +52,9 @@ func DifferFromRoots[K ~[]byte, O Ordering[K]](
 	fromNs NodeStore, toNs NodeStore,
 	from, to Node,
 	order O,
+	considerAllRowsModified bool,
 ) (Differ[K, O], error) {
-	var fc, tc *Cursor
+	var fc, tc *cursor
 	var err error
 
 	if !from.empty() {
@@ -57,7 +63,7 @@ func DifferFromRoots[K ~[]byte, O Ordering[K]](
 			return Differ[K, O]{}, err
 		}
 	} else {
-		fc = &Cursor{}
+		fc = &cursor{}
 	}
 
 	if !to.empty() {
@@ -66,7 +72,7 @@ func DifferFromRoots[K ~[]byte, O Ordering[K]](
 			return Differ[K, O]{}, err
 		}
 	} else {
-		tc = &Cursor{}
+		tc = &cursor{}
 	}
 
 	fs, err := newCursorPastEnd(ctx, fromNs, from)
@@ -80,11 +86,12 @@ func DifferFromRoots[K ~[]byte, O Ordering[K]](
 	}
 
 	return Differ[K, O]{
-		from:     fc,
-		to:       tc,
-		fromStop: fs,
-		toStop:   ts,
-		order:    order,
+		from:                    fc,
+		to:                      tc,
+		fromStop:                fs,
+		toStop:                  ts,
+		order:                   order,
+		considerAllRowsModified: considerAllRowsModified,
 	}, nil
 }
 
@@ -135,8 +142,20 @@ func (td Differ[K, O]) Next(ctx context.Context) (diff Diff, err error) {
 			return sendAdded(ctx, td.to)
 
 		case cmp == 0:
-			if !equalcursorValues(td.from, td.to) {
+			// If the cursor schema has changed, then all rows should be considered modified.
+			// If the cursor schema hasn't changed, rows are modified iff their bytes have changed.
+			if td.considerAllRowsModified || !equalcursorValues(td.from, td.to) {
 				return sendModified(ctx, td.from, td.to)
+			}
+
+			// advance both cursors since we have already determined that they are equal. This needs to be done because
+			// skipCommon will not advance the cursors if they are equal in a collation sensitive comparison but differ
+			// in a byte comparison.
+			if err = td.from.advance(ctx); err != nil {
+				return Diff{}, err
+			}
+			if err = td.to.advance(ctx); err != nil {
+				return Diff{}, err
 			}
 
 			// seek ahead to the next diff and loop again
@@ -156,7 +175,7 @@ func (td Differ[K, O]) Next(ctx context.Context) (diff Diff, err error) {
 	return Diff{}, io.EOF
 }
 
-func sendRemoved(ctx context.Context, from *Cursor) (diff Diff, err error) {
+func sendRemoved(ctx context.Context, from *cursor) (diff Diff, err error) {
 	diff = Diff{
 		Type: RemovedDiff,
 		Key:  from.CurrentKey(),
@@ -169,7 +188,7 @@ func sendRemoved(ctx context.Context, from *Cursor) (diff Diff, err error) {
 	return
 }
 
-func sendAdded(ctx context.Context, to *Cursor) (diff Diff, err error) {
+func sendAdded(ctx context.Context, to *cursor) (diff Diff, err error) {
 	diff = Diff{
 		Type: AddedDiff,
 		Key:  to.CurrentKey(),
@@ -182,7 +201,7 @@ func sendAdded(ctx context.Context, to *Cursor) (diff Diff, err error) {
 	return
 }
 
-func sendModified(ctx context.Context, from, to *Cursor) (diff Diff, err error) {
+func sendModified(ctx context.Context, from, to *cursor) (diff Diff, err error) {
 	diff = Diff{
 		Type: ModifiedDiff,
 		Key:  from.CurrentKey(),
@@ -199,7 +218,7 @@ func sendModified(ctx context.Context, from, to *Cursor) (diff Diff, err error) 
 	return
 }
 
-func skipCommon(ctx context.Context, from, to *Cursor) (err error) {
+func skipCommon(ctx context.Context, from, to *cursor) (err error) {
 	// track when |from.parent| and |to.parent| change
 	// to avoid unnecessary comparisons.
 	parentsAreNew := true
@@ -238,7 +257,7 @@ func skipCommon(ctx context.Context, from, to *Cursor) (err error) {
 	return err
 }
 
-func skipCommonParents(ctx context.Context, from, to *Cursor) (err error) {
+func skipCommonParents(ctx context.Context, from, to *cursor) (err error) {
 	err = skipCommon(ctx, from.parent, to.parent)
 	if err != nil {
 		return err
@@ -266,18 +285,18 @@ func skipCommonParents(ctx context.Context, from, to *Cursor) (err error) {
 }
 
 // todo(andy): assumes equal byte representations
-func equalItems(from, to *Cursor) bool {
+func equalItems(from, to *cursor) bool {
 	return bytes.Equal(from.CurrentKey(), to.CurrentKey()) &&
 		bytes.Equal(from.currentValue(), to.currentValue())
 }
 
-func equalParents(from, to *Cursor) (eq bool) {
+func equalParents(from, to *cursor) (eq bool) {
 	if from.parent != nil && to.parent != nil {
 		eq = equalItems(from.parent, to.parent)
 	}
 	return
 }
 
-func equalcursorValues(from, to *Cursor) bool {
+func equalcursorValues(from, to *cursor) bool {
 	return bytes.Equal(from.currentValue(), to.currentValue())
 }

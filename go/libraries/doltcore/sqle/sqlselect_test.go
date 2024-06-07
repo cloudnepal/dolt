@@ -91,7 +91,7 @@ func BasicSelectTests() []SelectTest {
 	var headCommitHash string
 	switch types.Format_Default {
 	case types.Format_DOLT:
-		headCommitHash = "a0gt4vif0b0bf19g89k87gs55qqlqpod"
+		headCommitHash = "ias4mf52sgeig337ce2le7ov9vpltppr"
 	case types.Format_LD_1:
 		headCommitHash = "73hc2robs4v0kt9taoe3m5hd49dmrgun"
 	}
@@ -466,7 +466,7 @@ func BasicSelectTests() []SelectTest {
 			Query:        "select is_married and age >= 40 from people where last_name = 'Simpson' order by id limit 2",
 			ExpectedRows: []sql.Row{{true}, {false}},
 			ExpectedSqlSchema: sql.Schema{
-				&sql.Column{Name: "is_married and age >= 40", Type: gmstypes.Int8},
+				&sql.Column{Name: "is_married and age >= 40", Type: gmstypes.Boolean},
 			},
 		},
 		{
@@ -480,7 +480,7 @@ func BasicSelectTests() []SelectTest {
 			},
 			ExpectedSqlSchema: sql.Schema{
 				&sql.Column{Name: "first_name", Type: typeinfo.StringDefaultType.ToSqlType()},
-				&sql.Column{Name: "not_marge", Type: gmstypes.Int8},
+				&sql.Column{Name: "not_marge", Type: gmstypes.Boolean},
 			},
 		},
 		{
@@ -783,6 +783,8 @@ func BasicSelectTests() []SelectTest {
 					"billy bob", "bigbillieb@fake.horse",
 					time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).In(LoadedLocalLocation()),
 					"Initialize data repository",
+					"",
+					"",
 				},
 			},
 			ExpectedSqlSchema: sql.Schema{
@@ -792,6 +794,8 @@ func BasicSelectTests() []SelectTest {
 				&sql.Column{Name: "latest_committer_email", Type: gmstypes.Text},
 				&sql.Column{Name: "latest_commit_date", Type: gmstypes.Datetime},
 				&sql.Column{Name: "latest_commit_message", Type: gmstypes.Text},
+				&sql.Column{Name: "remote", Type: gmstypes.Text},
+				&sql.Column{Name: "branch", Type: gmstypes.Text},
 			},
 		},
 	}
@@ -978,6 +982,14 @@ var AsOfTests = []SelectTest{
 		Name:        "select * from timestamp, before table creation",
 		Query:       "select * from test_table as of CONVERT('1970-01-01 02:00:00', DATETIME)",
 		ExpectedErr: "not found",
+	},
+	{
+		Name: "select from dolt_docs as of main",
+		AdditionalSetup: CreateTableFn("dolt_docs", doltdb.DocsSchema,
+			"INSERT INTO dolt_docs VALUES ('LICENSE.md','A license')"),
+		Query:          "select * from dolt_docs as of 'main'",
+		ExpectedRows:   []sql.Row{{"LICENSE.md", "A license"}},
+		ExpectedSchema: CompressSchema(doltdb.DocsSchema),
 	},
 }
 
@@ -1297,9 +1309,9 @@ var systemTableSelectTests = []SelectTest{
 	{
 		Name: "select from dolt_schemas",
 		AdditionalSetup: CreateTableFn(doltdb.SchemasTableName, schemaTableSchema,
-			`INSERT INTO dolt_schemas VALUES ('view', 'name', 'create view name as select 2+2 from dual', NULL)`),
+			`INSERT INTO dolt_schemas VALUES ('view', 'name', 'create view name as select 2+2 from dual', NULL, NULL)`),
 		Query:          "select * from dolt_schemas",
-		ExpectedRows:   []sql.Row{{"view", "name", "create view name as select 2+2 from dual", nil}},
+		ExpectedRows:   []sql.Row{{"view", "name", "create view name as select 2+2 from dual", nil, nil}},
 		ExpectedSchema: CompressSchema(schemaTableSchema),
 	},
 }
@@ -1323,13 +1335,13 @@ func (tcc *testCommitClock) Now() time.Time {
 }
 
 func installTestCommitClock() func() {
-	oldNowFunc := datas.CommitNowFunc
+	oldNowFunc := datas.CommitterDate
 	oldCommitLoc := datas.CommitLoc
 	tcc := &testCommitClock{}
-	datas.CommitNowFunc = tcc.Now
+	datas.CommitterDate = tcc.Now
 	datas.CommitLoc = time.UTC
 	return func() {
-		datas.CommitNowFunc = oldNowFunc
+		datas.CommitterDate = oldNowFunc
 		datas.CommitLoc = oldCommitLoc
 	}
 }
@@ -1344,6 +1356,7 @@ func testSelectQuery(t *testing.T, test SelectTest) {
 
 	dEnv, err := CreateTestDatabase()
 	require.NoError(t, err)
+	defer dEnv.DoltDB.Close()
 
 	if test.AdditionalSetup != nil {
 		test.AdditionalSetup(t, dEnv)
@@ -1366,7 +1379,7 @@ func testSelectQuery(t *testing.T, test SelectTest) {
 		assert.Equal(t, len(test.ExpectedRows[i]), len(actualRows[i]))
 		for j := 0; j < len(test.ExpectedRows[i]); j++ {
 			if _, ok := actualRows[i][j].(json.NomsJSON); ok {
-				cmp, err := actualRows[i][j].(json.NomsJSON).Compare(nil, test.ExpectedRows[i][j].(json.NomsJSON))
+				cmp, err := gmstypes.CompareJSON(actualRows[i][j].(json.NomsJSON), test.ExpectedRows[i][j].(json.NomsJSON))
 				assert.NoError(t, err)
 				assert.Equal(t, 0, cmp)
 			} else {
@@ -1548,8 +1561,11 @@ func testSelectDiffQuery(t *testing.T, test SelectTest) {
 	cs, err := doltdb.NewCommitSpec("main")
 	require.NoError(t, err)
 
-	cm, err := dEnv.DoltDB.Resolve(ctx, cs, nil)
+	optCmt, err := dEnv.DoltDB.Resolve(ctx, cs, nil)
 	require.NoError(t, err)
+
+	cm, ok := optCmt.ToCommit()
+	require.True(t, ok)
 
 	root, err := cm.GetRootValue(ctx)
 	require.NoError(t, err)
@@ -1601,9 +1617,9 @@ func createWorkingRootUpdate() map[string]TableUpdate {
 	}
 }
 
-func updateTables(t *testing.T, ctx context.Context, root *doltdb.RootValue, tblUpdates map[string]TableUpdate) *doltdb.RootValue {
+func updateTables(t *testing.T, ctx context.Context, root doltdb.RootValue, tblUpdates map[string]TableUpdate) doltdb.RootValue {
 	for tblName, updates := range tblUpdates {
-		tbl, ok, err := root.GetTable(ctx, tblName)
+		tbl, ok, err := root.GetTable(ctx, doltdb.TableName{Name: tblName})
 		require.NoError(t, err)
 
 		var sch schema.Schema
@@ -1648,7 +1664,7 @@ func updateTables(t *testing.T, ctx context.Context, root *doltdb.RootValue, tbl
 		tbl, err = doltdb.NewNomsTable(ctx, root.VRW(), root.NodeStore(), sch, rowData, indexData, nil)
 		require.NoError(t, err)
 
-		root, err = root.PutTable(ctx, tblName, tbl)
+		root, err = root.PutTable(ctx, doltdb.TableName{Name: tblName}, tbl)
 		require.NoError(t, err)
 	}
 
@@ -1661,8 +1677,11 @@ func initializeWithHistory(t *testing.T, ctx context.Context, dEnv *env.DoltEnv,
 		cs, err := doltdb.NewCommitSpec(env.DefaultInitBranch)
 		require.NoError(t, err)
 
-		cm, err := dEnv.DoltDB.Resolve(ctx, cs, nil)
+		optCmt, err := dEnv.DoltDB.Resolve(ctx, cs, nil)
 		require.NoError(t, err)
+
+		cm, ok := optCmt.ToCommit()
+		require.True(t, ok)
 
 		processNode(t, ctx, dEnv, node, cm)
 	}
@@ -1674,15 +1693,18 @@ func processNode(t *testing.T, ctx context.Context, dEnv *env.DoltEnv, node Hist
 	require.NoError(t, err)
 
 	if !ok {
-		err = dEnv.DoltDB.NewBranchAtCommit(ctx, branchRef, parent)
+		err = dEnv.DoltDB.NewBranchAtCommit(ctx, branchRef, parent, nil)
 		require.NoError(t, err)
 	}
 
 	cs, err := doltdb.NewCommitSpec(branchRef.String())
 	require.NoError(t, err)
 
-	cm, err := dEnv.DoltDB.Resolve(ctx, cs, nil)
+	optCmt, err := dEnv.DoltDB.Resolve(ctx, cs, nil)
 	require.NoError(t, err)
+
+	cm, ok := optCmt.ToCommit()
+	require.True(t, ok)
 
 	root, err := cm.GetRootValue(ctx)
 	require.NoError(t, err)

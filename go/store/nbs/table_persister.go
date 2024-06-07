@@ -30,6 +30,9 @@ import (
 	"io"
 	"sort"
 	"time"
+
+	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
 )
 
 var errCacheMiss = errors.New("index cache miss")
@@ -53,15 +56,17 @@ type tablePersister interface {
 	ConjoinAll(ctx context.Context, sources chunkSources, stats *Stats) (chunkSource, cleanupFunc, error)
 
 	// Open a table named |name|, containing |chunkCount| chunks.
-	Open(ctx context.Context, name addr, chunkCount uint32, stats *Stats) (chunkSource, error)
+	Open(ctx context.Context, name hash.Hash, chunkCount uint32, stats *Stats) (chunkSource, error)
 
 	// Exists checks if a table named |name| exists.
-	Exists(ctx context.Context, name addr, chunkCount uint32, stats *Stats) (bool, error)
+	Exists(ctx context.Context, name hash.Hash, chunkCount uint32, stats *Stats) (bool, error)
 
 	// PruneTableFiles deletes table files which the persister would normally be responsible for and
 	// which are not in the included |keeper| set and have not be written or modified more recently
 	// than the provided |mtime|.
-	PruneTableFiles(ctx context.Context, keeper func() []addr, mtime time.Time) error
+	PruneTableFiles(ctx context.Context, keeper func() []hash.Hash, mtime time.Time) error
+
+	AccessMode() chunks.ExclusiveAccessMode
 
 	io.Closer
 }
@@ -70,7 +75,7 @@ type tableFilePersister interface {
 	tablePersister
 
 	// CopyTableFile copies the table file with the given fileId from the reader to the TableFileStore.
-	CopyTableFile(ctx context.Context, r io.ReadCloser, fileId string, fileSz uint64, chunkCount uint32) error
+	CopyTableFile(ctx context.Context, r io.Reader, fileId string, fileSz uint64, chunkCount uint32) error
 
 	// Path returns the file system path. Use CopyTableFile instead of Path to
 	// copy a file to the TableFileStore. Path cannot be removed because it's used
@@ -114,7 +119,7 @@ type compactionPlan struct {
 
 func (cp compactionPlan) suffixes() []byte {
 	suffixesStart := uint64(cp.chunkCount) * (prefixTupleSize + lengthSize)
-	return cp.mergedIndex[suffixesStart : suffixesStart+uint64(cp.chunkCount)*addrSuffixSize]
+	return cp.mergedIndex[suffixesStart : suffixesStart+uint64(cp.chunkCount)*hash.SuffixLen]
 }
 
 // planRangeCopyConjoin computes a conjoin plan for tablePersisters that can conjoin
@@ -217,19 +222,19 @@ func planConjoin(sources []sourceWithSize, stats *Stats) (plan compactionPlan, e
 			suffixesPos += uint64(n)
 		} else {
 			// Build up the index one entry at a time.
-			var a addr
+			var h hash.Hash
 			for i := 0; i < len(ordinals); i++ {
-				e, err := index.indexEntry(uint32(i), &a)
+				e, err := index.indexEntry(uint32(i), &h)
 				if err != nil {
 					return compactionPlan{}, err
 				}
 				li := lengthsPos + lengthSize*uint64(ordinals[i])
-				si := suffixesPos + addrSuffixSize*uint64(ordinals[i])
+				si := suffixesPos + hash.SuffixLen*uint64(ordinals[i])
 				binary.BigEndian.PutUint32(plan.mergedIndex[li:], e.Length())
-				copy(plan.mergedIndex[si:], a[addrPrefixSize:])
+				copy(plan.mergedIndex[si:], h[hash.PrefixLen:])
 			}
 			lengthsPos += lengthSize * uint64(len(ordinals))
-			suffixesPos += addrSuffixSize * uint64(len(ordinals))
+			suffixesPos += hash.SuffixLen * uint64(len(ordinals))
 		}
 	}
 
@@ -238,7 +243,7 @@ func planConjoin(sources []sourceWithSize, stats *Stats) (plan compactionPlan, e
 	var pfxPos uint64
 	for _, pi := range prefixIndexRecs {
 		binary.BigEndian.PutUint64(plan.mergedIndex[pfxPos:], pi.addr.Prefix())
-		pfxPos += addrPrefixSize
+		pfxPos += hash.PrefixLen
 		binary.BigEndian.PutUint32(plan.mergedIndex[pfxPos:], pi.order)
 		pfxPos += ordinalSize
 	}
@@ -249,12 +254,11 @@ func planConjoin(sources []sourceWithSize, stats *Stats) (plan compactionPlan, e
 	return plan, nil
 }
 
-func nameFromSuffixes(suffixes []byte) (name addr) {
+func nameFromSuffixes(suffixes []byte) (name hash.Hash) {
 	sha := sha512.New()
 	sha.Write(suffixes)
 
 	var h []byte
 	h = sha.Sum(h) // Appends hash to h
-	copy(name[:], h)
-	return
+	return hash.New(h[:hash.ByteLen])
 }

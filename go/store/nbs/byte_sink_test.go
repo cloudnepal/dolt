@@ -28,7 +28,7 @@ import (
 
 func TestBlockBufferTableSink(t *testing.T) {
 	createSink := func() ByteSink {
-		return NewBlockBufferTableSink(128)
+		return NewBlockBufferByteSink(128)
 	}
 
 	suite.Run(t, &TableSinkSuite{createSink, t})
@@ -36,7 +36,7 @@ func TestBlockBufferTableSink(t *testing.T) {
 
 func TestFixedBufferTableSink(t *testing.T) {
 	createSink := func() ByteSink {
-		return NewFixedBufferTableSink(make([]byte, 32*1024))
+		return NewFixedBufferByteSink(make([]byte, 32*1024))
 	}
 
 	suite.Run(t, &TableSinkSuite{createSink, t})
@@ -79,6 +79,10 @@ type TableSinkSuite struct {
 	sinkFactory func() ByteSink
 	t           *testing.T
 }
+
+func (suite2 *TableSinkSuite) SetS(suite suite.TestingSuite) {}
+
+var _ suite.TestingSuite = (*TableSinkSuite)(nil)
 
 func (suite *TableSinkSuite) SetT(t *testing.T) {
 	suite.t = t

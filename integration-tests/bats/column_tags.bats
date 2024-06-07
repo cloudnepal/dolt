@@ -104,7 +104,8 @@ SQL
     dolt checkout main
     dolt merge branch1
     run dolt merge branch2
-    [ $status -ne 0 ]
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "CONFLICT (schema):" ]] || false
 }
 
 @test "column_tags: Merging branches that use the same tag referring to different column names fails" {
@@ -130,7 +131,8 @@ SQL
     dolt checkout main
     dolt merge branch1
     run dolt merge branch2
-    [ $status -eq 1 ]
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "CONFLICT (schema):" ]] || false
 }
 
 @test "column_tags: Merging branches that both created the same column succeeds" {
@@ -238,7 +240,7 @@ DELIM
     [[ "$output" =~ "ints_table,c5,12796" ]] || false
 }
 
-@test "column_tags: Round-tripping a column type through different NomsKinds restores original tag" {
+@test "column_tags: Round-tripping a column type through different NomsKinds preserves its tag" {
     dolt sql -q "CREATE TABLE t (pk INT PRIMARY KEY, col1 int);"
     run dolt schema tags
     [ $status -eq 0 ]
@@ -247,7 +249,7 @@ DELIM
     dolt sql -q "ALTER TABLE t MODIFY COLUMN col1 VARCHAR(100);"
     run dolt schema tags
     [ $status -eq 0 ]
-    [[ $output =~ "col1   | 16050" ]] || false
+    [[ $output =~ "col1   | 10878" ]] || false
 
     dolt sql -q "ALTER TABLE t MODIFY COLUMN col1 int;"
     run dolt schema tags
@@ -272,7 +274,7 @@ DELIM
     [[ $output =~ "col1   | 16050" ]] || false
 }
 
-@test "column_tags: Round-tripping a column type after some other column has been altered" {
+@test "column_tags: Round-tripping a column type after other column is altered preserves column tag" {
     dolt sql -q "CREATE TABLE t (pk INT PRIMARY KEY, col1 int);"
     run dolt schema tags
     [ $status -eq 0 ]
@@ -283,12 +285,12 @@ DELIM
     dolt sql -q "ALTER TABLE t MODIFY COLUMN col1 VARCHAR(100);"
     run dolt schema tags
     [ $status -eq 0 ]
-    [[ $output =~ "col1   | 11127" ]] || false
+    [[ $output =~ "col1   | 10878" ]] || false
 
     dolt sql -q "ALTER TABLE t MODIFY COLUMN col1 int;"
     run dolt schema tags
     [ $status -eq 0 ]
-    [[ $output =~ "col1   | 10186" ]] || false
+    [[ $output =~ "col1   | 10878" ]] || false
 }
 
 @test "column_tags: update-tag only available on __DOLT__" {
@@ -304,8 +306,6 @@ DELIM
 }
 
 @test "column_tags: update-tag updates a columns tag" {
-    skip_nbf_not_dolt
-
     dolt sql -q "CREATE TABLE t (pk INT PRIMARY KEY, col1 int);"
     run dolt schema tags
     [ $status -eq 0 ]
@@ -325,9 +325,7 @@ DELIM
     [[ $output =~ "col1   | 6" ]] || false
 }
 
-@test "column_tags: create table on two separate branches, merge them together by updating tags" {
-    skip_nbf_not_dolt
-
+@test "column_tags: create table on two separate branches, merge them together even though they have different tags" {
     dolt branch other
     dolt sql -q "CREATE TABLE t (pk int PRIMARY KEY, col1 int);"
     dolt sql -q "INSERT INTO t VALUES (1, 1);"
@@ -344,23 +342,7 @@ DELIM
     dolt sql -q "ALTER TABLE target DROP COLUMN badCol;"
     dolt commit -Am "fixup"
 
-    run dolt schema tags
-    [[ $output =~ "| target | col1   | 14690 |" ]] || false
-
     dolt checkout main
-
-    run dolt schema tags
-    [ $status -eq 0 ]
-    [[ $output =~ "| target | col1   | 14649 |" ]] || false
-
-    run dolt merge other
-    [ $status -ne 0 ]
-    [[ $output =~ "table with same name 'target' added in 2 commits can't be merged" ]] || false
-    dolt reset --hard
-
-    dolt schema update-tag target col1 14690
-    dolt commit -am "update tag of col1 of target"
-
     run dolt merge other -m "merge other into main"
     [ $status -eq 0 ]
     [[ $output =~ "1 tables changed, 1 rows added(+)" ]] || false

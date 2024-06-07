@@ -24,7 +24,6 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dtestutils"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
@@ -32,11 +31,10 @@ import (
 	dsqle "github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
-	"github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-func setupIndexes(t *testing.T, tableName, insertQuery string) (*sqle.Engine, *env.DoltEnv, *doltdb.RootValue, dsqle.Database, []*indexTuple) {
+func setupIndexes(t *testing.T, tableName, insertQuery string) (*sqle.Engine, *sql.Context, []*indexTuple) {
 	dEnv := dtestutils.CreateTestEnv()
 	tmpDir, err := dEnv.TempTableFilesDir()
 	require.NoError(t, err)
@@ -97,25 +95,16 @@ func setupIndexes(t *testing.T, tableName, insertQuery string) (*sqle.Engine, *e
 		cols: idxv2v1Cols,
 	}
 
-	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	require.NoError(t, err)
 	b := env.GetDefaultInitBranch(dEnv.Config)
 	pro, err := dsqle.NewDoltDatabaseProviderWithDatabase(b, mrEnv.FileSystem(), db, dEnv.FS)
 	if err != nil {
-		return nil, nil, nil, dsqle.Database{}, nil
+		return nil, nil, nil
 	}
 
 	pro = pro.WithDbFactoryUrl(doltdb.InMemDoltDB)
 	engine = sqle.NewDefault(pro)
-
-	// Get an updated root to use for the rest of the test
-	ctx := sql.NewEmptyContext()
-	controller := branch_control.CreateDefaultController()
-	sess, err := dsess.NewDoltSession(ctx.Session.(*sql.BaseSession), pro, config.NewEmptyMapConfig(), controller)
-	require.NoError(t, err)
-	roots, ok := sess.GetRoots(ctx, db.Name())
-	require.True(t, ok)
-	err = sess.SetRoot(sqlCtx, db.Name(), roots.Working)
 
 	it := []*indexTuple{
 		idxv1ToTuple,
@@ -126,7 +115,7 @@ func setupIndexes(t *testing.T, tableName, insertQuery string) (*sqle.Engine, *e
 		},
 	}
 
-	return engine, dEnv, roots.Working, db, it
+	return engine, sqlCtx, it
 }
 
 // indexTuple converts integers into the appropriate tuple for comparison against ranges
@@ -180,12 +169,22 @@ func drainIter(ctx *sql.Context, iter sql.RowIter) error {
 	return iter.Close(ctx)
 }
 
-func getDbState(t *testing.T, db sql.Database, dEnv *env.DoltEnv) dsess.InitialDbState {
+func getDbState(t *testing.T, db sql.Database, dEnv *env.DoltEnv) (dsess.InitialDbState, error) {
 	ctx := context.Background()
 
-	head := dEnv.RepoStateReader().CWBHeadSpec()
-	headCommit, err := dEnv.DoltDB.Resolve(ctx, head, dEnv.RepoStateReader().CWBHeadRef())
+	headSpec, err := dEnv.RepoStateReader().CWBHeadSpec()
+	if err != nil {
+		return dsess.InitialDbState{}, err
+	}
+	headRef, err := dEnv.RepoStateReader().CWBHeadRef()
+	if err != nil {
+		return dsess.InitialDbState{}, err
+	}
+	optCmt, err := dEnv.DoltDB.Resolve(ctx, headSpec, headRef)
 	require.NoError(t, err)
+
+	headCommit, ok := optCmt.ToCommit()
+	require.True(t, ok)
 
 	ws, err := dEnv.WorkingSet(ctx)
 	require.NoError(t, err)
@@ -196,5 +195,5 @@ func getDbState(t *testing.T, db sql.Database, dEnv *env.DoltEnv) dsess.InitialD
 		WorkingSet: ws,
 		DbData:     dEnv.DbData(),
 		Remotes:    dEnv.RepoState.Remotes,
-	}
+	}, nil
 }

@@ -32,7 +32,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 )
 
-func setupEditorFkTest(t *testing.T) (*env.DoltEnv, *doltdb.RootValue) {
+func setupEditorFkTest(t *testing.T) (*env.DoltEnv, doltdb.RootValue) {
 	dEnv := dtestutils.CreateTestEnv()
 	root, err := dEnv.WorkingRoot(context.Background())
 	if err != nil {
@@ -153,6 +153,7 @@ func TestTableEditorForeignKeyCascade(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			dEnv, initialRoot := setupEditorFkTest(t)
+			defer dEnv.DoltDB.Close()
 
 			testRoot, err := ExecuteSql(dEnv, initialRoot, `
 ALTER TABLE two ADD FOREIGN KEY (v1) REFERENCES one(v1) ON DELETE CASCADE ON UPDATE CASCADE;
@@ -202,6 +203,7 @@ func TestTableEditorForeignKeySetNull(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.sqlStatement, func(t *testing.T) {
 			dEnv, initialRoot := setupEditorFkTest(t)
+			defer dEnv.DoltDB.Close()
 
 			testRoot, err := ExecuteSql(dEnv, initialRoot, `
 ALTER TABLE two ADD FOREIGN KEY (v1) REFERENCES one(v1) ON DELETE SET NULL ON UPDATE SET NULL;`)
@@ -284,6 +286,7 @@ func TestTableEditorForeignKeyRestrict(t *testing.T) {
 			for _, test := range tests {
 				t.Run(test.setup+test.trigger, func(t *testing.T) {
 					dEnv, initialRoot := setupEditorFkTest(t)
+					defer dEnv.DoltDB.Close()
 
 					testRoot, err := ExecuteSql(dEnv, initialRoot, fmt.Sprintf(`
 			ALTER TABLE two ADD FOREIGN KEY (v1) REFERENCES one(v1) %s;
@@ -355,6 +358,7 @@ func TestTableEditorForeignKeyViolations(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.setup+test.trigger, func(t *testing.T) {
 			dEnv, initialRoot := setupEditorFkTest(t)
+			defer dEnv.DoltDB.Close()
 
 			testRoot, err := ExecuteSql(dEnv, initialRoot, `
 ALTER TABLE two ADD FOREIGN KEY (v1) REFERENCES one(v1) ON DELETE CASCADE ON UPDATE CASCADE;
@@ -376,6 +380,7 @@ ALTER TABLE three ADD FOREIGN KEY (v1, v2) REFERENCES two(v1, v2) ON DELETE CASC
 
 func TestTableEditorSelfReferentialForeignKeyRestrict(t *testing.T) {
 	dEnv, initialRoot := setupEditorFkTest(t)
+	defer dEnv.DoltDB.Close()
 
 	ctx := context.Background()
 	root := initialRoot
@@ -446,6 +451,7 @@ func TestTableEditorSelfReferentialForeignKeyRestrict(t *testing.T) {
 
 func TestTableEditorSelfReferentialForeignKeyCascade(t *testing.T) {
 	dEnv, initialRoot := setupEditorFkTest(t)
+	defer dEnv.DoltDB.Close()
 
 	ctx := context.Background()
 	root := initialRoot
@@ -546,6 +552,7 @@ func TestTableEditorSelfReferentialForeignKeyCascade(t *testing.T) {
 
 func TestTableEditorSelfReferentialForeignKeySetNull(t *testing.T) {
 	dEnv, initialRoot := setupEditorFkTest(t)
+	defer dEnv.DoltDB.Close()
 
 	ctx := context.Background()
 	root := initialRoot
@@ -644,8 +651,8 @@ func TestTableEditorSelfReferentialForeignKeySetNull(t *testing.T) {
 	}
 }
 
-func assertTableEditorRows(t *testing.T, root *doltdb.RootValue, expected []sql.Row, tableName string) {
-	tbl, ok, err := root.GetTable(context.Background(), tableName)
+func assertTableEditorRows(t *testing.T, root doltdb.RootValue, expected []sql.Row, tableName string) {
+	tbl, ok, err := root.GetTable(context.Background(), doltdb.TableName{Name: tableName})
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -734,7 +741,7 @@ func sortInt64Rows(rows []sql.Row) []sql.Row {
 	return rows
 }
 
-func setupEditorKeylessFkTest(t *testing.T) (*env.DoltEnv, *doltdb.RootValue) {
+func setupEditorKeylessFkTest(t *testing.T) (*env.DoltEnv, doltdb.RootValue) {
 	dEnv := dtestutils.CreateTestEnv()
 	root, err := dEnv.WorkingRoot(context.Background())
 	if err != nil {
@@ -857,6 +864,7 @@ func TestTableEditorKeylessFKCascade(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			dEnv, initialRoot := setupEditorKeylessFkTest(t)
+			defer dEnv.DoltDB.Close()
 
 			testRoot, err := ExecuteSql(dEnv, initialRoot, `
 ALTER TABLE two ADD FOREIGN KEY (v1) REFERENCES one(v1) ON DELETE CASCADE ON UPDATE CASCADE;

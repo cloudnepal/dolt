@@ -21,6 +21,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/dolt/go/store/prolly/message"
@@ -178,7 +179,7 @@ func TestThreeWayDiffer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := sql.NewEmptyContext()
 			ns := NewTestNodeStore()
 
 			var valTypes []val.Type
@@ -192,7 +193,8 @@ func TestThreeWayDiffer(t *testing.T) {
 			left := newTestMap(t, ctx, tt.left, ns, valDesc)
 			right := newTestMap(t, ctx, tt.right, ns, valDesc)
 
-			iter, err := NewThreeWayDiffer(ctx, ns, left, right, base, testResolver(t, ns, valDesc, val.NewTupleBuilder(valDesc)), false, keyDesc)
+			var diffInfo ThreeWayDiffInfo
+			iter, err := NewThreeWayDiffer(ctx, ns, left, right, base, testResolver(t, ns, valDesc, val.NewTupleBuilder(valDesc)), false, diffInfo, keyDesc)
 			require.NoError(t, err)
 
 			var cmp []testDiff
@@ -215,8 +217,8 @@ func TestThreeWayDiffer(t *testing.T) {
 	}
 }
 
-func testResolver(t *testing.T, ns NodeStore, valDesc val.TupleDesc, valBuilder *val.TupleBuilder) func(val.Tuple, val.Tuple, val.Tuple) (val.Tuple, bool) {
-	return func(l, r, b val.Tuple) (val.Tuple, bool) {
+func testResolver(t *testing.T, ns NodeStore, valDesc val.TupleDesc, valBuilder *val.TupleBuilder) func(*sql.Context, val.Tuple, val.Tuple, val.Tuple) (val.Tuple, bool, error) {
+	return func(_ *sql.Context, l, r, b val.Tuple) (val.Tuple, bool, error) {
 		for i := range valDesc.Types {
 			var base, left, right int64
 			var ok bool
@@ -236,7 +238,7 @@ func testResolver(t *testing.T, ns NodeStore, valDesc val.TupleDesc, valBuilder 
 			}
 
 			if base != left && base != right && left != right {
-				return nil, false
+				return nil, false, nil
 			} else if base != left {
 				valBuilder.PutInt64(i, left)
 			} else if base != right {
@@ -245,7 +247,7 @@ func testResolver(t *testing.T, ns NodeStore, valDesc val.TupleDesc, valBuilder 
 				valBuilder.PutInt64(i, base)
 			}
 		}
-		return valBuilder.Build(ns.Pool()), true
+		return valBuilder.Build(ns.Pool()), true, nil
 	}
 }
 

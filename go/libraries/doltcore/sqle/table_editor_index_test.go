@@ -31,7 +31,7 @@ import (
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-func setupEditorIndexTest(t *testing.T) (*env.DoltEnv, *doltdb.RootValue) {
+func setupEditorIndexTest(t *testing.T) (*env.DoltEnv, doltdb.RootValue) {
 	index_dEnv := dtestutils.CreateTestEnv()
 	root, err := index_dEnv.WorkingRoot(context.Background())
 	require.NoError(t, err)
@@ -120,6 +120,7 @@ UPDATE onepk SET pk1 = v1 + pk1 ORDER BY pk1 DESC;
 	for _, test := range tests {
 		t.Run(test.sqlStatement, func(t *testing.T) {
 			dEnv, initialRoot := setupEditorIndexTest(t)
+			defer dEnv.DoltDB.Close()
 
 			root := initialRoot
 			for _, sqlStatement := range strings.Split(test.sqlStatement, ";") {
@@ -128,10 +129,10 @@ UPDATE onepk SET pk1 = v1 + pk1 ORDER BY pk1 DESC;
 				require.NoError(t, err)
 			}
 
-			onepk, ok, err := root.GetTable(context.Background(), "onepk")
+			onepk, ok, err := root.GetTable(context.Background(), doltdb.TableName{Name: "onepk"})
 			require.NoError(t, err)
 			require.True(t, ok)
-			twopk, ok, err := root.GetTable(context.Background(), "twopk")
+			twopk, ok, err := root.GetTable(context.Background(), doltdb.TableName{Name: "twopk"})
 			require.NoError(t, err)
 			require.True(t, ok)
 
@@ -282,6 +283,7 @@ UPDATE oneuni SET v1 = v1 + pk1;
 	for _, test := range tests {
 		t.Run(test.sqlStatement, func(t *testing.T) {
 			dEnv, initialRoot := setupEditorIndexTest(t)
+			defer dEnv.DoltDB.Close()
 
 			root := initialRoot
 			var err error
@@ -297,10 +299,10 @@ UPDATE oneuni SET v1 = v1 + pk1;
 			}
 			require.NoError(t, err)
 
-			oneuni, ok, err := root.GetTable(context.Background(), "oneuni")
+			oneuni, ok, err := root.GetTable(context.Background(), doltdb.TableName{Name: "oneuni"})
 			require.NoError(t, err)
 			require.True(t, ok)
-			twouni, ok, err := root.GetTable(context.Background(), "twouni")
+			twouni, ok, err := root.GetTable(context.Background(), doltdb.TableName{Name: "twouni"})
 			require.NoError(t, err)
 			require.True(t, ok)
 

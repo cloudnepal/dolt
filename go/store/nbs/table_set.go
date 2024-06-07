@@ -29,9 +29,11 @@ import (
 	"sort"
 	"sync"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dolthub/dolt/go/store/chunks"
+	"github.com/dolthub/dolt/go/store/hash"
 )
 
 // Returned when a chunk with a reference to a non-existence chunk is
@@ -56,7 +58,7 @@ type tableSet struct {
 	rl              chan struct{}
 }
 
-func (ts tableSet) has(h addr) (bool, error) {
+func (ts tableSet) has(h hash.Hash) (bool, error) {
 	f := func(css chunkSourceSet) (bool, error) {
 		for _, haver := range css {
 			has, err := haver.has(h)
@@ -113,7 +115,7 @@ func (ts tableSet) hasMany(addrs []hasRecord) (bool, error) {
 	return f(ts.upstream)
 }
 
-func (ts tableSet) get(ctx context.Context, h addr, stats *Stats) ([]byte, error) {
+func (ts tableSet) get(ctx context.Context, h hash.Hash, stats *Stats) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -286,7 +288,19 @@ func (ts tableSet) Size() int {
 
 // append adds a memTable to an existing tableSet, compacting |mt| and
 // returning a new tableSet with newly compacted table added.
-func (ts tableSet) append(ctx context.Context, mt *memTable, checker refCheck, stats *Stats) (tableSet, error) {
+func (ts tableSet) append(ctx context.Context, mt *memTable, checker refCheck, hasCache *lru.TwoQueueCache[hash.Hash, struct{}], stats *Stats) (tableSet, error) {
+	addrs := hash.NewHashSet()
+	for _, getAddrs := range mt.getChildAddrs {
+		getAddrs(ctx, addrs, func(h hash.Hash) bool { return hasCache.Contains(h) })
+	}
+	mt.addChildRefs(addrs)
+
+	for i := range mt.pendingRefs {
+		if !mt.pendingRefs[i].has && hasCache.Contains(*mt.pendingRefs[i].a) {
+			mt.pendingRefs[i].has = true
+		}
+	}
+
 	sort.Sort(hasRecordByPrefix(mt.pendingRefs))
 	absent, err := checker(mt.pendingRefs)
 	if err != nil {
@@ -338,7 +352,7 @@ func (ts tableSet) rebase(ctx context.Context, specs []tableSpec, stats *Stats) 
 	// deduplicate |specs|
 	orig := specs
 	specs = make([]tableSpec, 0, len(orig))
-	seen := map[addr]struct{}{}
+	seen := map[hash.Hash]struct{}{}
 	for _, spec := range orig {
 		if _, ok := seen[spec.name]; ok {
 			continue
@@ -389,7 +403,7 @@ func (ts tableSet) rebase(ctx context.Context, specs []tableSpec, stats *Stats) 
 		// open missing tables in parallel
 		spec := s
 		eg.Go(func() error {
-			cs, err := ts.p.Open(ctx, spec.name, spec.chunkCount, stats)
+			cs, err := ts.p.Open(ctx, spec.name, spec.chunkCount, stats) // NM4 - spec.name is the tf/arch name.
 			if err != nil {
 				return err
 			}

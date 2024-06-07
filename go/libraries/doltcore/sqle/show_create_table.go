@@ -23,18 +23,19 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 )
 
 // These functions cannot be in the sqlfmt package as the reliance on the sqle package creates a circular reference.
 
-func PrepareCreateTableStmt(ctx context.Context, sqlDb SqlDatabase) (*sql.Context, *sqle.Engine, *dsess.DoltSession) {
+func PrepareCreateTableStmt(ctx context.Context, sqlDb dsess.SqlDatabase) (*sql.Context, *sqle.Engine, *dsess.DoltSession) {
 	pro, err := NewDoltDatabaseProviderWithDatabase(env.DefaultInitBranch, nil, sqlDb, nil)
 	if err != nil {
 		return nil, nil, nil
 	}
 	engine := sqle.NewDefault(pro)
 
-	sess := dsess.DefaultSession(pro)
+	sess := dsess.DefaultSession(pro, writer.NewWriteSession)
 	sqlCtx := sql.NewContext(ctx, sql.WithSession(sess))
 	sqlCtx.SetCurrentDatabase(sqlDb.Name())
 	return sqlCtx, engine, sess
@@ -45,7 +46,7 @@ func GetCreateTableStmt(ctx *sql.Context, engine *sqle.Engine, tableName string)
 	if err != nil {
 		return "", err
 	}
-	rows, err := sql.RowIterToRows(ctx, nil, rowIter)
+	rows, err := sql.RowIterToRows(ctx, rowIter)
 	if err != nil {
 		return "", err
 	}

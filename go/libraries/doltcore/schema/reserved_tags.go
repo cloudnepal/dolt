@@ -79,6 +79,7 @@ const (
 	DoltSchemasNameTag
 	DoltSchemasFragmentTag
 	DoltSchemasExtraTag
+	DoltSchemasSqlModeTag
 )
 
 // Tags for hidden columns in keyless rows
@@ -93,6 +94,7 @@ const (
 	DoltProceduresCreateStmtTag
 	DoltProceduresCreatedAtTag
 	DoltProceduresModifiedAtTag
+	DoltProceduresSqlModeTag
 )
 
 const (
@@ -107,4 +109,9 @@ const (
 	DoltConflictsBaseCardinalityTag
 	DoltConflictsOurCardinalityTag
 	DoltConflictsTheirCardinalityTag
+)
+
+const (
+	DoltIgnorePatternTag = iota + SystemTableReservedMin + uint64(8000)
+	DoltIgnoreIgnoredTag
 )

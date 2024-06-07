@@ -19,77 +19,115 @@ import (
 	"strconv"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/types"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/store/datas"
 )
 
-// doltPush is the stored procedure version for the CLI command `dolt push`.
-func doltPush(ctx *sql.Context, args ...string) (sql.RowIter, error) {
-	res, err := doDoltPush(ctx, args)
-	if err != nil {
-		return nil, err
-	}
-	return rowToIter(int64(res)), nil
+var doltPushSchema = []*sql.Column{
+	{
+		Name:     "status",
+		Type:     types.Int64,
+		Nullable: false,
+	},
+	{
+		Name:     "message",
+		Type:     types.LongText,
+		Nullable: true,
+	},
 }
 
-func doDoltPush(ctx *sql.Context, args []string) (int, error) {
+// doltPush is the stored procedure version for the CLI command `dolt push`.
+func doltPush(ctx *sql.Context, args ...string) (sql.RowIter, error) {
+	res, message, err := doDoltPush(ctx, args)
+	return rowToIter(int64(res), message), err
+}
+
+func doDoltPush(ctx *sql.Context, args []string) (int, string, error) {
 	dbName := ctx.GetCurrentDatabase()
 
 	if len(dbName) == 0 {
-		return cmdFailure, fmt.Errorf("empty database name")
+		return cmdFailure, "", fmt.Errorf("empty database name")
 	}
 	if err := branch_control.CheckAccess(ctx, branch_control.Permissions_Write); err != nil {
-		return cmdFailure, err
+		return cmdFailure, "", err
 	}
 
 	sess := dsess.DSessFromSess(ctx.Session)
 	dbData, ok := sess.GetDbData(ctx, dbName)
-
 	if !ok {
-		return cmdFailure, fmt.Errorf("could not load database %s", dbName)
+		return cmdFailure, "", fmt.Errorf("could not load database %s", dbName)
 	}
 
 	apr, err := cli.CreatePushArgParser().Parse(args)
 	if err != nil {
-		return cmdFailure, err
+		return cmdFailure, "", err
 	}
 
-	autoSetUpRemote := loadConfig(ctx).GetStringOrDefault(env.PushAutoSetupRemote, "false")
+	autoSetUpRemote := loadConfig(ctx).GetStringOrDefault(config.PushAutoSetupRemote, "false")
 	pushAutoSetUpRemote, err := strconv.ParseBool(autoSetUpRemote)
 	if err != nil {
-		return cmdFailure, err
+		return cmdFailure, "", err
 	}
 
-	opts, err := env.NewPushOpts(ctx, apr, dbData.Rsr, dbData.Ddb, apr.Contains(cli.ForceFlag), apr.Contains(cli.SetUpstreamFlag), pushAutoSetUpRemote)
+	targets, remote, err := env.NewPushOpts(ctx, apr, dbData.Rsr, dbData.Ddb, apr.Contains(cli.ForceFlag), apr.Contains(cli.SetUpstreamFlag), pushAutoSetUpRemote, apr.Contains(cli.AllFlag))
 	if err != nil {
-		return cmdFailure, err
+		return cmdFailure, "", err
 	}
-	remoteDB, err := sess.Provider().GetRemoteDB(ctx, dbData.Ddb.ValueReadWriter().Format(), opts.Remote, true)
+
+	if user, hasUser := apr.GetValue(cli.UserFlag); hasUser {
+		rmt := (*remote).WithParams(map[string]string{
+			dbfactory.GRPCUsernameAuthParam: user,
+		})
+		remote = &rmt
+	}
+
+	remoteDB, err := sess.Provider().GetRemoteDB(ctx, dbData.Ddb.ValueReadWriter().Format(), *remote, true)
 	if err != nil {
-		return 1, actions.HandleInitRemoteStorageClientErr(opts.Remote.Name, opts.Remote.Url, err)
+		return cmdFailure, "", actions.HandleInitRemoteStorageClientErr(remote.Name, remote.Url, err)
 	}
 
 	tmpDir, err := dbData.Rsw.TempTableFilesDir()
 	if err != nil {
-		return cmdFailure, err
+		return cmdFailure, "", err
 	}
-	err = actions.DoPush(ctx, dbData.Rsr, dbData.Rsw, dbData.Ddb, remoteDB, tmpDir, opts, runProgFuncs, stopProgFuncs)
+
+	var returnMsg string
+	po := &env.PushOptions{
+		Targets: targets,
+		Remote:  remote,
+		Rsr:     dbData.Rsr,
+		Rsw:     dbData.Rsw,
+		SrcDb:   dbData.Ddb,
+		DestDb:  remoteDB,
+		TmpDir:  tmpDir,
+	}
+	returnMsg, err = actions.DoPush(ctx, po, runProgFuncs, stopProgFuncs)
 	if err != nil {
 		switch err {
 		case doltdb.ErrUpToDate:
-			return cmdSuccess, nil
+			return cmdSuccess, "Everything up-to-date", nil
 		case datas.ErrMergeNeeded:
-			return cmdFailure, fmt.Errorf("%w; the tip of your current branch is behind its remote counterpart", err)
+			return cmdFailure, returnMsg, fmt.Errorf("%w; the tip of your current branch is behind its remote counterpart", err)
 		default:
-			return cmdFailure, err
+			if returnMsg != "" {
+				// For multiple branches push, we need to print successful push message
+				// before the error message. We currently cannot return success message
+				// if there was a failed push with error. So, we need to include the success
+				// message in the error message before returning.
+				err = fmt.Errorf("%s\n%s", returnMsg, err.Error())
+			}
+			return cmdFailure, "", err
 		}
 	}
 	// TODO : set upstream should be persisted outside of session
-	return cmdSuccess, nil
+	return cmdSuccess, returnMsg, nil
 }

@@ -16,14 +16,17 @@ package commands
 
 import (
 	"context"
+	"os"
 	"path"
 	"strings"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
 	"github.com/dolthub/dolt/go/store/types"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
 	eventsapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/eventsapi/v1alpha1"
+	"github.com/dolthub/dolt/go/libraries/doltcore/creds"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
@@ -79,7 +82,7 @@ func (cmd CloneCmd) EventType() eventsapi.ClientEventType {
 }
 
 // Exec executes the command
-func (cmd CloneCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd CloneCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, cloneDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
@@ -95,7 +98,13 @@ func (cmd CloneCmd) Exec(ctx context.Context, commandStr string, args []string, 
 func clone(ctx context.Context, apr *argparser.ArgParseResults, dEnv *env.DoltEnv) errhand.VerboseError {
 	remoteName := apr.GetValueOrDefault(cli.RemoteParam, "origin")
 	branch := apr.GetValueOrDefault(cli.BranchParam, "")
+	singleBranch := apr.Contains(cli.SingleBranchFlag)
 	dir, urlStr, verr := parseArgs(apr)
+	if verr != nil {
+		return verr
+	}
+
+	dEnv.UserPassConfig, verr = getRemoteUserAndPassConfig(apr)
 	if verr != nil {
 		return verr
 	}
@@ -132,10 +141,15 @@ func clone(ctx context.Context, apr *argparser.ArgParseResults, dEnv *env.DoltEn
 		return errhand.VerboseErrorFromError(err)
 	}
 
+	depth, ok := apr.GetInt(cli.DepthFlag)
+	if !ok {
+		depth = -1
+	}
+
 	// Nil out the old Dolt env so we don't accidentally operate on the wrong database
 	dEnv = nil
 
-	err = actions.CloneRemote(ctx, srcDB, remoteName, branch, clonedEnv)
+	err = actions.CloneRemote(ctx, srcDB, remoteName, branch, singleBranch, depth, clonedEnv)
 	if err != nil {
 		// If we're cloning into a directory that already exists do not erase it. Otherwise
 		// make best effort to delete the directory we created.
@@ -186,7 +200,7 @@ func parseArgs(apr *argparser.ArgParseResults) (string, string, errhand.VerboseE
 		if dir == "." {
 			dir = path.Dir(urlStr)
 		} else if dir == "/" {
-			return "", "", errhand.BuildDError("Could not infer repo name.  Please explicitily define a directory for this url").Build()
+			return "", "", errhand.BuildDError("Could not infer repo name.  Please explicitly define a directory for this url").Build()
 		}
 	}
 
@@ -227,4 +241,18 @@ func validateAndParseDolthubUrl(urlStr string) (string, bool) {
 	}
 
 	return "", false
+}
+
+func getRemoteUserAndPassConfig(apr *argparser.ArgParseResults) (*creds.DoltCredsForPass, errhand.VerboseError) {
+	if !apr.Contains(cli.UserFlag) {
+		return nil, nil
+	}
+	pass, found := os.LookupEnv(dconfig.EnvDoltRemotePassword)
+	if !found {
+		return nil, errhand.BuildDError("error: must set DOLT_REMOTE_PASSWORD environment variable to use --user param").Build()
+	}
+	return &creds.DoltCredsForPass{
+		Username: apr.GetValueOrDefault(cli.UserFlag, ""),
+		Password: pass,
+	}, nil
 }

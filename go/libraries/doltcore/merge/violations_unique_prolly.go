@@ -54,25 +54,25 @@ type UniqCVMeta struct {
 	Name    string   `json:"Name"`
 }
 
+func (m UniqCVMeta) ToInterface() (interface{}, error) {
+	return map[string]interface{}{
+		"Columns": m.Columns,
+		"Name":    m.Name,
+	}, nil
+}
+
+var _ sql.JSONWrapper = UniqCVMeta{}
+
 func (m UniqCVMeta) Unmarshall(ctx *sql.Context) (val types.JSONDocument, err error) {
 	return types.JSONDocument{Val: m}, nil
 }
 
-func (m UniqCVMeta) Compare(ctx *sql.Context, v types.JSONValue) (cmp int, err error) {
-	ours := types.JSONDocument{Val: m}
-	return ours.Compare(ctx, v)
-}
-
-func (m UniqCVMeta) ToString(ctx *sql.Context) (string, error) {
-	return m.PrettyPrint(), nil
-}
-
 func (m UniqCVMeta) PrettyPrint() string {
 	jsonStr := fmt.Sprintf(`{`+
-		`"Columns": ["%s"], `+
-		`"Name": "%s"}`,
-		strings.Join(m.Columns, `', '`),
-		m.Name)
+		`"Name": "%s", `+
+		`"Columns": ["%s"]}`,
+		m.Name,
+		strings.Join(m.Columns, `', '`))
 	return jsonStr
 }
 
@@ -98,53 +98,6 @@ func replaceUniqueKeyViolation(ctx context.Context, edt *prolly.ArtifactsEditor,
 
 	err = edt.ReplaceConstraintViolation(ctx, k, theirsHash, prolly.ArtifactTypeUniqueKeyViol, meta)
 	if err != nil {
-		if mv, ok := err.(*prolly.ErrMergeArtifactCollision); ok {
-			var e, n UniqCVMeta
-			err = json.Unmarshal(mv.ExistingInfo, &e)
-			if err != nil {
-				return err
-			}
-			err = json.Unmarshal(mv.NewInfo, &n)
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("%w: pk %s of table '%s' violates unique keys '%s' and '%s'",
-				ErrMultipleViolationsForRow,
-				kd.Format(mv.Key), tblName, e.Name, n.Name)
-		}
-		return err
-	}
-
-	return nil
-}
-
-func replaceUniqueKeyViolationWithValue(ctx context.Context, edt *prolly.ArtifactsEditor, k, value val.Tuple, kd val.TupleDesc, theirRootIsh doltdb.Rootish, vInfo []byte, tblName string) error {
-	meta := prolly.ConstraintViolationMeta{
-		VInfo: vInfo,
-		Value: value,
-	}
-
-	theirsHash, err := theirRootIsh.HashOf()
-	if err != nil {
-		return err
-	}
-
-	err = edt.ReplaceConstraintViolation(ctx, k, theirsHash, prolly.ArtifactTypeUniqueKeyViol, meta)
-	if err != nil {
-		if mv, ok := err.(*prolly.ErrMergeArtifactCollision); ok {
-			var e, n UniqCVMeta
-			err = json.Unmarshal(mv.ExistingInfo, &e)
-			if err != nil {
-				return err
-			}
-			err = json.Unmarshal(mv.NewInfo, &n)
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("%w: pk %s of table '%s' violates unique keys '%s' and '%s'",
-				ErrMultipleViolationsForRow,
-				kd.Format(mv.Key), tblName, e.Name, n.Name)
-		}
 		return err
 	}
 
@@ -177,4 +130,72 @@ func ordinalMappingFromIndex(def schema.Index) (m val.OrdinalMapping) {
 		}
 	}
 	return
+}
+
+type NullViolationMeta struct {
+	Columns []string `json:"Columns"`
+}
+
+var _ sql.JSONWrapper = NullViolationMeta{}
+
+func newNotNullViolationMeta(violations []string, value val.Tuple) (prolly.ConstraintViolationMeta, error) {
+	info, err := json.Marshal(NullViolationMeta{Columns: violations})
+	if err != nil {
+		return prolly.ConstraintViolationMeta{}, err
+	}
+	return prolly.ConstraintViolationMeta{
+		VInfo: info,
+		Value: value,
+	}, nil
+}
+
+func (m NullViolationMeta) ToInterface() (interface{}, error) {
+	return map[string]interface{}{
+		"Columns": m.Columns,
+	}, nil
+}
+
+func (m NullViolationMeta) Unmarshall(ctx *sql.Context) (val types.JSONDocument, err error) {
+	return types.JSONDocument{Val: m}, nil
+}
+
+// CheckCVMeta holds metadata describing a check constraint violation.
+type CheckCVMeta struct {
+	Name       string `json:"Name"`
+	Expression string `json:"Expression"`
+}
+
+var _ sql.JSONWrapper = CheckCVMeta{}
+
+// newCheckCVMeta creates a new CheckCVMeta from a schema |sch| and a check constraint name |checkName|. If the
+// check constraint is not found in the specified schema, an error is returned.
+func newCheckCVMeta(sch schema.Schema, checkName string) (CheckCVMeta, error) {
+	found := false
+	var check schema.Check
+	for _, check = range sch.Checks().AllChecks() {
+		if check.Name() == checkName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return CheckCVMeta{}, fmt.Errorf("check constraint '%s' not found in schema", checkName)
+	}
+
+	return CheckCVMeta{
+		Name:       check.Name(),
+		Expression: check.Expression(),
+	}, nil
+}
+
+// Unmarshall implements sql.JSONWrapper
+func (m CheckCVMeta) Unmarshall(_ *sql.Context) (val types.JSONDocument, err error) {
+	return types.JSONDocument{Val: m}, nil
+}
+
+func (m CheckCVMeta) ToInterface() (interface{}, error) {
+	return map[string]interface{}{
+		"Name":       m.Name,
+		"Expression": m.Expression,
+	}, nil
 }

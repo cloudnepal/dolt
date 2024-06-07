@@ -21,14 +21,19 @@ import (
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/types"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 )
 
+const diffSummaryDefaultRowCount = 10
+
 var _ sql.TableFunction = (*DiffSummaryTableFunction)(nil)
+var _ sql.ExecSourceRel = (*DiffSummaryTableFunction)(nil)
 
 type DiffSummaryTableFunction struct {
 	ctx *sql.Context
@@ -63,6 +68,19 @@ func (ds *DiffSummaryTableFunction) NewInstance(ctx *sql.Context, db sql.Databas
 	return node, nil
 }
 
+func (ds *DiffSummaryTableFunction) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(ds.Schema())
+	numRows, _, err := ds.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
+}
+
+func (ds *DiffSummaryTableFunction) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return diffSummaryDefaultRowCount, false, nil
+}
+
 // Database implements the sql.Databaser interface
 func (ds *DiffSummaryTableFunction) Database() sql.Database {
 	return ds.database
@@ -93,6 +111,10 @@ func (ds *DiffSummaryTableFunction) Resolved() bool {
 		return ds.commitsResolved() && ds.tableNameExpr.Resolved()
 	}
 	return ds.commitsResolved()
+}
+
+func (ds *DiffSummaryTableFunction) IsReadOnly() bool {
+	return true
 }
 
 // String implements the Stringer interface
@@ -143,9 +165,9 @@ func (ds *DiffSummaryTableFunction) CheckPrivileges(ctx *sql.Context, opChecker 
 			return false
 		}
 
+		subject := sql.PrivilegeCheckSubject{Database: ds.database.Name(), Table: tableName}
 		// TODO: Add tests for privilege checking
-		return opChecker.UserHasPrivileges(ctx,
-			sql.NewPrivilegedOperation(ds.database.Name(), tableName, "", sql.PrivilegeType_Select))
+		return opChecker.UserHasPrivileges(ctx, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 	}
 
 	tblNames, err := ds.database.GetTableNames(ctx)
@@ -155,7 +177,8 @@ func (ds *DiffSummaryTableFunction) CheckPrivileges(ctx *sql.Context, opChecker 
 
 	var operations []sql.PrivilegedOperation
 	for _, tblName := range tblNames {
-		operations = append(operations, sql.NewPrivilegedOperation(ds.database.Name(), tblName, "", sql.PrivilegeType_Select))
+		subject := sql.PrivilegeCheckSubject{Database: ds.database.Name(), Table: tblName}
+		operations = append(operations, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 	}
 
 	return opChecker.UserHasPrivileges(ctx, operations...)
@@ -176,12 +199,12 @@ func (ds *DiffSummaryTableFunction) Expressions() []sql.Expression {
 }
 
 // WithExpressions implements the sql.Expressioner interface.
-func (ds *DiffSummaryTableFunction) WithExpressions(expression ...sql.Expression) (sql.Node, error) {
-	if len(expression) < 1 {
-		return nil, sql.ErrInvalidArgumentNumber.New(ds.Name(), "1 to 3", len(expression))
+func (ds *DiffSummaryTableFunction) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
+	if len(exprs) < 1 {
+		return nil, sql.ErrInvalidArgumentNumber.New(ds.Name(), "1 to 3", len(exprs))
 	}
 
-	for _, expr := range expression {
+	for _, expr := range exprs {
 		if !expr.Resolved() {
 			return nil, ErrInvalidNonLiteralArgument.New(ds.Name(), expr.String())
 		}
@@ -192,41 +215,41 @@ func (ds *DiffSummaryTableFunction) WithExpressions(expression ...sql.Expression
 	}
 
 	newDstf := *ds
-	if strings.Contains(expression[0].String(), "..") {
-		if len(expression) < 1 || len(expression) > 2 {
-			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "1 or 2", len(expression))
+	if strings.Contains(exprs[0].String(), "..") {
+		if len(exprs) < 1 || len(exprs) > 2 {
+			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "1 or 2", len(exprs))
 		}
-		newDstf.dotCommitExpr = expression[0]
-		if len(expression) == 2 {
-			newDstf.tableNameExpr = expression[1]
+		newDstf.dotCommitExpr = exprs[0]
+		if len(exprs) == 2 {
+			newDstf.tableNameExpr = exprs[1]
 		}
 	} else {
-		if len(expression) < 2 || len(expression) > 3 {
-			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "2 or 3", len(expression))
+		if len(exprs) < 2 || len(exprs) > 3 {
+			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "2 or 3", len(exprs))
 		}
-		newDstf.fromCommitExpr = expression[0]
-		newDstf.toCommitExpr = expression[1]
-		if len(expression) == 3 {
-			newDstf.tableNameExpr = expression[2]
+		newDstf.fromCommitExpr = exprs[0]
+		newDstf.toCommitExpr = exprs[1]
+		if len(exprs) == 3 {
+			newDstf.tableNameExpr = exprs[2]
 		}
 	}
 
 	// validate the expressions
 	if newDstf.dotCommitExpr != nil {
-		if !types.IsText(newDstf.dotCommitExpr.Type()) {
+		if !types.IsText(newDstf.dotCommitExpr.Type()) && !expression.IsBindVar(newDstf.dotCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.dotCommitExpr.String())
 		}
 	} else {
-		if !types.IsText(newDstf.fromCommitExpr.Type()) {
+		if !types.IsText(newDstf.fromCommitExpr.Type()) && !expression.IsBindVar(newDstf.fromCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.fromCommitExpr.String())
 		}
-		if !types.IsText(newDstf.toCommitExpr.Type()) {
+		if !types.IsText(newDstf.toCommitExpr.Type()) && !expression.IsBindVar(newDstf.toCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.toCommitExpr.String())
 		}
 	}
 
 	if newDstf.tableNameExpr != nil {
-		if !types.IsText(newDstf.tableNameExpr.Type()) {
+		if !types.IsText(newDstf.tableNameExpr.Type()) && !expression.IsBindVar(newDstf.tableNameExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.tableNameExpr.String())
 		}
 	}
@@ -241,7 +264,7 @@ func (ds *DiffSummaryTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.
 		return nil, err
 	}
 
-	sqledb, ok := ds.database.(SqlDatabase)
+	sqledb, ok := ds.database.(dsess.SqlDatabase)
 	if !ok {
 		return nil, fmt.Errorf("unexpected database type: %T", ds.database)
 	}
@@ -257,7 +280,7 @@ func (ds *DiffSummaryTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.
 	}
 
 	sort.Slice(deltas, func(i, j int) bool {
-		return strings.Compare(deltas[i].ToName, deltas[j].ToName) < 0
+		return deltas[i].ToName.Less(deltas[j].ToName)
 	})
 
 	// If tableNameExpr defined, return a single table diff summary result
@@ -291,9 +314,16 @@ func (ds *DiffSummaryTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.
 	return NewDiffSummaryTableFunctionRowIter(diffSummaries), nil
 }
 
-func getSummaryForDelta(ctx *sql.Context, delta diff.TableDelta, sqledb SqlDatabase, fromDetails, toDetails *refDetails, shouldErrorOnPKChange bool) (*diff.TableDeltaSummary, error) {
+func getSummaryForDelta(ctx *sql.Context, delta diff.TableDelta, sqledb dsess.SqlDatabase, fromDetails, toDetails *refDetails, shouldErrorOnPKChange bool) (*diff.TableDeltaSummary, error) {
 	if delta.FromTable == nil && delta.ToTable == nil {
-		return nil, nil
+		if !strings.HasPrefix(delta.FromName.Name, diff.DBPrefix) && !strings.HasPrefix(delta.ToName.Name, diff.DBPrefix) {
+			return nil, nil
+		}
+		summ, err := delta.GetSummary(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return summ, nil
 	}
 
 	if !schema.ArePrimaryKeySetsDiffable(delta.Format(), delta.FromSch, delta.ToSch) {
@@ -397,10 +427,10 @@ func (d *diffSummaryTableFunctionRowIter) Close(context *sql.Context) error {
 
 func getRowFromSummary(ds *diff.TableDeltaSummary) sql.Row {
 	return sql.Row{
-		ds.FromTableName, // from_table_name
-		ds.ToTableName,   // to_table_name
-		ds.DiffType,      // diff_type
-		ds.DataChange,    // data_change
-		ds.SchemaChange,  // schema_change
+		ds.FromTableName.Name, // from_table_name
+		ds.ToTableName.Name,   // to_table_name
+		ds.DiffType,           // diff_type
+		ds.DataChange,         // data_change
+		ds.SchemaChange,       // schema_change
 	}
 }

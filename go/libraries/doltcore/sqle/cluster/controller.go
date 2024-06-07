@@ -23,27 +23,36 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 
+	replicationapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/replicationapi/v1alpha1"
+	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
 	"github.com/dolthub/dolt/go/libraries/doltcore/creds"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/remotesrv"
+	"github.com/dolthub/dolt/go/libraries/doltcore/servercfg"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/clusterdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/libraries/utils/jwtauth"
 	"github.com/dolthub/dolt/go/store/types"
 )
@@ -56,8 +65,17 @@ const RoleDetectedBrokenConfig Role = "detected_broken_config"
 
 const PersistentConfigPrefix = "sqlserver.cluster"
 
+// State for any ongoing DROP DATABASE replication attempts we have
+// outstanding. When we create a database, we cancel all on going DROP DATABASE
+// replication attempts.
+type databaseDropReplication struct {
+	ctx    context.Context
+	cancel func()
+	wg     *sync.WaitGroup
+}
+
 type Controller struct {
-	cfg           Config
+	cfg           servercfg.ClusterConfig
 	persistentCfg config.ReadWriteConfig
 	role          Role
 	epoch         int
@@ -68,40 +86,52 @@ type Controller struct {
 	cinterceptor  clientinterceptor
 	lgr           *logrus.Logger
 
-	provider       dbProvider
-	iterSessions   IterSessions
-	killQuery      func(uint32)
-	killConnection func(uint32) error
+	standbyCallback IsStandbyCallback
+	iterSessions    IterSessions
+	killQuery       func(uint32)
+	killConnection  func(uint32) error
 
 	jwks      *jwtauth.MultiJWKS
 	tlsCfg    *tls.Config
 	grpcCreds credentials.PerRPCCredentials
 	pub       ed25519.PublicKey
 	priv      ed25519.PrivateKey
+
+	replicationClients []*replicationServiceClient
+
+	mysqlDb          *mysql_db.MySQLDb
+	mysqlDbPersister *replicatingMySQLDbPersister
+	mysqlDbReplicas  []*mysqlDbReplica
+
+	branchControlController *branch_control.Controller
+	branchControlFilesys    filesys.Filesys
+	bcReplication           *branchControlReplication
+
+	dropDatabase             func(*sql.Context, string) error
+	outstandingDropDatabases map[string]*databaseDropReplication
+	remoteSrvDBCache         remotesrv.DBCache
 }
 
 type sqlvars interface {
 	AddSystemVariables(sysVars []sql.SystemVariable)
+	GetGlobal(name string) (sql.SystemVariable, interface{}, bool)
 }
 
-// We can manage certain aspects of the exposed databases on the server through
-// this.
-type dbProvider interface {
-	SetIsStandby(bool)
-}
+// Our IsStandbyCallback gets called with |true| or |false| when the server
+// becomes a standby or a primary respectively. Standby replicas should be read
+// only.
+type IsStandbyCallback func(bool)
 
 type procedurestore interface {
 	Register(sql.ExternalStoredProcedureDetails)
 }
 
 const (
-	DoltClusterRoleVariable      = "dolt_cluster_role"
-	DoltClusterRoleEpochVariable = "dolt_cluster_role_epoch"
 	// Since we fetch the keys from the other replicas we’re going to use a fixed string here.
 	DoltClusterRemoteApiAudience = "dolt-cluster-remote-api.dolthub.com"
 )
 
-func NewController(lgr *logrus.Logger, cfg Config, pCfg config.ReadWriteConfig) (*Controller, error) {
+func NewController(lgr *logrus.Logger, cfg servercfg.ClusterConfig, pCfg config.ReadWriteConfig) (*Controller, error) {
 	if cfg == nil {
 		return nil, nil
 	}
@@ -119,7 +149,9 @@ func NewController(lgr *logrus.Logger, cfg Config, pCfg config.ReadWriteConfig) 
 		lgr:           lgr,
 	}
 	roleSetter := func(role string, epoch int) {
-		ret.setRoleAndEpoch(role, epoch, false /* graceful */, -1 /* saveConnID */)
+		ret.setRoleAndEpoch(role, epoch, roleTransitionOptions{
+			graceful: false,
+		})
 	}
 	ret.sinterceptor.lgr = lgr.WithFields(logrus.Fields{})
 	ret.sinterceptor.setRole(role, epoch)
@@ -152,6 +184,26 @@ func NewController(lgr *logrus.Logger, cfg Config, pCfg config.ReadWriteConfig) 
 	ret.sinterceptor.keyProvider = ret.jwks
 	ret.sinterceptor.jwtExpected = JWTExpectations()
 
+	ret.replicationClients, err = ret.replicationServiceClients(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	ret.mysqlDbReplicas = make([]*mysqlDbReplica, len(ret.replicationClients))
+	for i := range ret.mysqlDbReplicas {
+		bo := backoff.NewExponentialBackOff()
+		bo.InitialInterval = time.Second
+		bo.MaxInterval = time.Minute
+		bo.MaxElapsedTime = 0
+		ret.mysqlDbReplicas[i] = &mysqlDbReplica{
+			lgr:     lgr.WithFields(logrus.Fields{}),
+			client:  ret.replicationClients[i],
+			backoff: bo,
+		}
+		ret.mysqlDbReplicas[i].cond = sync.NewCond(&ret.mysqlDbReplicas[i].mu)
+	}
+
+	ret.outstandingDropDatabases = make(map[string]*databaseDropReplication)
+
 	return ret, nil
 }
 
@@ -162,11 +214,26 @@ func (c *Controller) Run() {
 		defer wg.Done()
 		c.jwks.Run()
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.mysqlDbPersister.Run()
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.bcReplication.Run()
+	}()
 	wg.Wait()
+	for _, client := range c.replicationClients {
+		client.closer()
+	}
 }
 
 func (c *Controller) GracefulStop() error {
 	c.jwks.GracefulStop()
+	c.mysqlDbPersister.GracefulStop()
+	c.bcReplication.GracefulStop()
 	return nil
 }
 
@@ -180,7 +247,7 @@ func (c *Controller) ManageSystemVariables(variables sqlvars) {
 	c.refreshSystemVars()
 }
 
-func (c *Controller) ApplyStandbyReplicationConfig(ctx context.Context, bt *sql.BackgroundThreads, mrEnv *env.MultiRepoEnv, dbs ...sqle.SqlDatabase) error {
+func (c *Controller) ApplyStandbyReplicationConfig(ctx context.Context, bt *sql.BackgroundThreads, mrEnv *env.MultiRepoEnv, dbs ...dsess.SqlDatabase) error {
 	if c == nil {
 		return nil
 	}
@@ -203,13 +270,13 @@ func (c *Controller) ApplyStandbyReplicationConfig(ctx context.Context, bt *sql.
 
 type IterSessions func(func(sql.Session) (bool, error)) error
 
-func (c *Controller) ManageDatabaseProvider(p dbProvider) {
+func (c *Controller) SetIsStandbyCallback(callback IsStandbyCallback) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.provider = p
+	c.standbyCallback = callback
 	c.setProviderIsStandby(c.role != RolePrimary)
 }
 
@@ -236,11 +303,16 @@ func (c *Controller) applyCommitHooks(ctx context.Context, name string, bt *sql.
 	dialprovider := c.gRPCDialProvider(denv)
 	var hooks []*commithook
 	for _, r := range c.cfg.StandbyRemotes() {
-		remote, ok := remotes[r.Name()]
+		remoteUrl := strings.Replace(r.RemoteURLTemplate(), dsess.URLTemplateDatabasePlaceholder, name, -1)
+		remote, ok := remotes.Get(r.Name())
 		if !ok {
-			return nil, fmt.Errorf("sqle: cluster: standby replication: destination remote %s does not exist on database %s", r.Name(), name)
+			remote = env.NewRemote(r.Name(), remoteUrl, nil)
+			err := denv.AddRemote(remote)
+			if err != nil {
+				return nil, fmt.Errorf("sqle: cluster: standby replication: could not create remote %s for database %s: %w", r.Name(), name, err)
+			}
 		}
-		commitHook := newCommitHook(c.lgr, r.Name(), name, c.role, func(ctx context.Context) (*doltdb.DoltDB, error) {
+		commitHook := newCommitHook(c.lgr, r.Name(), remote.Url, name, c.role, func(ctx context.Context) (*doltdb.DoltDB, error) {
 			return remote.GetRemoteDB(ctx, types.Format_Default, dialprovider)
 		}, denv.DoltDB, ttfdir)
 		denv.DoltDB.PrependCommitHook(ctx, commitHook)
@@ -261,6 +333,111 @@ func (c *Controller) RegisterStoredProcedures(store procedurestore) {
 		return
 	}
 	store.Register(newAssumeRoleProcedure(c))
+	store.Register(newTransitionToStandbyProcedure(c))
+}
+
+// Incoming drop database replication requests need a way to drop a database in
+// the sqle.DatabaseProvider. This is our callback for that functionality.
+func (c *Controller) SetDropDatabase(dropDatabase func(*sql.Context, string) error) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dropDatabase = dropDatabase
+}
+
+// DropDatabaseHook gets called when the database provider drops a
+// database. This is how we learn that we need to replicate a drop database.
+func (c *Controller) DropDatabaseHook() func(*sql.Context, string) {
+	return c.dropDatabaseHook
+}
+
+func (c *Controller) dropDatabaseHook(_ *sql.Context, dbname string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// We always cleanup the commithooks associated with that database.
+
+	j := 0
+	for i := 0; i < len(c.commithooks); i++ {
+		if c.commithooks[i].dbname == dbname {
+			c.commithooks[i].databaseWasDropped()
+			continue
+		}
+		if j != i {
+			c.commithooks[j] = c.commithooks[i]
+		}
+		j += 1
+	}
+	c.commithooks = c.commithooks[:j]
+
+	if c.role != RolePrimary {
+		return
+	}
+
+	// If we are the primary, we will replicate the drop to our standby replicas.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+	wg.Add(len(c.replicationClients))
+	state := &databaseDropReplication{
+		ctx:    ctx,
+		cancel: cancel,
+		wg:     wg,
+	}
+	c.outstandingDropDatabases[dbname] = state
+
+	for _, client := range c.replicationClients {
+		client := client
+		go c.replicateDropDatabase(state, client, dbname)
+	}
+}
+
+func (c *Controller) cancelDropDatabaseReplication(dbname string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s := c.outstandingDropDatabases[dbname]; s != nil {
+		s.cancel()
+		s.wg.Wait()
+	}
+}
+
+func (c *Controller) replicateDropDatabase(s *databaseDropReplication, client *replicationServiceClient, dbname string) {
+	defer s.wg.Done()
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = time.Millisecond
+	bo.MaxInterval = time.Minute
+	bo.MaxElapsedTime = 0
+	for {
+		if s.ctx.Err() != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+		_, err := client.client.DropDatabase(ctx, &replicationapi.DropDatabaseRequest{
+			Name: dbname,
+		})
+		cancel()
+		if err == nil {
+			c.lgr.Tracef("successfully replicated drop of [%s] to %s", dbname, client.remote)
+			return
+		}
+		if status.Code(err) == codes.FailedPrecondition {
+			c.lgr.Warnf("drop of [%s] to %s will note be replicated; FailedPrecondition", dbname, client.remote)
+			return
+		}
+		c.lgr.Warnf("failed to replicate drop of [%s] to %s: %v", dbname, client.remote, err)
+		if s.ctx.Err() != nil {
+			return
+		}
+		d := bo.NextBackOff()
+		c.lgr.Tracef("sleeping %v before next drop attempt for database [%s] at %s", d, dbname, client.remote)
+		select {
+		case <-time.After(d):
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *Controller) ClusterDatabase() sql.Database {
@@ -284,18 +461,18 @@ func (c *Controller) ServerOptions() []grpc.ServerOption {
 func (c *Controller) refreshSystemVars() {
 	role, epoch := string(c.role), c.epoch
 	vars := []sql.SystemVariable{
-		{
-			Name:    DoltClusterRoleVariable,
+		&sql.MysqlSystemVariable{
+			Name:    dsess.DoltClusterRoleVariable,
 			Dynamic: false,
-			Scope:   sql.SystemVariableScope_Persist,
-			Type:    gmstypes.NewSystemStringType(DoltClusterRoleVariable),
+			Scope:   sql.GetMysqlScope(sql.SystemVariableScope_Persist),
+			Type:    gmstypes.NewSystemStringType(dsess.DoltClusterRoleVariable),
 			Default: role,
 		},
-		{
-			Name:    DoltClusterRoleEpochVariable,
+		&sql.MysqlSystemVariable{
+			Name:    dsess.DoltClusterRoleEpochVariable,
 			Dynamic: false,
-			Scope:   sql.SystemVariableScope_Persist,
-			Type:    gmstypes.NewSystemIntType(DoltClusterRoleEpochVariable, 0, 9223372036854775807, false),
+			Scope:   sql.GetMysqlScope(sql.SystemVariableScope_Persist),
+			Type:    gmstypes.NewSystemIntType(dsess.DoltClusterRoleEpochVariable, 0, 9223372036854775807, false),
 			Default: epoch,
 		},
 	}
@@ -304,16 +481,16 @@ func (c *Controller) refreshSystemVars() {
 
 func (c *Controller) persistVariables() error {
 	toset := make(map[string]string)
-	toset[DoltClusterRoleVariable] = string(c.role)
-	toset[DoltClusterRoleEpochVariable] = strconv.Itoa(c.epoch)
+	toset[dsess.DoltClusterRoleVariable] = string(c.role)
+	toset[dsess.DoltClusterRoleEpochVariable] = strconv.Itoa(c.epoch)
 	return c.persistentCfg.SetStrings(toset)
 }
 
-func applyBootstrapClusterConfig(lgr *logrus.Logger, cfg Config, pCfg config.ReadWriteConfig) (Role, int, error) {
+func applyBootstrapClusterConfig(lgr *logrus.Logger, cfg servercfg.ClusterConfig, pCfg config.ReadWriteConfig) (Role, int, error) {
 	toset := make(map[string]string)
-	persistentRole := pCfg.GetStringOrDefault(DoltClusterRoleVariable, "")
+	persistentRole := pCfg.GetStringOrDefault(dsess.DoltClusterRoleVariable, "")
 	var roleFromPersistentConfig bool
-	persistentEpoch := pCfg.GetStringOrDefault(DoltClusterRoleEpochVariable, "")
+	persistentEpoch := pCfg.GetStringOrDefault(dsess.DoltClusterRoleEpochVariable, "")
 	if persistentRole == "" {
 		if cfg.BootstrapRole() != "" {
 			lgr.Tracef("cluster/controller: persisted cluster role was empty, apply bootstrap_role %s", cfg.BootstrapRole())
@@ -322,7 +499,7 @@ func applyBootstrapClusterConfig(lgr *logrus.Logger, cfg Config, pCfg config.Rea
 			lgr.Trace("cluster/controller: persisted cluster role was empty, bootstrap_role was empty: defaulted to primary")
 			persistentRole = "primary"
 		}
-		toset[DoltClusterRoleVariable] = persistentRole
+		toset[dsess.DoltClusterRoleVariable] = persistentRole
 	} else {
 		roleFromPersistentConfig = true
 		lgr.Tracef("cluster/controller: persisted cluster role is %s", persistentRole)
@@ -330,19 +507,19 @@ func applyBootstrapClusterConfig(lgr *logrus.Logger, cfg Config, pCfg config.Rea
 	if persistentEpoch == "" {
 		persistentEpoch = strconv.Itoa(cfg.BootstrapEpoch())
 		lgr.Tracef("cluster/controller: persisted cluster role epoch is empty, took boostrap_epoch: %s", persistentEpoch)
-		toset[DoltClusterRoleEpochVariable] = persistentEpoch
+		toset[dsess.DoltClusterRoleEpochVariable] = persistentEpoch
 	} else {
 		lgr.Tracef("cluster/controller: persisted cluster role epoch is %s", persistentEpoch)
 	}
 	if persistentRole != string(RolePrimary) && persistentRole != string(RoleStandby) {
 		isallowed := persistentRole == string(RoleDetectedBrokenConfig) && roleFromPersistentConfig
 		if !isallowed {
-			return "", 0, fmt.Errorf("persisted role %s.%s = %s must be \"primary\" or \"secondary\"", PersistentConfigPrefix, DoltClusterRoleVariable, persistentRole)
+			return "", 0, fmt.Errorf("persisted role %s.%s = %s must be \"primary\" or \"secondary\"", PersistentConfigPrefix, dsess.DoltClusterRoleVariable, persistentRole)
 		}
 	}
 	epochi, err := strconv.Atoi(persistentEpoch)
 	if err != nil {
-		return "", 0, fmt.Errorf("persisted role epoch %s.%s = %s must be an integer", PersistentConfigPrefix, DoltClusterRoleEpochVariable, persistentEpoch)
+		return "", 0, fmt.Errorf("persisted role epoch %s.%s = %s must be an integer", PersistentConfigPrefix, dsess.DoltClusterRoleEpochVariable, persistentEpoch)
 	}
 	if len(toset) > 0 {
 		err := pCfg.SetStrings(toset)
@@ -353,38 +530,77 @@ func applyBootstrapClusterConfig(lgr *logrus.Logger, cfg Config, pCfg config.Rea
 	return Role(persistentRole), epochi, nil
 }
 
-func (c *Controller) setRoleAndEpoch(role string, epoch int, graceful bool, saveConnID int) (bool, error) {
+type roleTransitionOptions struct {
+	// If true, all standby replicas must be caught up in order to
+	// transition from primary to standby.
+	graceful bool
+
+	// If non-zero and |graceful| is true, will allow a transition from
+	// primary to standby to succeed only if this many standby replicas
+	// are known to be caught up at the finalization of the replication
+	// hooks.
+	minCaughtUpStandbys int
+
+	// If non-nil, this connection will be saved if and when the connection
+	// process needs to terminate existing connections.
+	saveConnID *int
+}
+
+type roleTransitionResult struct {
+	// true if the role changed as a result of this call.
+	changedRole bool
+
+	// filled in with graceful transition results if this was a graceful
+	// transition and it was successful.
+	gracefulTransitionResults []graceTransitionResult
+}
+
+func (c *Controller) setRoleAndEpoch(role string, epoch int, opts roleTransitionOptions) (roleTransitionResult, error) {
+	graceful := opts.graceful
+	saveConnID := -1
+	if opts.saveConnID != nil {
+		saveConnID = *opts.saveConnID
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if epoch == c.epoch && role == string(c.role) {
-		return false, nil
+		return roleTransitionResult{false, nil}, nil
 	}
 
 	if role != string(RolePrimary) && role != string(RoleStandby) && role != string(RoleDetectedBrokenConfig) {
-		return false, fmt.Errorf("error assuming role '%s'; valid roles are 'primary' and 'standby'", role)
+		return roleTransitionResult{false, nil}, fmt.Errorf("error assuming role '%s'; valid roles are 'primary' and 'standby'", role)
 	}
 
 	if epoch < c.epoch {
-		return false, fmt.Errorf("error assuming role '%s' at epoch %d; already at epoch %d", role, epoch, c.epoch)
+		return roleTransitionResult{false, nil}, fmt.Errorf("error assuming role '%s' at epoch %d; already at epoch %d", role, epoch, c.epoch)
 	}
 	if epoch == c.epoch {
 		// This is allowed for non-graceful transitions to 'standby', which only occur from interceptors and
 		// other signals that the cluster is misconfigured.
 		isallowed := !graceful && (role == string(RoleStandby) || role == string(RoleDetectedBrokenConfig))
 		if !isallowed {
-			return false, fmt.Errorf("error assuming role '%s' at epoch %d; already at epoch %d with different role, '%s'", role, epoch, c.epoch, c.role)
+			return roleTransitionResult{false, nil}, fmt.Errorf("error assuming role '%s' at epoch %d; already at epoch %d with different role, '%s'", role, epoch, c.epoch, c.role)
 		}
 	}
 
 	changedrole := role != string(c.role)
+	var gracefulResults []graceTransitionResult
 
 	if changedrole {
 		var err error
 		if role == string(RoleStandby) {
 			if graceful {
-				err = c.gracefulTransitionToStandby(saveConnID)
+				beforeRole, beforeEpoch := c.role, c.epoch
+				gracefulResults, err = c.gracefulTransitionToStandby(saveConnID, opts.minCaughtUpStandbys)
+				if err == nil && (beforeRole != c.role || beforeEpoch != c.epoch) {
+					// The role or epoch moved out from under us while we were unlocked and transitioning to standby.
+					err = fmt.Errorf("error assuming role '%s' at epoch %d: the role configuration changed while we were replicating to our standbys. Please try again", role, epoch)
+				}
 				if err != nil {
-					return false, err
+					c.setProviderIsStandby(c.role != RolePrimary)
+					c.killRunningQueries(saveConnID)
+					return roleTransitionResult{false, nil}, err
 				}
 			} else {
 				c.immediateTransitionToStandby()
@@ -406,8 +622,14 @@ func (c *Controller) setRoleAndEpoch(role string, epoch int, graceful bool, save
 		for _, h := range c.commithooks {
 			h.setRole(c.role)
 		}
+		c.mysqlDbPersister.setRole(c.role)
+		c.bcReplication.setRole(c.role)
 	}
-	return changedrole, c.persistVariables()
+	_ = c.persistVariables()
+	return roleTransitionResult{
+		changedRole:               changedrole,
+		gracefulTransitionResults: gracefulResults,
+	}, nil
 }
 
 func (c *Controller) roleAndEpoch() (Role, int) {
@@ -460,19 +682,97 @@ func (c *Controller) recordSuccessfulRemoteSrvCommit(name string) {
 	}
 }
 
-func (c *Controller) RemoteSrvServerArgs(ctx *sql.Context, args remotesrv.ServerArgs) remotesrv.ServerArgs {
+func (c *Controller) RemoteSrvServerArgs(ctxFactory func(context.Context) (*sql.Context, error), args remotesrv.ServerArgs) (remotesrv.ServerArgs, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	listenaddr := c.RemoteSrvListenAddr()
 	args.HttpListenAddr = listenaddr
 	args.GrpcListenAddr = listenaddr
 	args.Options = c.ServerOptions()
-	args = sqle.RemoteSrvServerArgs(ctx, args)
+	var err error
+	args.FS, args.DBCache, err = sqle.RemoteSrvFSAndDBCache(ctxFactory, sqle.CreateUnknownDatabases)
+	if err != nil {
+		return remotesrv.ServerArgs{}, err
+	}
 	args.DBCache = remotesrvStoreCache{args.DBCache, c}
+	c.remoteSrvDBCache = args.DBCache
 
 	keyID := creds.PubKeyToKID(c.pub)
 	keyIDStr := creds.B32CredsEncoding.EncodeToString(keyID)
 	args.HttpInterceptor = JWKSHandlerInterceptor(keyIDStr, c.pub)
 
-	return args
+	return args, nil
+}
+
+func (c *Controller) HookMySQLDbPersister(persister MySQLDbPersister, mysqlDb *mysql_db.MySQLDb) MySQLDbPersister {
+	if c != nil {
+		c.mysqlDb = mysqlDb
+		c.mysqlDbPersister = &replicatingMySQLDbPersister{
+			base:     persister,
+			replicas: c.mysqlDbReplicas,
+		}
+		c.mysqlDbPersister.setRole(c.role)
+		persister = c.mysqlDbPersister
+	}
+	return persister
+}
+
+func (c *Controller) HookBranchControlPersistence(controller *branch_control.Controller, fs filesys.Filesys) {
+	if c != nil {
+		c.branchControlController = controller
+		c.branchControlFilesys = fs
+
+		replicas := make([]*branchControlReplica, len(c.replicationClients))
+		for i := range replicas {
+			bo := backoff.NewExponentialBackOff()
+			bo.InitialInterval = time.Second
+			bo.MaxInterval = time.Minute
+			bo.MaxElapsedTime = 0
+			replicas[i] = &branchControlReplica{
+				backoff: bo,
+				client:  c.replicationClients[i],
+				lgr:     c.lgr.WithFields(logrus.Fields{}),
+			}
+			replicas[i].cond = sync.NewCond(&replicas[i].mu)
+		}
+		c.bcReplication = &branchControlReplication{
+			replicas:     replicas,
+			bcController: controller,
+		}
+		c.bcReplication.setRole(c.role)
+
+		controller.SavedCallback = func(ctx context.Context) {
+			contents := controller.Serialized.Load()
+			if contents != nil {
+				var rsc doltdb.ReplicationStatusController
+				c.bcReplication.UpdateBranchControlContents(ctx, *contents, &rsc)
+				if sqlCtx, ok := ctx.(*sql.Context); ok {
+					dsess.WaitForReplicationController(sqlCtx, rsc)
+				}
+			}
+		}
+	}
+}
+
+func (c *Controller) RegisterGrpcServices(ctxFactory func(context.Context) (*sql.Context, error), srv *grpc.Server) {
+	replicationapi.RegisterReplicationServiceServer(srv, &replicationServiceServer{
+		ctxFactory:           ctxFactory,
+		mysqlDb:              c.mysqlDb,
+		branchControl:        c.branchControlController,
+		branchControlFilesys: c.branchControlFilesys,
+		dropDatabase:         c.dropDatabase,
+		lgr:                  c.lgr.WithFields(logrus.Fields{}),
+	})
+}
+
+// TODO: make the deadline here configurable or something.
+const waitForHooksToReplicateTimeout = 10 * time.Second
+
+type graceTransitionResult struct {
+	caughtUp  bool
+	database  string
+	remote    string
+	remoteUrl string
 }
 
 // The order of operations is:
@@ -488,18 +788,100 @@ func (c *Controller) RemoteSrvServerArgs(ctx *sql.Context, args remotesrv.Server
 // after returning the results of dolt_assume_cluster_role().
 //
 // called with c.mu held
-func (c *Controller) gracefulTransitionToStandby(saveConnID int) error {
+func (c *Controller) gracefulTransitionToStandby(saveConnID, minCaughtUpStandbys int) ([]graceTransitionResult, error) {
 	c.setProviderIsStandby(true)
 	c.killRunningQueries(saveConnID)
-	// TODO: this can block with c.mu held, although we are not too
-	// interested in the server proceeding gracefully while this is
-	// happening.
-	if err := c.waitForHooksToReplicate(); err != nil {
-		c.setProviderIsStandby(false)
-		c.killRunningQueries(saveConnID)
-		return err
+
+	var hookStates, mysqlStates, bcStates []graceTransitionResult
+	var hookErr, mysqlErr, bcErr error
+
+	// We concurrently wait for hooks, mysql and dolt_branch_control replication to true up.
+	// If we encounter any errors while doing this, we fail the graceful transition.
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		// waitForHooksToReplicate will release the lock while it
+		// blocks, but will return with the lock held.
+		hookStates, hookErr = c.waitForHooksToReplicate(waitForHooksToReplicateTimeout)
+	}()
+	go func() {
+		defer wg.Done()
+		mysqlStates, mysqlErr = c.mysqlDbPersister.waitForReplication(waitForHooksToReplicateTimeout)
+	}()
+	go func() {
+		defer wg.Done()
+		bcStates, bcErr = c.bcReplication.waitForReplication(waitForHooksToReplicateTimeout)
+	}()
+	wg.Wait()
+
+	if hookErr != nil {
+		return nil, hookErr
 	}
-	return nil
+	if mysqlErr != nil {
+		return nil, mysqlErr
+	}
+	if bcErr != nil {
+		return nil, bcErr
+	}
+
+	if len(hookStates) != len(c.commithooks) {
+		c.lgr.Warnf("cluster/controller: failed to transition to standby; the set of replicated databases changed during the transition.")
+		return nil, errors.New("cluster/controller: failed to transition to standby; the set of replicated databases changed during the transition.")
+	}
+
+	res := make([]graceTransitionResult, 0, len(hookStates)+len(mysqlStates)+len(bcStates))
+	res = append(res, hookStates...)
+	res = append(res, mysqlStates...)
+	res = append(res, bcStates...)
+
+	if minCaughtUpStandbys == 0 {
+		for _, state := range res {
+			if !state.caughtUp {
+				c.lgr.Warnf("cluster/controller: failed to replicate all databases to all standbys; not transitioning to standby.")
+				return nil, fmt.Errorf("cluster/controller: failed to transition from primary to standby gracefully; could not replicate databases to standby in a timely manner.")
+			}
+		}
+		c.lgr.Tracef("cluster/controller: successfully replicated all databases to all standbys; transitioning to standby.")
+	} else {
+		databases := make(map[string]struct{})
+		replicas := make(map[string]int)
+		for _, r := range res {
+			databases[r.database] = struct{}{}
+			url, err := url.Parse(r.remoteUrl)
+			if err != nil {
+				return nil, fmt.Errorf("cluster/controller: could not parse remote_url (%s) for remote %s on database %s: %w", r.remoteUrl, r.remote, r.database, err)
+			}
+			if _, ok := replicas[url.Host]; !ok {
+				replicas[url.Host] = 0
+			}
+			if r.caughtUp {
+				replicas[url.Host] = replicas[url.Host] + 1
+			}
+		}
+		numCaughtUp := 0
+		for _, v := range replicas {
+			if v == len(databases) {
+				numCaughtUp += 1
+			}
+		}
+		if numCaughtUp < minCaughtUpStandbys {
+			return nil, fmt.Errorf("cluster/controller: failed to transition from primary to standby gracefully; could not ensure %d replicas were caught up on all %d databases. Only caught up %d standbys fully.", minCaughtUpStandbys, len(databases), numCaughtUp)
+		}
+		c.lgr.Tracef("cluster/controller: successfully replicated all databases to %d out of %d standbys; transitioning to standby.", numCaughtUp, len(replicas))
+	}
+
+	return res, nil
+}
+
+func allCaughtUp(res []graceTransitionResult) bool {
+	for _, r := range res {
+		if !r.caughtUp {
+			return false
+		}
+	}
+	return true
 }
 
 // The order of operations is:
@@ -545,67 +927,74 @@ func (c *Controller) killRunningQueries(saveConnID int) {
 
 // called with c.mu held
 func (c *Controller) setProviderIsStandby(standby bool) {
-	if c.provider != nil {
-		c.provider.SetIsStandby(standby)
+	if c.standbyCallback != nil {
+		c.standbyCallback(standby)
 	}
 }
-
-const waitForHooksToReplicateTimeout = 10 * time.Second
 
 // Called during a graceful transition from primary to standby. Waits until all
 // commithooks report nextHead == lastPushedHead.
 //
-// TODO: make the deadline here configurable or something.
+// Returns `[]bool` with an entry for each `commithook` which existed at the
+// start of the call. The entry will be `true` if that `commithook` was caught
+// up as part of this wait, and `false` otherwise.
 //
 // called with c.mu held
-func (c *Controller) waitForHooksToReplicate() error {
-	caughtup := make([]bool, len(c.commithooks))
+func (c *Controller) waitForHooksToReplicate(timeout time.Duration) ([]graceTransitionResult, error) {
+	commithooks := make([]*commithook, len(c.commithooks))
+	copy(commithooks, c.commithooks)
+	res := make([]graceTransitionResult, len(commithooks))
+	for i := range res {
+		res[i].database = commithooks[i].dbname
+		res[i].remote = commithooks[i].remotename
+		res[i].remoteUrl = commithooks[i].remoteurl
+	}
 	var wg sync.WaitGroup
-	wg.Add(len(c.commithooks))
-	for li, lch := range c.commithooks {
+	wg.Add(len(commithooks))
+	for li, lch := range commithooks {
 		i := li
 		ch := lch
-		if ch.isCaughtUpLocking() {
-			caughtup[i] = true
-			wg.Done()
-		} else {
-			ch.setWaitNotify(func() {
-				// called with ch.mu locked.
-				if !caughtup[i] && ch.isCaughtUp() {
-					caughtup[i] = true
-					wg.Done()
-				}
-			})
+		ok := ch.setWaitNotify(func() {
+			// called with ch.mu locked.
+			if !res[i].caughtUp && ch.isCaughtUp() {
+				res[i].caughtUp = true
+				wg.Done()
+			}
+		})
+		if !ok {
+			for j := li - 1; j >= 0; j-- {
+				commithooks[j].setWaitNotify(nil)
+			}
+			c.lgr.Warnf("cluster/controller: failed to wait for graceful transition to standby; there were concurrent attempts to transition..")
+			return nil, errors.New("cluster/controller: failed to transition from primary to standby gracefully; did not gain exclusive access to commithooks.")
 		}
 	}
+	c.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
-	var success bool
 	select {
 	case <-done:
-		success = true
-	case <-time.After(waitForHooksToReplicateTimeout):
-		success = false
+	case <-time.After(timeout):
 	}
-	for _, ch := range c.commithooks {
+	c.mu.Lock()
+	for _, ch := range commithooks {
 		ch.setWaitNotify(nil)
 	}
-	// make certain we don't leak the wg.Wait goroutine in the failure case.
-	for _, b := range caughtup {
-		if !b {
+
+	// Make certain we don't leak the wg.Wait goroutine in the failure case.
+	// At this point, none of the callbacks will ever be called again and
+	// ch.setWaitNotify grabs a lock and so establishes the happens before.
+	for _, b := range res {
+		if !b.caughtUp {
 			wg.Done()
 		}
 	}
-	if success {
-		c.lgr.Tracef("cluster/controller: successfully replicated all databases to all standbys; transitioning to standby.")
-		return nil
-	} else {
-		c.lgr.Warnf("cluster/controller: failed to replicate all databases to all standbys; not transitioning to standby.")
-		return errors.New("cluster/controller: failed to transition from primary to standby gracefully; could not replicate databases to standby in a timely manner.")
-	}
+	<-done
+
+	return res, nil
 }
 
 // Within a cluster, if remotesapi is configured with a tls_ca, we take the
@@ -732,4 +1121,64 @@ func (c *Controller) standbyRemotesJWKS() *jwtauth.MultiJWKS {
 		urls[i] = strings.Replace(r.RemoteURLTemplate(), dsess.URLTemplateDatabasePlaceholder, ".well-known/jwks.json", -1)
 	}
 	return jwtauth.NewMultiJWKS(c.lgr.WithFields(logrus.Fields{"component": "jwks-key-provider"}), urls, client)
+}
+
+type replicationServiceClient struct {
+	remote string
+	url    string
+	tls    bool
+	client replicationapi.ReplicationServiceClient
+	closer func() error
+}
+
+func (c *Controller) replicationServiceDialOptions() []grpc.DialOption {
+	var ret []grpc.DialOption
+	if c.tlsCfg == nil {
+		ret = append(ret, grpc.WithInsecure())
+	} else {
+		ret = append(ret, grpc.WithTransportCredentials(credentials.NewTLS(c.tlsCfg)))
+	}
+
+	ret = append(ret, grpc.WithStreamInterceptor(c.cinterceptor.Stream()))
+	ret = append(ret, grpc.WithUnaryInterceptor(c.cinterceptor.Unary()))
+
+	ret = append(ret, grpc.WithPerRPCCredentials(c.grpcCreds))
+
+	return ret
+}
+
+func (c *Controller) replicationServiceClients(ctx context.Context) ([]*replicationServiceClient, error) {
+	var ret []*replicationServiceClient
+	for _, r := range c.cfg.StandbyRemotes() {
+		urlStr := strings.Replace(r.RemoteURLTemplate(), dsess.URLTemplateDatabasePlaceholder, "", -1)
+		url, err := url.Parse(urlStr)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse remote url template [%s] for remote %s: %w", r.RemoteURLTemplate(), r.Name(), err)
+		}
+		grpcTarget := "dns:" + url.Hostname() + ":" + url.Port()
+		cc, err := grpc.DialContext(ctx, grpcTarget, c.replicationServiceDialOptions()...)
+		if err != nil {
+			return nil, fmt.Errorf("could not dial grpc endpoint [%s] for remote %s: %w", grpcTarget, r.Name(), err)
+		}
+		client := replicationapi.NewReplicationServiceClient(cc)
+		ret = append(ret, &replicationServiceClient{
+			remote: r.Name(),
+			url:    grpcTarget,
+			tls:    c.tlsCfg != nil,
+			client: client,
+			closer: cc.Close,
+		})
+	}
+	return ret, nil
+}
+
+// Generally r.url is a gRPC dial endpoint and will be something like "dns:53.78.2.1:3832", or something like that.
+//
+// We want to match these endpoints up with Dolt remotes URLs, which will typically be something like http://53.78.2.1:3832.
+func (r *replicationServiceClient) httpUrl() string {
+	prefix := "https://"
+	if !r.tls {
+		prefix = "http://"
+	}
+	return prefix + strings.TrimPrefix(r.url, "dns:")
 }

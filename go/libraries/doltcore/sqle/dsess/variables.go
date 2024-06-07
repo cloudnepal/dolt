@@ -33,34 +33,50 @@ const (
 
 // General system variables
 const (
-	DoltCommitOnTransactionCommit = "dolt_transaction_commit"
-	TransactionsDisabledSysVar    = "dolt_transactions_disabled"
-	ForceTransactionCommit        = "dolt_force_transaction_commit"
-	CurrentBatchModeKey           = "batch_mode"
-	AllowCommitConflicts          = "dolt_allow_commit_conflicts"
-	ReplicateToRemote             = "dolt_replicate_to_remote"
-	ReadReplicaRemote             = "dolt_read_replica_remote"
-	ReadReplicaForcePull          = "dolt_read_replica_force_pull"
-	ReplicationRemoteURLTemplate  = "dolt_replication_remote_url_template"
-	SkipReplicationErrors         = "dolt_skip_replication_errors"
-	ReplicateHeads                = "dolt_replicate_heads"
-	ReplicateAllHeads             = "dolt_replicate_all_heads"
-	AsyncReplication              = "dolt_async_replication"
-	AwsCredsFile                  = "aws_credentials_file"
-	AwsCredsProfile               = "aws_credentials_profile"
-	AwsCredsRegion                = "aws_credentials_region"
-	ShowBranchDatabases           = "dolt_show_branch_databases"
+	DoltCommitOnTransactionCommit        = "dolt_transaction_commit"
+	DoltCommitOnTransactionCommitMessage = "dolt_transaction_commit_message"
+	TransactionsDisabledSysVar           = "dolt_transactions_disabled"
+	ForceTransactionCommit               = "dolt_force_transaction_commit"
+	CurrentBatchModeKey                  = "batch_mode"
+	DoltOverrideSchema                   = "dolt_override_schema"
+	AllowCommitConflicts                 = "dolt_allow_commit_conflicts"
+	ReplicateToRemote                    = "dolt_replicate_to_remote"
+	ReadReplicaRemote                    = "dolt_read_replica_remote"
+	ReadReplicaForcePull                 = "dolt_read_replica_force_pull"
+	ReplicationRemoteURLTemplate         = "dolt_replication_remote_url_template"
+	SkipReplicationErrors                = "dolt_skip_replication_errors"
+	ReplicateHeads                       = "dolt_replicate_heads"
+	ReplicateAllHeads                    = "dolt_replicate_all_heads"
+	AsyncReplication                     = "dolt_async_replication"
+	AwsCredsFile                         = "aws_credentials_file"
+	AwsCredsProfile                      = "aws_credentials_profile"
+	AwsCredsRegion                       = "aws_credentials_region"
+	ShowBranchDatabases                  = "dolt_show_branch_databases"
+	DoltLogLevel                         = "dolt_log_level"
+	ShowSystemTables                     = "dolt_show_system_tables"
+
+	DoltClusterRoleVariable         = "dolt_cluster_role"
+	DoltClusterRoleEpochVariable    = "dolt_cluster_role_epoch"
+	DoltClusterAckWritesTimeoutSecs = "dolt_cluster_ack_writes_timeout_secs"
+
+	DoltStatsAutoRefreshEnabled   = "dolt_stats_auto_refresh_enabled"
+	DoltStatsAutoRefreshThreshold = "dolt_stats_auto_refresh_threshold"
+	DoltStatsAutoRefreshInterval  = "dolt_stats_auto_refresh_interval"
+	DoltStatsMemoryOnly           = "dolt_stats_memory_only"
+	DoltStatsBranches             = "dolt_stats_branches"
 )
 
 const URLTemplateDatabasePlaceholder = "{database}"
 
 // DefineSystemVariablesForDB defines per database dolt-session variables in the engine as necessary
 func DefineSystemVariablesForDB(name string) {
+	name, _ = SplitRevisionDbName(name)
+
 	if _, _, ok := sql.SystemVariables.GetGlobal(name + HeadKeySuffix); !ok {
 		sql.SystemVariables.AddSystemVariables([]sql.SystemVariable{
-			{
+			&sql.MysqlSystemVariable{
 				Name:              HeadRefKey(name),
-				Scope:             sql.SystemVariableScope_Session,
+				Scope:             sql.GetMysqlScope(sql.SystemVariableScope_Session),
 				Dynamic:           true,
 				SetVarHintApplies: false,
 				Type:              types.NewSystemStringType(HeadRefKey(name)),
@@ -68,33 +84,33 @@ func DefineSystemVariablesForDB(name string) {
 			},
 			// The following variable are Dynamic, but read-only. Their values
 			// can only be updates by the system, not by users.
-			{
+			&sql.MysqlSystemVariable{
 				Name:              HeadKey(name),
-				Scope:             sql.SystemVariableScope_Session,
+				Scope:             sql.GetMysqlScope(sql.SystemVariableScope_Session),
 				Dynamic:           true,
 				SetVarHintApplies: false,
 				Type:              types.NewSystemStringType(HeadKey(name)),
 				Default:           "",
 			},
-			{
+			&sql.MysqlSystemVariable{
 				Name:              WorkingKey(name),
-				Scope:             sql.SystemVariableScope_Session,
+				Scope:             sql.GetMysqlScope(sql.SystemVariableScope_Session),
 				Dynamic:           true,
 				SetVarHintApplies: false,
 				Type:              types.NewSystemStringType(WorkingKey(name)),
 				Default:           "",
 			},
-			{
+			&sql.MysqlSystemVariable{
 				Name:              StagedKey(name),
-				Scope:             sql.SystemVariableScope_Session,
+				Scope:             sql.GetMysqlScope(sql.SystemVariableScope_Session),
 				Dynamic:           true,
 				SetVarHintApplies: false,
 				Type:              types.NewSystemStringType(StagedKey(name)),
 				Default:           "",
 			},
-			{
+			&sql.MysqlSystemVariable{
 				Name:              DefaultBranchKey(name),
-				Scope:             sql.SystemVariableScope_Global,
+				Scope:             sql.GetMysqlScope(sql.SystemVariableScope_Global),
 				Dynamic:           true,
 				SetVarHintApplies: false,
 				Type:              types.NewSystemStringType(DefaultBranchKey(name)),

@@ -123,7 +123,7 @@ func (ti *geometryType) ConvertValueToNomsValue(ctx context.Context, vrw types.V
 	}
 
 	// Convert accordingly
-	geom, err := ti.sqlGeometryType.Convert(v)
+	geom, _, err := ti.sqlGeometryType.Convert(v)
 	if err != nil {
 		return nil, err
 	}
@@ -319,5 +319,9 @@ func CreateGeometryTypeFromParams(params map[string]string) (TypeInfo, error) {
 		}
 	}
 
-	return &geometryType{sqlGeometryType: gmstypes.GeometryType{SRID: uint32(sridVal), DefinedSRID: def}}, nil
+	return CreateGeometryTypeFromSqlGeometryType(gmstypes.GeometryType{SRID: uint32(sridVal), DefinedSRID: def}), nil
+}
+
+func CreateGeometryTypeFromSqlGeometryType(sqlGeometryType gmstypes.GeometryType) TypeInfo {
+	return &geometryType{sqlGeometryType: sqlGeometryType}
 }

@@ -22,6 +22,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table"
@@ -69,13 +71,19 @@ func (dl FileDataLocation) String() string {
 }
 
 // Exists returns true if the DataLocation already exists
-func (dl FileDataLocation) Exists(ctx context.Context, root *doltdb.RootValue, fs filesys.ReadableFS) (bool, error) {
+func (dl FileDataLocation) Exists(ctx context.Context, root doltdb.RootValue, fs filesys.ReadableFS) (bool, error) {
 	exists, _ := fs.Exists(dl.Path)
 	return exists, nil
 }
 
 // NewReader creates a TableReadCloser for the DataLocation
-func (dl FileDataLocation) NewReader(ctx context.Context, root *doltdb.RootValue, fs filesys.ReadableFS, opts interface{}) (rdCl table.SqlRowReader, sorted bool, err error) {
+func (dl FileDataLocation) NewReader(ctx context.Context, dEnv *env.DoltEnv, opts interface{}) (rdCl table.SqlRowReader, sorted bool, err error) {
+	fs := dEnv.FS
+	root, err := dEnv.WorkingRoot(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
 	exists, isDir := fs.Exists(dl.Path)
 
 	if !exists {
@@ -113,7 +121,7 @@ func (dl FileDataLocation) NewReader(ctx context.Context, root *doltdb.RootValue
 		var sch schema.Schema
 		jsonOpts, _ := opts.(JSONOptions)
 		if jsonOpts.SchFile != "" {
-			tn, s, err := SchAndTableNameFromFile(ctx, jsonOpts.SchFile, fs, root)
+			tn, s, err := SchAndTableNameFromFile(ctx, jsonOpts.SchFile, dEnv)
 			if err != nil {
 				return nil, false, err
 			}
@@ -125,16 +133,16 @@ func (dl FileDataLocation) NewReader(ctx context.Context, root *doltdb.RootValue
 			if opts == nil {
 				return nil, false, errors.New("Unable to determine table name on JSON import")
 			}
-			tbl, exists, err := root.GetTable(context.TODO(), jsonOpts.TableName)
+			tbl, exists, err := root.GetTable(context.TODO(), doltdb.TableName{Name: jsonOpts.TableName})
 			if !exists {
-				return nil, false, errors.New(fmt.Sprintf("The following table could not be found:\n%v", jsonOpts.TableName))
+				return nil, false, fmt.Errorf("The following table could not be found:\n%v", jsonOpts.TableName)
 			}
 			if err != nil {
-				return nil, false, errors.New(fmt.Sprintf("An error occurred attempting to read the table:\n%v", err.Error()))
+				return nil, false, fmt.Errorf("An error occurred attempting to read the table:\n%v", err.Error())
 			}
 			sch, err = tbl.GetSchema(context.TODO())
 			if err != nil {
-				return nil, false, errors.New(fmt.Sprintf("An error occurred attempting to read the table schema:\n%v", err.Error()))
+				return nil, false, fmt.Errorf("An error occurred attempting to read the table schema:\n%v", err.Error())
 			}
 		}
 
@@ -145,7 +153,7 @@ func (dl FileDataLocation) NewReader(ctx context.Context, root *doltdb.RootValue
 		var tableSch schema.Schema
 		parquetOpts, _ := opts.(ParquetOptions)
 		if parquetOpts.SchFile != "" {
-			tn, s, tnErr := SchAndTableNameFromFile(ctx, parquetOpts.SchFile, fs, root)
+			tn, s, tnErr := SchAndTableNameFromFile(ctx, parquetOpts.SchFile, dEnv)
 			if tnErr != nil {
 				return nil, false, tnErr
 			}
@@ -157,16 +165,16 @@ func (dl FileDataLocation) NewReader(ctx context.Context, root *doltdb.RootValue
 			if opts == nil {
 				return nil, false, errors.New("Unable to determine table name on JSON import")
 			}
-			tbl, tableExists, tErr := root.GetTable(context.TODO(), parquetOpts.TableName)
+			tbl, tableExists, tErr := root.GetTable(context.TODO(), doltdb.TableName{Name: parquetOpts.TableName})
 			if !tableExists {
-				return nil, false, errors.New(fmt.Sprintf("The following table could not be found:\n%v", parquetOpts.TableName))
+				return nil, false, fmt.Errorf("The following table could not be found:\n%v", parquetOpts.TableName)
 			}
 			if tErr != nil {
-				return nil, false, errors.New(fmt.Sprintf("An error occurred attempting to read the table:\n%v", err.Error()))
+				return nil, false, fmt.Errorf("An error occurred attempting to read the table:\n%v", err.Error())
 			}
 			tableSch, err = tbl.GetSchema(context.TODO())
 			if err != nil {
-				return nil, false, errors.New(fmt.Sprintf("An error occurred attempting to read the table schema:\n%v", err.Error()))
+				return nil, false, fmt.Errorf("An error occurred attempting to read the table schema:\n%v", err.Error())
 			}
 		}
 		rd, rErr := parquet.OpenParquetReader(root.VRW(), dl.Path, tableSch)
@@ -178,7 +186,7 @@ func (dl FileDataLocation) NewReader(ctx context.Context, root *doltdb.RootValue
 
 // NewCreatingWriter will create a TableWriteCloser for a DataLocation that will create a new table, or overwrite
 // an existing table.
-func (dl FileDataLocation) NewCreatingWriter(ctx context.Context, mvOpts DataMoverOptions, root *doltdb.RootValue, outSch schema.Schema, opts editor.Options, wr io.WriteCloser) (table.SqlRowWriter, error) {
+func (dl FileDataLocation) NewCreatingWriter(ctx context.Context, mvOpts DataMoverOptions, root doltdb.RootValue, outSch schema.Schema, opts editor.Options, wr io.WriteCloser) (table.SqlRowWriter, error) {
 	switch dl.Format {
 	case CsvFile:
 		return csv.NewCSVWriter(wr, outSch, csv.NewCSVInfo())
@@ -195,7 +203,7 @@ func (dl FileDataLocation) NewCreatingWriter(ctx context.Context, mvOpts DataMov
 			return sqlexport.OpenSQLExportWriter(ctx, wr, root, mvOpts.SrcName(), mvOpts.IsAutocommitOff(), outSch, opts)
 		}
 	case ParquetFile:
-		return parquet.NewParquetWriter(outSch, mvOpts.DestName())
+		return parquet.NewParquetRowWriterForFile(outSch, mvOpts.DestName())
 	}
 
 	panic("Invalid Data Format." + string(dl.Format))

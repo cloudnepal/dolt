@@ -16,18 +16,24 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"time"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/gocraft/dbr/v2"
+	"github.com/gocraft/dbr/v2/dialect"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
 	eventsapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/eventsapi/v1alpha1"
-	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
-	"github.com/dolthub/dolt/go/libraries/doltcore/merge"
-	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dprocedures"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
-	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/store/util/outputpager"
 )
 
 var pullDocs = cli.CommandDocumentationContent{
@@ -68,157 +74,263 @@ func (cmd PullCmd) EventType() eventsapi.ClientEventType {
 }
 
 // Exec executes the command
-func (cmd PullCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd PullCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cli.CreatePullArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, pullDocs, ap))
-
 	apr := cli.ParseArgsOrDie(ap, args, help)
 
 	if apr.NArg() > 2 {
 		verr := errhand.VerboseErrorFromError(actions.ErrInvalidPullArgs)
 		return HandleVErrAndExitCode(verr, usage)
 	}
-
-	var remoteName, remoteRefName string
-	if apr.NArg() == 1 {
-		remoteName = apr.Arg(0)
-	} else if apr.NArg() == 2 {
-		remoteName = apr.Arg(0)
-		remoteRefName = apr.Arg(1)
+	if apr.ContainsAll(cli.CommitFlag, cli.NoCommitFlag) {
+		verr := errhand.VerboseErrorFromError(errors.New(fmt.Sprintf(ErrConflictingFlags, cli.CommitFlag, cli.NoCommitFlag)))
+		return HandleVErrAndExitCode(verr, usage)
+	}
+	if apr.ContainsAll(cli.SquashParam, cli.NoFFParam) {
+		verr := errhand.VerboseErrorFromError(errors.New(fmt.Sprintf(ErrConflictingFlags, cli.SquashParam, cli.NoFFParam)))
+		return HandleVErrAndExitCode(verr, usage)
+	}
+	// This command may create a commit, so we need user identity
+	if !cli.CheckUserNameAndEmail(cliCtx.Config()) {
+		bdr := errhand.BuildDError("Could not determine name and/or email.")
+		bdr.AddDetails("Log into DoltHub: dolt login")
+		bdr.AddDetails("OR add name to config: dolt config [--global|--local] --add %[1]s \"FIRST LAST\"", config.UserNameKey)
+		bdr.AddDetails("OR add email to config: dolt config [--global|--local] --add %[1]s \"EMAIL_ADDRESS\"", config.UserEmailKey)
+		return HandleVErrAndExitCode(bdr.Build(), usage)
 	}
 
-	if dEnv.IsLocked() {
-		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(env.ErrActiveServerLock.New(dEnv.LockFile())), help)
+	queryist, sqlCtx, closeFunc, err := cliCtx.QueryEngine(ctx)
+	if err != nil {
+		cli.Println(err.Error())
+		return 1
+	}
+	if closeFunc != nil {
+		defer closeFunc()
 	}
 
-	pullSpec, err := env.NewPullSpec(ctx, dEnv.RepoStateReader(), remoteName, remoteRefName, apr.Contains(cli.SquashParam), apr.Contains(cli.NoFFParam), apr.Contains(cli.NoCommitFlag), apr.Contains(cli.NoEditFlag), apr.Contains(cli.ForceFlag), apr.NArg() == 1)
+	query, err := constructInterpolatedDoltPullQuery(apr)
 	if err != nil {
 		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
 	}
 
-	err = pullHelper(ctx, dEnv, pullSpec)
-	if err != nil {
-		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
+	errChan := make(chan error)
+	go func() {
+		defer close(errChan)
+		// allows pulls (merges) that create conflicts to stick
+		_, _, err = queryist.Query(sqlCtx, "set @@dolt_force_transaction_commit = 1")
+		if err != nil {
+			errChan <- err
+			return
+		}
+		// save current head for diff summaries after pull
+		headHash, err := getHashOf(queryist, sqlCtx, "HEAD")
+		if err != nil {
+			cli.Println("failed to get hash of HEAD, pull not started")
+			errChan <- err
+		}
+
+		_, rowIter, err := queryist.Query(sqlCtx, query)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		// if merge is called with '--no-commit', we need to commit the sql transaction or the staged changes will be lost
+		_, _, err = queryist.Query(sqlCtx, "COMMIT")
+		if err != nil {
+			errChan <- err
+			return
+		}
+		rows, err := sql.RowIterToRows(sqlCtx, rowIter)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		if len(rows) != 1 {
+			err = fmt.Errorf("Runtime error: merge operation returned unexpected number of rows: %d", len(rows))
+			errChan <- err
+			return
+		}
+		row := rows[0]
+
+		remoteHash, remoteRef, err := getRemoteHashForPull(apr, sqlCtx, queryist)
+		if err != nil {
+			cli.Println("pull finished, but failed to get hash of remote ref")
+			cli.Println(err.Error())
+		}
+
+		if apr.Contains(cli.ForceFlag) {
+			if remoteHash != "" && headHash != "" {
+				cli.Println("Updating", headHash+".."+remoteHash)
+			}
+			commit, err := getCommitInfo(queryist, sqlCtx, "HEAD")
+			if err != nil {
+				cli.Println("pull finished, but failed to get commit info")
+				cli.Println(err.Error())
+				return
+			}
+			if cli.ExecuteWithStdioRestored != nil {
+				cli.ExecuteWithStdioRestored(func() {
+					pager := outputpager.Start()
+					defer pager.Stop()
+
+					PrintCommitInfo(pager, 0, false, "auto", commit)
+				})
+			}
+		} else {
+			fastFwd := getFastforward(row, dprocedures.PullProcFFIndex)
+
+			var success int
+			if apr.Contains(cli.NoCommitFlag) {
+				success = printMergeStats(fastFwd, apr, queryist, sqlCtx, usage, headHash, remoteHash, "HEAD", "STAGED")
+			} else {
+				success = printMergeStats(fastFwd, apr, queryist, sqlCtx, usage, headHash, remoteHash, "HEAD", remoteRef)
+			}
+			if success == 1 {
+				errChan <- errors.New(" ") //return a non-nil error for the correct exit code but no further messages to print
+				return
+			}
+		}
+	}()
+
+	spinner := TextSpinner{}
+	if !apr.Contains(cli.SilentFlag) {
+		cli.Print(spinner.next() + " Pulling...")
+		defer func() {
+			cli.DeleteAndPrint(len(" Pulling...")+1, "")
+		}()
 	}
-	return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
+
+	for {
+		select {
+		case err := <-errChan:
+			return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
+		case <-ctx.Done():
+			if ctx.Err() != nil {
+				switch ctx.Err() {
+				case context.DeadlineExceeded:
+					return HandleVErrAndExitCode(errhand.VerboseErrorFromError(errors.New("timeout exceeded")), usage)
+				case context.Canceled:
+					return HandleVErrAndExitCode(errhand.VerboseErrorFromError(errors.New("pull cancelled by force")), usage)
+				default:
+					return HandleVErrAndExitCode(errhand.VerboseErrorFromError(errors.New("error cancelling context: "+ctx.Err().Error())), usage)
+				}
+			}
+			return HandleVErrAndExitCode(nil, usage)
+		case <-time.After(time.Millisecond * 50):
+			if !apr.Contains(cli.SilentFlag) {
+				cli.DeleteAndPrint(len(" Pulling...")+1, spinner.next()+" Pulling...")
+			}
+		}
+	}
 }
 
-// pullHelper splits pull into fetch, prepare merge, and merge to interleave printing
-func pullHelper(ctx context.Context, dEnv *env.DoltEnv, pullSpec *env.PullSpec) error {
-	srcDB, err := pullSpec.Remote.GetRemoteDBWithoutCaching(ctx, dEnv.DoltDB.ValueReadWriter().Format(), dEnv)
+// constructInterpolatedDoltPullQuery constructs the sql query necessary to call the DOLT_PULL() function.
+// Also interpolates this query to prevent sql injection.
+func constructInterpolatedDoltPullQuery(apr *argparser.ArgParseResults) (string, error) {
+	var params []interface{}
+	var args []string
+
+	for _, arg := range apr.Args {
+		args = append(args, "?")
+		params = append(params, arg)
+	}
+
+	if apr.Contains(cli.SquashParam) {
+		args = append(args, "'--squash'")
+	}
+	if apr.Contains(cli.NoFFParam) {
+		args = append(args, "'--no-ff'")
+	}
+	if apr.Contains(cli.ForceFlag) {
+		args = append(args, "'--force'")
+	}
+	if apr.Contains(cli.CommitFlag) {
+		args = append(args, "'--commit'")
+	}
+	if apr.Contains(cli.NoCommitFlag) {
+		args = append(args, "'--no-commit'")
+	}
+	if apr.Contains(cli.NoEditFlag) {
+		args = append(args, "'--no-edit'")
+	}
+	if user, hasUser := apr.GetValue(cli.UserFlag); hasUser {
+		args = append(args, "'--user'")
+		args = append(args, "?")
+		params = append(params, user)
+	}
+
+	query := "call dolt_pull(" + strings.Join(args, ", ") + ")"
+
+	interpolatedQuery, err := dbr.InterpolateForDialect(query, params, dialect.MySQL)
 	if err != nil {
-		return fmt.Errorf("failed to get remote db; %w", err)
+		return "", err
 	}
 
-	// Fetch all references
-	branchRefs, err := srcDB.GetHeadRefs(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: %s", env.ErrFailedToReadDb, err.Error())
-	}
+	return interpolatedQuery, nil
+}
 
-	_, hasBranch, err := srcDB.HasBranch(ctx, pullSpec.Branch.GetPath())
-	if err != nil {
-		return err
-	}
-	if !hasBranch {
-		return fmt.Errorf("branch %q not found on remote", pullSpec.Branch.GetPath())
-	}
+// getRemoteHashForPull gets the hash of the remote branch being merged in and the ref to the remote head
+func getRemoteHashForPull(apr *argparser.ArgParseResults, sqlCtx *sql.Context, queryist cli.Queryist) (remoteHash, remoteRef string, err error) {
+	var remote, branch string
 
-	// Go through every reference and every branch in each reference
-	for _, rs := range pullSpec.RefSpecs {
-		rsSeen := false // track invalid refSpecs
-		for _, branchRef := range branchRefs {
-			remoteTrackRef := rs.DestRef(branchRef)
-			if remoteTrackRef == nil {
-				continue
-			}
-
-			rsSeen = true
-			tmpDir, err := dEnv.TempTableFilesDir()
+	if apr.NArg() < 2 {
+		if apr.NArg() == 0 {
+			remote, err = getDefaultRemote(sqlCtx, queryist)
 			if err != nil {
-				return err
+				return "", "", err
 			}
-			srcDBCommit, err := actions.FetchRemoteBranch(ctx, tmpDir, pullSpec.Remote, srcDB, dEnv.DoltDB, branchRef, buildProgStarter(downloadLanguage), stopProgFuncs)
-			if err != nil {
-				return err
-			}
+		} else {
+			remote = apr.Args[0]
+		}
 
-			err = dEnv.DoltDB.FastForward(ctx, remoteTrackRef, srcDBCommit)
-			if err != nil {
-				return fmt.Errorf("fetch failed; %w", err)
-			}
-
-			// Merge iff branch is current branch and there is an upstream set (pullSpec.Branch is set to nil if there is no upstream)
-			if branchRef != pullSpec.Branch {
-				continue
-			}
-
-			t := datas.CommitNowFunc()
-
-			roots, err := dEnv.Roots(ctx)
-			if err != nil {
-				return err
-			}
-
-			name, email, configErr := env.GetNameAndEmail(dEnv.Config)
-			// If the name and email aren't set we can set them to empty values for now. This is only valid for ff
-			// merges which detect for later.
-			if configErr != nil {
-				if pullSpec.Noff {
-					return configErr
-				}
-				name, email = "", ""
-			}
-
-			// Begin merge
-			mergeSpec, err := merge.NewMergeSpec(ctx, dEnv.RepoStateReader(), dEnv.DoltDB, roots, name, email, pullSpec.Msg, remoteTrackRef.String(), pullSpec.Squash, pullSpec.Noff, pullSpec.Force, pullSpec.NoCommit, pullSpec.NoEdit, t)
-			if err != nil {
-				return err
-			}
-			if mergeSpec == nil {
-				return nil
-			}
-
-			// If configurations are not set and a ff merge are not possible throw an error.
-			if configErr != nil {
-				canFF, err := mergeSpec.HeadC.CanFastForwardTo(ctx, mergeSpec.MergeC)
-				if err != nil && err != doltdb.ErrUpToDate {
-					return err
-				}
-
-				if !canFF {
-					return configErr
-				}
-			}
-
-			err = validateMergeSpec(ctx, mergeSpec)
-			if err != nil {
-				return err
-			}
-
-			suggestedMsg := fmt.Sprintf("Merge branch '%s' of %s into %s", pullSpec.Branch.GetPath(), pullSpec.Remote.Url, dEnv.RepoStateReader().CWBHeadRef().GetPath())
-			tblStats, err := performMerge(ctx, dEnv, mergeSpec, suggestedMsg)
-			printSuccessStats(tblStats)
-			if err != nil {
-				return err
+		rows, err := GetRowsForSql(queryist, sqlCtx, "select name from dolt_remote_branches")
+		if err != nil {
+			return "", "", err
+		}
+		for _, row := range rows {
+			ref := row[0].(string)
+			if ref == "remotes/"+remote+"/main" {
+				branch = "main"
+				break
 			}
 		}
-		if !rsSeen {
-			return fmt.Errorf("%w: '%s'", ref.ErrInvalidRefSpec, rs.GetRemRefToLocal())
+		if branch == "" {
+			ref := rows[0][0].(string)
+			branch = strings.TrimPrefix(ref, "remotes/"+remote+"/")
+		}
+	} else {
+		remote = apr.Args[0]
+		branch = apr.Args[1]
+	}
+
+	if remote == "" || branch == "" {
+		return "", "", errors.New("pull finished successfully but remote and/or branch provided is empty")
+	}
+
+	remoteHash, err = getHashOf(queryist, sqlCtx, remote+"/"+branch)
+	if err != nil {
+		return "", "", err
+	}
+	return remoteHash, remote + "/" + branch, nil
+}
+
+// getDefaultRemote gets the name of the default remote.
+func getDefaultRemote(sqlCtx *sql.Context, queryist cli.Queryist) (string, error) {
+	rows, err := GetRowsForSql(queryist, sqlCtx, "select name from dolt_remotes")
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", env.ErrNoRemote
+	}
+	if len(rows) == 1 {
+		return rows[0][0].(string), nil
+	}
+	for _, row := range rows {
+		if row[0].(string) == "origin" {
+			return "origin", nil
 		}
 	}
-
-	if err != nil {
-		return err
-	}
-	tmpDir, err := dEnv.TempTableFilesDir()
-	if err != nil {
-		return err
-	}
-	err = actions.FetchFollowTags(ctx, tmpDir, srcDB, dEnv.DoltDB, buildProgStarter(downloadLanguage), stopProgFuncs)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return rows[0][0].(string), nil
 }

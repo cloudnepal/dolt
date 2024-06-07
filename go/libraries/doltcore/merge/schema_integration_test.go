@@ -16,9 +16,9 @@ package merge_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 
+	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -39,9 +39,10 @@ type testCommand struct {
 	args args
 }
 
-func (tc testCommand) exec(t *testing.T, ctx context.Context, dEnv *env.DoltEnv) {
-	exitCode := tc.cmd.Exec(ctx, tc.cmd.Name(), tc.args, dEnv)
-	require.Equal(t, 0, exitCode)
+func (tc testCommand) exec(t *testing.T, ctx context.Context, dEnv *env.DoltEnv) int {
+	cliCtx, err := commands.NewArgFreeCliContext(ctx, dEnv)
+	require.NoError(t, err)
+	return tc.cmd.Exec(ctx, tc.cmd.Name(), tc.args, dEnv, cliCtx)
 }
 
 type args []string
@@ -133,7 +134,6 @@ var mergeSchemaTests = []mergeSchemaTest{
 				newColTypeInfo("c9", uint64(4508), typeinfo.Int32Type, false)),
 			schema.NewIndex("c1_idx", []uint64{8201}, []uint64{8201, 3228}, nil, schema.IndexProperties{IsUserDefined: true}),
 		),
-		skip: true,
 	},
 	{
 		name: "add constraint, drop constraint, merge",
@@ -155,7 +155,6 @@ var mergeSchemaTests = []mergeSchemaTest{
 				newColTypeInfo("c3", uint64(4696), typeinfo.Int32Type, false)),
 			schema.NewIndex("c1_idx", []uint64{8201}, []uint64{8201, 3228}, nil, schema.IndexProperties{IsUserDefined: true}),
 		),
-		skip: true,
 	},
 	{
 		name: "add index, drop index, merge",
@@ -199,7 +198,6 @@ var mergeSchemaTests = []mergeSchemaTest{
 				newColTypeInfo("c33", uint64(4696), typeinfo.Int32Type, false)),
 			schema.NewIndex("c1_idx", []uint64{8201}, []uint64{8201, 3228}, nil, schema.IndexProperties{IsUserDefined: true}),
 		),
-		skip: true,
 	},
 	{
 		name: "rename indexes",
@@ -290,13 +288,13 @@ var mergeSchemaConflictTests = []mergeSchemaConflictTest{
 			ColConflicts: []merge.ColConflict{
 				{
 					Kind:   merge.NameCollision,
-					Ours:   newColTypeInfo("c4", uint64(4696), typeinfo.Int32Type, false),
-					Theirs: newColTypeInfo("c4", uint64(8539), typeinfo.Int32Type, false),
+					Ours:   newColTypeInfo("C6", uint64(13258), typeinfo.Int32Type, false),
+					Theirs: newColTypeInfo("c6", uint64(13258), typeinfo.Int32Type, false),
 				},
 				{
 					Kind:   merge.NameCollision,
-					Ours:   newColTypeInfo("C6", uint64(13258), typeinfo.Int32Type, false),
-					Theirs: newColTypeInfo("c6", uint64(13258), typeinfo.Int32Type, false),
+					Ours:   newColTypeInfo("c4", uint64(4696), typeinfo.Int32Type, false),
+					Theirs: newColTypeInfo("c4", uint64(8539), typeinfo.Int32Type, false),
 				},
 			},
 		},
@@ -458,7 +456,7 @@ var mergeSchemaConflictTests = []mergeSchemaConflictTest{
 			{commands.CommitCmd{}, []string{"-m", "modified branch other"}},
 			{commands.CheckoutCmd{}, []string{env.DefaultInitBranch}},
 		},
-		expectedErr: merge.ErrMergeWithDifferentPks,
+		expectedErr: merge.ErrMergeWithDifferentPks.New("test"),
 	},
 }
 
@@ -558,26 +556,31 @@ func testMergeSchemas(t *testing.T, test mergeSchemaTest) {
 	}
 
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 	ctx := context.Background()
 
+	cliCtx, _ := commands.NewArgFreeCliContext(ctx, dEnv)
+
 	for _, c := range setupCommon {
-		c.exec(t, ctx, dEnv)
+		exit := c.exec(t, ctx, dEnv)
+		require.Equal(t, 0, exit)
 	}
 	for _, c := range test.setup {
-		c.exec(t, ctx, dEnv)
+		exit := c.exec(t, ctx, dEnv)
+		require.Equal(t, 0, exit)
 	}
 
 	// assert that we're on main
-	exitCode := commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{env.DefaultInitBranch}, dEnv)
+	exitCode := commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{env.DefaultInitBranch}, dEnv, cliCtx)
 	require.Equal(t, 0, exitCode)
 
 	// merge branches
-	exitCode = commands.MergeCmd{}.Exec(ctx, "merge", []string{"other"}, dEnv)
+	exitCode = commands.MergeCmd{}.Exec(ctx, "merge", []string{"other"}, dEnv, cliCtx)
 	assert.Equal(t, 0, exitCode)
 
 	wr, err := dEnv.WorkingRoot(ctx)
 	assert.NoError(t, err)
-	tbl, ok, err := wr.GetTable(ctx, "test")
+	tbl, ok, err := wr.GetTable(ctx, doltdb.TableName{Name: "test"})
 	assert.True(t, ok)
 	require.NoError(t, err)
 	sch, err := tbl.GetSchema(ctx)
@@ -592,7 +595,7 @@ func testMergeSchemasWithConflicts(t *testing.T, test mergeSchemaConflictTest) {
 		ctx := context.Background()
 		wr, err := dEnv.WorkingRoot(ctx)
 		assert.NoError(t, err)
-		tbl, ok, err := wr.GetTable(ctx, "test")
+		tbl, ok, err := wr.GetTable(ctx, doltdb.TableName{Name: "test"})
 		assert.True(t, ok)
 		require.NoError(t, err)
 		sch, err := tbl.GetSchema(ctx)
@@ -601,31 +604,38 @@ func testMergeSchemasWithConflicts(t *testing.T, test mergeSchemaConflictTest) {
 	}
 
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 	ctx := context.Background()
 	for _, c := range setupCommon {
-		c.exec(t, ctx, dEnv)
+		exit := c.exec(t, ctx, dEnv)
+		require.Equal(t, 0, exit)
 	}
 
 	ancSch := getSchema(t, dEnv)
 
 	for _, c := range test.setup {
-		c.exec(t, ctx, dEnv)
+		exit := c.exec(t, ctx, dEnv)
+		require.Equal(t, 0, exit)
 	}
 
+	cliCtx, _ := commands.NewArgFreeCliContext(ctx, dEnv)
+
 	// assert that we're on main
-	exitCode := commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{env.DefaultInitBranch}, dEnv)
+	exitCode := commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{env.DefaultInitBranch}, dEnv, cliCtx)
 	require.Equal(t, 0, exitCode)
 
 	mainSch := getSchema(t, dEnv)
 
-	exitCode = commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{"other"}, dEnv)
+	exitCode = commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{"other"}, dEnv, cliCtx)
 	require.Equal(t, 0, exitCode)
 
 	otherSch := getSchema(t, dEnv)
 
-	_, actConflicts, err := merge.SchemaMerge(context.Background(), types.Format_Default, mainSch, otherSch, ancSch, "test")
+	_, actConflicts, mergeInfo, _, err := merge.SchemaMerge(context.Background(), types.Format_Default, mainSch, otherSch, ancSch, "test")
+	assert.False(t, mergeInfo.InvalidateSecondaryIndexes)
 	if test.expectedErr != nil {
-		assert.True(t, errors.Is(err, test.expectedErr))
+		// We don't use errors.Is here because errors generated by `Kind.New` compare stack traces in their `Is` implementation.
+		assert.Equal(t, err.Error(), test.expectedErr.Error(), "Expected error '%s', instead got '%s'", test.expectedErr.Error(), err.Error())
 		return
 	}
 
@@ -655,27 +665,32 @@ func testMergeSchemasWithConflicts(t *testing.T, test mergeSchemaConflictTest) {
 
 func testMergeForeignKeys(t *testing.T, test mergeForeignKeyTest) {
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 	ctx := context.Background()
 	for _, c := range setupForeignKeyTests {
-		c.exec(t, ctx, dEnv)
+		exit := c.exec(t, ctx, dEnv)
+		require.Equal(t, 0, exit)
 	}
 
 	ancRoot, err := dEnv.WorkingRoot(ctx)
 	require.NoError(t, err)
 
 	for _, c := range test.setup {
-		c.exec(t, ctx, dEnv)
+		exit := c.exec(t, ctx, dEnv)
+		require.Equal(t, 0, exit)
 	}
 
+	cliCtx, _ := commands.NewArgFreeCliContext(ctx, dEnv)
+
 	// assert that we're on main
-	exitCode := commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{env.DefaultInitBranch}, dEnv)
+	exitCode := commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{env.DefaultInitBranch}, dEnv, cliCtx)
 	require.Equal(t, 0, exitCode)
 
 	mainWS, err := dEnv.WorkingSet(ctx)
 	require.NoError(t, err)
 	mainRoot := mainWS.WorkingRoot()
 
-	exitCode = commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{"other"}, dEnv)
+	exitCode = commands.CheckoutCmd{}.Exec(ctx, "checkout", []string{"other"}, dEnv, cliCtx)
 	require.Equal(t, 0, exitCode)
 
 	otherWS, err := dEnv.WorkingSet(ctx)
@@ -684,10 +699,10 @@ func testMergeForeignKeys(t *testing.T, test mergeForeignKeyTest) {
 
 	opts := editor.TestEditorOptions(dEnv.DoltDB.ValueReadWriter())
 	mo := merge.MergeOpts{IsCherryPick: false}
-	mergedRoot, _, err := merge.MergeRoots(ctx, mainRoot, otherRoot, ancRoot, mainWS, otherWS, opts, mo)
+	result, err := merge.MergeRoots(sql.NewContext(ctx), mainRoot, otherRoot, ancRoot, mainWS, otherWS, opts, mo)
 	assert.NoError(t, err)
 
-	fkc, err := mergedRoot.GetForeignKeyCollection(ctx)
+	fkc, err := result.Root.GetForeignKeyCollection(ctx)
 	assert.NoError(t, err)
 	assert.Equal(t, test.fkColl.Count(), fkc.Count())
 

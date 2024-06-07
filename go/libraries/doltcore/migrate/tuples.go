@@ -175,6 +175,9 @@ func translateNomsField(ctx context.Context, ns tree.NodeStore, value types.Valu
 	case types.BlobKind:
 		return translateBlobField(ctx, ns, value.(types.Blob), idx, b)
 
+	case types.ExtendedKind:
+		return fmt.Errorf("extended types are invalid during migration")
+
 	default:
 		return fmt.Errorf("encountered unexpected NomsKind %s",
 			types.KindToString[nk])
@@ -244,6 +247,8 @@ func translateStringField(ctx context.Context, ns tree.NodeStore, value types.St
 		// note: previously, TEXT fields were serialized as types.String
 		rd := strings.NewReader(string(value))
 		bb := ns.BlobBuilder()
+		defer ns.PutBlobBuilder(bb)
+
 		bb.Init(len(value))
 		_, addr, err := bb.Chunk(ctx, rd)
 		if err != nil {
@@ -313,6 +318,8 @@ func translateJSONField(ctx context.Context, ns tree.NodeStore, value types.JSON
 	buf := bytes.NewBuffer([]byte(s))
 
 	bb := ns.BlobBuilder()
+	defer ns.PutBlobBuilder(bb)
+
 	bb.Init(len(s))
 	_, addr, err := bb.Chunk(ctx, buf)
 	if err != nil {
@@ -331,7 +338,7 @@ func translateBlobField(ctx context.Context, ns tree.NodeStore, value types.Blob
 	case val.StringAddrEnc, val.BytesAddrEnc:
 		// common case
 	default:
-		return fmt.Errorf("unexpecte encoding for blob (%d)", b.Desc.Types[idx].Enc)
+		return fmt.Errorf("unexpected encoding for blob (%d)", b.Desc.Types[idx].Enc)
 	}
 
 	buf := make([]byte, value.Len())
@@ -343,6 +350,8 @@ func translateBlobField(ctx context.Context, ns tree.NodeStore, value types.Blob
 	}
 
 	bb := ns.BlobBuilder()
+	defer ns.PutBlobBuilder(bb)
+
 	bb.Init(int(value.Len()))
 	_, addr, err := bb.Chunk(ctx, bytes.NewReader(buf))
 	if err != nil {

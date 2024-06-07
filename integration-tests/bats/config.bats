@@ -15,6 +15,14 @@ teardown() {
     stop_sql_server
 }
 
+function no_stderr {
+    "$@" 2>/dev/null
+}
+
+function no_stdout {
+    "$@" 1>/dev/null
+}
+
 @test "config: make sure no dolt configuration for simulated fresh user" {
     run dolt config --list
     [ "$status" -eq 0 ]
@@ -31,19 +39,64 @@ teardown() {
     [[ "$output" =~ "$email" ]] || false
 }
 
+@test "config: cannot set nonsense variables" {
+    run dolt config --add foo bar
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "error: invalid config option" ]] || false
+
+    run dolt config --set foo bar
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "error: invalid config option" ]] || false
+}
+
+@test "config: can unset nonsense variables" {
+    dolt config --global --add user.name steph  # need to create config_global.json first
+    echo '{"foo":"bar"}' > $DOLT_ROOT_PATH/.dolt/config_global.json
+    run dolt config --global --list
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "foo = bar" ]] || false
+
+    run dolt config --global --unset foo
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Config successfully updated" ]] || false
+}
+
+@test "config: warning on cli commands if config has nonsense variables" {
+    dolt config --global --add user.name steph  # need to create config_global.json first
+    echo '{"global":"foo"}' > $DOLT_ROOT_PATH/.dolt/config_global.json
+    run no_stdout dolt version
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Warning: Unknown global config option 'global'. Use \`dolt config --global --unset global\` to remove." ]] || false
+
+    # warning prints to stderr
+    run no_stderr dolt version
+    [ "$status" -eq 0 ]
+    ! [[ "$output" =~ "Warning: Unknown global config option 'global'. Use \`dolt config --global --unset global\` to remove." ]] || false
+
+    dolt config --global --add user.email "you@example.com"
+    dolt config --global --add user.name "Your Name"
+    dolt init
+
+    dolt config --local --add user.name steph  # need to create config.json first
+    echo '{"local":"bar"}' > .dolt/config.json
+    run no_stdout dolt config --list
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Warning: Unknown global config option 'global'. Use \`dolt config --global --unset global\` to remove." ]] || false
+    [[ "$output" =~ "Warning: Unknown local config option 'local'. Use \`dolt config --local --unset local\` to remove." ]] || false
+}
+
 @test "config: set a global config variable" {
-    run dolt config --global --add test test
+    run dolt config --global --add user.name steph
     [ "$status" -eq 0 ]
     # Need to make this a regex because of the coloring
     [[ "$output" =~ "Config successfully updated" ]] || false
-    [ -f `nativepath ~/.dolt/config_global.json` ]
     run dolt config --list
     [ "$status" -eq 0 ]
-    [ "$output" = "test = test" ]
-    run dolt config --get test
+    [ "$output" = "user.name = steph" ]
+    run dolt config --get user.name
     [ "$status" -eq 0 ]
-    [ "$output" = "test" ]
-    run dolt config --global --add test
+    [ "$output" = "steph" ]
+    run dolt config --global --add user.email
     [ "$status" -eq 1 ]
     [[ "$output" =~ "wrong number of arguments" ]] || false
     run dolt config --global --add
@@ -52,28 +105,28 @@ teardown() {
 }
 
 @test "config: delete a config variable" {
-    dolt config --global --add test test
-    run dolt config --global --unset test
+    dolt config --global --add user.name steph
+    run dolt config --global --unset user.name
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Config successfully updated" ]] || false
     run dolt config --list
     [ "$status" -eq 0 ]
     [ "$output" = "" ]
-    run dolt config --get test
+    run dolt config --get user.name
     [ "$status" -eq 1 ]
     [ "$output" = "" ]
 }
 
 @test "config: set and delete multiple config variables" {
-    dolt config --global --add test1 test1
-    dolt config --global --add test2 test2
-    dolt config --global --add test3 test3
+    dolt config --global --add user.name steph
+    dolt config --global --add user.email steph@dolthub.com
+    dolt config --global --add metrics.disabled true
     run dolt config --list
     [ "$status" -eq 0 ]
     [ "${#lines[@]}" -eq 3 ]
-    run dolt config --global --unset test1 test2 test3
+    run dolt config --global --unset user.name user.email metrics.disabled
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "Config successfully updated" ]]
+    [[ "$output" =~ "Config successfully updated" ]] || false
     run dolt config --list
     [ "$status" -eq 0 ]
     [ "$output" = "" ]
@@ -94,65 +147,65 @@ teardown() {
     dolt config --global --set user.name "tester"
     dolt config --global --set user.email "tester@liquidata.co"
     dolt init
-    run dolt config --local --set testlocal testlocal
+    run dolt config --local --set metrics.disabled true
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Config successfully updated" ]] || false
     [ -f .dolt/config.json ]
     run dolt config --list
     [ "$status" -eq 0 ]
     [ "${#lines[@]}" -eq 3 ]
-    [[ "$output" =~ "testlocal = testlocal" ]] || false
-    run dolt config --get testlocal
+    [[ "$output" =~ "metrics.disabled = true" ]] || false
+    run dolt config --get metrics.disabled
     [ "$status" -eq 0 ]
-    [ "$output" = "testlocal" ]
+    [ "$output" = "true" ]
 }
 
 @test "config: set a local config variable" {
     dolt config --global --add user.name "bats tester"
     dolt config --global --add user.email "bats-tester@liquidata.co"
     dolt init
-    run dolt config --local --add testlocal testlocal
+    run dolt config --local --add metrics.disabled true
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Config successfully updated" ]] || false
     [ -f .dolt/config.json ]
     run dolt config --list
     [ "$status" -eq 0 ]
     [ "${#lines[@]}" -eq 3 ]
-    [[ "$output" =~ "testlocal = testlocal" ]] || false
-    run dolt config --get testlocal
+    [[ "$output" =~ "metrics.disabled = true" ]] || false
+    run dolt config --get metrics.disabled
     [ "$status" -eq 0 ]
-    [ "$output" = "testlocal" ]
+    [ "$output" = "true" ]
 }
 
 @test "config: override a global config variable with a local config variable" {
     dolt config --global --add user.name "bats tester"
     dolt config --global --add user.email "bats-tester@liquidata.co"
     dolt init
-    dolt config --global --add test global
-    dolt config --local --add test local
-    run dolt config --local --get test
+    dolt config --global --add core.editor globalEditor
+    dolt config --local --add core.editor localEditor
+    run dolt config --local --get core.editor
     [ "$status" -eq 0 ]
-    [ "$output" = "local" ]
+    [ "$output" = "localEditor" ]
     # will list both global and local values in list output
     run dolt config --list
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "test = local" ]] || false
-    [[ "$output" =~ "test = global" ]] || false
+    [[ "$output" =~ "core.editor = localEditor" ]] || false
+    [[ "$output" =~ "core.editor = globalEditor" ]] || false
     # will get the local value explicitly
-    run dolt config --get --local test
+    run dolt config --get --local core.editor
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "local" ]] || false
-    [[ ! "$output" =~ "global" ]] || false
+    [[ "$output" =~ "localEditor" ]] || false
+    [[ ! "$output" =~ "globalEditor" ]] || false
     # will get the global value explicitly
-    run dolt config --get --global test
+    run dolt config --get --global core.editor
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "global" ]] || false
-    [[ ! "$output" =~ "local" ]] || false
+    [[ "$output" =~ "globalEditor" ]] || false
+    [[ ! "$output" =~ "localEditor" ]] || false
     # will get the local value implicitly
-    run dolt config --get test
+    run dolt config --get core.editor
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "local" ]] || false
-    [[ ! "$output" =~ "global" ]] || false
+    [[ "$output" =~ "localEditor" ]] || false
+    [[ ! "$output" =~ "globalEditor" ]] || false
 }
 
 @test "config: Commit to repo w/ ---author and without config vars sets" {
@@ -189,7 +242,7 @@ teardown() {
 }
 
 @test "config: SQL can create databases with no user and email set" {
-    dolt sql -b -q  "
+    dolt sql -q  "
     CREATE DATABASE testdb;
     use testdb;
     CREATE TABLE test (pk int primary key, c1 varchar(1));"
@@ -206,17 +259,17 @@ teardown() {
     skiponwindows "This test has dependencies missing on windows installations"
     
     start_sql_server
-    
-    dolt sql-client --use-db '' -u dolt -P $PORT -q "create database testdb"
-    run dolt sql-client --use-db '' -u dolt -P $PORT -r csv -q "show databases"
+
+    dolt sql -q "create database testdb"
+    run dolt sql --result-format csv -q "show databases"
     [ $status -eq 0 ]
     [[ "$output" =~ "testdb" ]] || false
-    dolt sql-client --use-db testdb -u dolt -P $PORT -q "create table a(x int)"
-    dolt sql-client --use-db testdb -u dolt -P $PORT -q "insert into a values (1), (2)"
+    dolt sql -q "create table a(x int)"
+    dolt sql -q "insert into a values (1), (2)"
 
     [ -d "testdb" ]
-    dolt sql-client --use-db testdb -u dolt -P $PORT -q "select * from dolt_log"
-    run dolt sql-client --use-db testdb -u dolt -P $PORT -q "select * from dolt_log"
+    dolt --use-db testdb sql -q "select * from dolt_log"
+    run dolt --use-db testdb sql -q "select * from dolt_log"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Dolt System Account" ]] || false
     [[ "$output" =~ "doltuser@dolthub.com" ]] || false
@@ -240,43 +293,6 @@ teardown() {
     dolt sql -q "CALL DOLT_COMMIT('-a', '-m', 'updated stuff')"
 }
 
-@test "config: DOLT_COMMIT uses default values when user.name or user.email is unset." {
-    dolt config --global --add user.name "bats tester"
-    dolt config --global --add user.email "joshn@doe.com"
-
-    dolt init
-    dolt sql -q "
-    CREATE TABLE test (
-       pk int primary key
-    )"
-    dolt add .
-
-    dolt config --global --unset user.name
-    dolt config --global --unset user.email
-
-    run dolt sql -q "call dolt_commit('-a', '-m', 'created table test')"
-    [ "$status" -eq 0 ]
-
-    run dolt log -n 1
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "Dolt System Account" ]] || false
-    [[ "$output" =~ "created table test" ]] || false
-
-    dolt sql -q "create table test2 (pk int primary key)"
-    dolt add .
-    
-    dolt config --global --add user.name "bats tester"
-
-    run dolt sql -q "call dolt_commit('-a', '-m', 'created table test2')"
-    [ "$status" -eq 0 ]
-
-    run dolt log -n 1
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "bats tester" ]] || false
-    [[ "$output" =~ "doltuser@dolthub.com" ]] || false
-    [[ "$output" =~ "created table test2" ]] || false
-}
-
 @test "config: Set default init branch" {
     dolt config --global --add user.name "bats tester"
     dolt config --global --add user.email "joshn@doe.com"
@@ -285,15 +301,15 @@ teardown() {
     dolt config --list
     run dolt config --list
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "init.defaultbranch = master" ]]
+    [[ "$output" =~ "init.defaultbranch = master" ]] || false
 
     dolt init
     run dolt status
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "On branch master" ]]
+    [[ "$output" =~ "On branch master" ]] || false
     run dolt branch
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "* master" ]]
+    [[ "$output" =~ "* master" ]] || false
 
     # cleanup
     dolt config --global --unset init.defaultBranch
@@ -306,10 +322,10 @@ teardown() {
     dolt init
     run dolt status
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "On branch main" ]]
+    [[ "$output" =~ "On branch main" ]] || false
     run dolt branch
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "* main" ]]
+    [[ "$output" =~ "* main" ]] || false
 }
 
 @test "config: init accepts branch flag" {
@@ -319,8 +335,14 @@ teardown() {
     dolt init -b=vegan-btw
     run dolt status
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "On branch vegan-btw" ]]
+    [[ "$output" =~ "On branch vegan-btw" ]] || false
     run dolt branch
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "* vegan-btw" ]]
+    [[ "$output" =~ "* vegan-btw" ]] || false
+}
+
+@test "config: config doesn't need write permission in current dir" {
+    chmod 111 .
+    dolt config --list
+    chmod 755 .
 }

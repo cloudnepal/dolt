@@ -261,7 +261,7 @@ teardown() {
 
     run dolt merge test -m "merge other"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ 'error: cannot merge two tables with different primary keys' ]] || false
+    [[ "$output" =~ 'error: cannot merge because table t has different primary keys' ]] || false
 }
 
 @test "primary-key-changes: merge on branch with primary key added throws an error" {
@@ -288,7 +288,36 @@ teardown() {
 
     run dolt merge test -m "merge other"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ 'error: cannot merge two tables with different primary keys' ]] || false
+    [[ "$output" =~ 'error: cannot merge because table t has different primary keys' ]] || false
+}
+
+@test "primary-key-changes: merge on branches with different primary key from ancestor throws an error" {
+    dolt sql -q "create table t(pk int, val1 int, val2 int)"
+    dolt add .
+    dolt sql -q "INSERT INTO t values (1,1,1)"
+    dolt commit -am "cm1"
+    dolt checkout -b test
+
+    dolt sql -q "ALTER TABLE t add PRIMARY key (pk)"
+    dolt add .
+
+    run dolt status
+    [[ "$output" =~ 'Changes to be committed' ]] || false
+    [[ "$output" =~ ([[:space:]]*modified:[[:space:]]*t) ]] || false
+    ! [[ "$output" =~ 'deleted' ]] || false
+    ! [[ "$output" =~ 'new table' ]] || false
+
+    dolt commit -m "cm2"
+    dolt checkout main
+
+    dolt sql -q "ALTER TABLE t add PRIMARY key (pk)"
+    dolt sql -q "INSERT INTO t values (2,2,2)"
+    dolt commit -am "cm3"
+
+    run dolt merge test -m "merge other"
+    [ "$status" -eq 1 ]
+
+    [[ "$output" =~ 'error: cannot merge because table t has different primary keys' ]] || false
 }
 
 @test "primary-key-changes: diff on primary key schema change shows schema level diff but does not show row level diff" {
@@ -365,7 +394,7 @@ teardown() {
     [ "$status" -eq 0 ]
 
     run dolt status
-    [[ "$output" =~ 'Untracked files' ]] || false
+    [[ "$output" =~ 'Untracked tables' ]] || false
     [[ "$output" =~ ([[:space:]]*new table:[[:space:]]*t) ]] || false
     ! [[ "$output" =~ 'deleted' ]] || false
     ! [[ "$output" =~ 'modified' ]] || false
@@ -497,7 +526,7 @@ SQL
     run dolt sql -q "ALTER TABLE t ADD PRIMARY KEY (pk1)"
 
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "error: key column 'pk1' doesn't exist in table" ]] || false
+    [[ "$output" =~ "key column 'pk1' doesn't exist in table" ]] || false
 }
 
 @test "primary-key-changes: same primary key set in different order is detected and blocked on merge" {
@@ -527,11 +556,11 @@ SQL
 
     run dolt merge test -m "merge other"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ 'error: cannot merge two tables with different primary keys' ]] || false
+    [[ "$output" =~ 'error: cannot merge because table t has different primary keys' ]] || false
 
     run dolt sql -q "call dolt_merge('test')"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ 'error: cannot merge two tables with different primary keys' ]] || false
+    [[ "$output" =~ 'error: cannot merge because table t has different primary keys' ]] || false
 
     skip "Dolt doesn't correctly store primary key order if it doesn't match the column order"
 }
@@ -666,7 +695,7 @@ alter table mydb.test add primary key(pk);
 SQL
     run dolt sql -q "show create table mydb.test"
     [ $status -eq 0 ]
-    [[ "$output" =~ "PRIMARY KEY" ]]
+    [[ "$output" =~ "PRIMARY KEY" ]] || false
 }
 
 @test "primary-key-changes: can add and drop primary keys on keyless db.table named tables" {
@@ -680,7 +709,7 @@ SQL
     dolt sql -q "ALTER TABLE mydb.test DROP PRIMARY KEY"
     run dolt sql -q "SHOW CREATE TABLE mydb.test"
     [ $status -eq 0 ]
-    [[ ! "$output" =~ "PRIMARY KEY" ]]
+    [[ ! "$output" =~ "PRIMARY KEY" ]] || false
 
     dolt sql -q "SHOW CREATE TABLE mydb.test" > output.txt
     run grep 'NOT NULL' output.txt

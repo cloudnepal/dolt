@@ -21,7 +21,6 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/rowconv"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/val"
 )
@@ -109,12 +108,7 @@ func (c ProllyRowConverter) PutConverted(ctx context.Context, key, value val.Tup
 		return err
 	}
 
-	err = c.putFields(ctx, value, c.valProj, c.valDesc, c.nonPkTargetTypes, dstRow)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return c.putFields(ctx, value, c.valProj, c.valDesc, c.nonPkTargetTypes, dstRow)
 }
 
 func (c ProllyRowConverter) putFields(ctx context.Context, tup val.Tuple, proj val.OrdinalMapping, desc val.TupleDesc, targetTypes []sql.Type, dstRow []interface{}) error {
@@ -122,19 +116,22 @@ func (c ProllyRowConverter) putFields(ctx context.Context, tup val.Tuple, proj v
 		if j == -1 {
 			continue
 		}
-		f, err := index.GetField(ctx, desc, i, tup, c.ns)
+		f, err := tree.GetField(ctx, desc, i, tup, c.ns)
 		if err != nil {
 			return err
 		}
 		if t := targetTypes[i]; t != nil {
-			dstRow[j], err = t.Convert(f)
+			var inRange sql.ConvertInRange
+			dstRow[j], inRange, err = t.Convert(f)
 			if sql.ErrInvalidValue.Is(err) && c.warnFn != nil {
 				col := c.inSchema.GetAllCols().GetByIndex(i)
 				c.warnFn(rowconv.DatatypeCoercionFailureWarningCode, rowconv.DatatypeCoercionFailureWarning, col.Name)
 				dstRow[j] = nil
 				err = nil
-			}
-			if err != nil {
+			} else if !inRange {
+				c.warnFn(rowconv.TruncatedOutOfRangeValueWarningCode, rowconv.TruncatedOutOfRangeValueWarning, t, f)
+				dstRow[j] = nil
+			} else if err != nil {
 				return err
 			}
 		} else {

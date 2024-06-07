@@ -47,7 +47,9 @@ func makeTestLocalStore(t *testing.T, maxTableFiles int) (st *NomsBlockStore, no
 	require.NoError(t, err)
 
 	// create a v5 manifest
-	_, err = fileManifest{dir: nomsDir, mode: asyncFlush}.Update(ctx, addr{}, manifestContents{}, &Stats{}, nil)
+	fm, err := getFileManifest(ctx, nomsDir, asyncFlush)
+	require.NoError(t, err)
+	_, err = fm.Update(ctx, hash.Hash{}, manifestContents{}, &Stats{}, nil)
 	require.NoError(t, err)
 
 	q = NewUnlimitedMemQuotaProvider()
@@ -202,7 +204,13 @@ func TestNBSPruneTableFiles(t *testing.T) {
 
 	// add a chunk and flush to trigger a conjoin
 	c := chunks.NewChunk([]byte("it's a boy!"))
-	ok, err := st.addChunk(ctx, c, hash.NewHashSet(), st.hasMany)
+	addrs := hash.NewHashSet()
+	ok, err := st.addChunk(ctx, c, func(c chunks.Chunk) chunks.GetAddrsCb {
+		return func(ctx context.Context, _ hash.HashSet, _ chunks.PendingRefExists) error {
+			addrs.Insert(c.Hash())
+			return nil
+		}
+	}, st.hasMany)
 	require.NoError(t, err)
 	require.True(t, ok)
 	ok, err = st.Commit(ctx, st.upstream.root, st.upstream.root)

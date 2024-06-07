@@ -16,22 +16,55 @@ package actions
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 )
 
-func StageTables(ctx context.Context, roots doltdb.Roots, tbls []string) (doltdb.Roots, error) {
+func StageTables(ctx context.Context, roots doltdb.Roots, tbls []doltdb.TableName, filterIgnoredTables bool) (doltdb.Roots, error) {
+	if filterIgnoredTables {
+		var err error
+		filteredTables, err := doltdb.FilterIgnoredTables(ctx, tbls, roots)
+		if len(filteredTables.Conflicts) > 0 {
+			return doltdb.Roots{}, filteredTables.Conflicts[0]
+		}
+		if err != nil {
+			return doltdb.Roots{}, err
+		}
+		tbls = filteredTables.DontIgnore
+	}
+
 	return stageTables(ctx, roots, tbls)
 }
 
-func StageAllTables(ctx context.Context, roots doltdb.Roots) (doltdb.Roots, error) {
+func StageAllTables(ctx context.Context, roots doltdb.Roots, filterIgnoredTables bool) (doltdb.Roots, error) {
 	tbls, err := doltdb.UnionTableNames(ctx, roots.Staged, roots.Working)
 	if err != nil {
 		return doltdb.Roots{}, err
 	}
 
-	return stageTables(ctx, roots, tbls)
+	return StageTables(ctx, roots, tbls, filterIgnoredTables)
+}
+
+func StageDatabase(ctx context.Context, roots doltdb.Roots) (doltdb.Roots, error) {
+	wColl, err := roots.Working.GetCollation(ctx)
+	if err != nil {
+		return doltdb.Roots{}, err
+	}
+	sColl, err := roots.Staged.GetCollation(ctx)
+	if err != nil {
+		return doltdb.Roots{}, err
+	}
+	if wColl == sColl {
+		return roots, nil
+	}
+	roots.Staged, err = roots.Staged.SetCollation(ctx, wColl)
+	if err != nil {
+		return doltdb.Roots{}, err
+	}
+	return roots, nil
 }
 
 func StageModifiedAndDeletedTables(ctx context.Context, roots doltdb.Roots) (doltdb.Roots, error) {
@@ -40,8 +73,11 @@ func StageModifiedAndDeletedTables(ctx context.Context, roots doltdb.Roots) (dol
 		return doltdb.Roots{}, err
 	}
 
-	tbls := []string{}
+	var tbls []doltdb.TableName
 	for _, tableDelta := range unstaged {
+		if strings.HasPrefix(tableDelta.FromName.Name, diff.DBPrefix) {
+			continue
+		}
 		if !tableDelta.IsAdd() {
 			tbls = append(tbls, tableDelta.FromName)
 		}
@@ -50,11 +86,7 @@ func StageModifiedAndDeletedTables(ctx context.Context, roots doltdb.Roots) (dol
 	return stageTables(ctx, roots, tbls)
 }
 
-func stageTables(
-	ctx context.Context,
-	roots doltdb.Roots,
-	tbls []string,
-) (doltdb.Roots, error) {
+func stageTables(ctx context.Context, roots doltdb.Roots, tbls []doltdb.TableName) (doltdb.Roots, error) {
 	var err error
 	err = ValidateTables(ctx, tbls, roots.Staged, roots.Working)
 	if err != nil {
@@ -75,7 +107,7 @@ func stageTables(
 }
 
 // clearEmptyConflicts clears any 0-row conflicts from the tables named, and returns a new root.
-func clearEmptyConflicts(ctx context.Context, tbls []string, working *doltdb.RootValue) (*doltdb.RootValue, error) {
+func clearEmptyConflicts(ctx context.Context, tbls []doltdb.TableName, working doltdb.RootValue) (doltdb.RootValue, error) {
 	for _, tblName := range tbls {
 		tbl, ok, err := working.GetTable(ctx, tblName)
 		if err != nil {
@@ -113,8 +145,8 @@ func clearEmptyConflicts(ctx context.Context, tbls []string, working *doltdb.Roo
 }
 
 // ValidateTables checks that all tables passed exist in at least one of the roots passed.
-func ValidateTables(ctx context.Context, tbls []string, roots ...*doltdb.RootValue) error {
-	var missing []string
+func ValidateTables(ctx context.Context, tbls []doltdb.TableName, roots ...doltdb.RootValue) error {
+	var missing []doltdb.TableName
 	for _, tbl := range tbls {
 		found := false
 		for _, root := range roots {
@@ -135,5 +167,17 @@ func ValidateTables(ctx context.Context, tbls []string, roots ...*doltdb.RootVal
 		return nil
 	}
 
-	return NewTblNotExistError(missing)
+	return NewTblNotExistError(summarizeTableNames(missing))
+}
+
+func summarizeTableNames(names []doltdb.TableName) []string {
+	namesStrs := make([]string, len(names))
+	for i, name := range names {
+		if name.Schema != "" {
+			namesStrs[i] = fmt.Sprintf("%s.%s", name.Schema, name.Name)
+		} else {
+			namesStrs[i] = fmt.Sprintf("%s", name.Name)
+		}
+	}
+	return namesStrs
 }

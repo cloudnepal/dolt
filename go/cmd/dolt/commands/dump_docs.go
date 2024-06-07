@@ -33,11 +33,13 @@ const (
 		"---\n" +
 		"title: CLI\n" +
 		"---\n\n" +
-		"# CLI\n\n"
+		"# Command Line Interface Reference\n\n"
 )
 
 type DumpDocsCmd struct {
-	DoltCommand cli.SubCommandHandler
+	DoltCommand      cli.SubCommandHandler
+	GlobalDocs       *cli.CommandDocumentation
+	GlobalSpecialMsg string
 }
 
 // Name returns the name of the Dolt cli command. This is what is used on the command line to invoke the command
@@ -66,13 +68,13 @@ func (cmd *DumpDocsCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd *DumpDocsCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 0)
 	ap.SupportsString(fileParamName, "", "file", "The file to write CLI docs to")
 	return ap
 }
 
 // Exec executes the command
-func (cmd *DumpDocsCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd *DumpDocsCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, cli.CommandDocumentationContent{}, ap))
@@ -94,6 +96,20 @@ func (cmd *DumpDocsCmd) Exec(ctx context.Context, commandStr string, args []stri
 	}
 
 	_, err = wr.Write([]byte(cliMdDocHeader))
+	if err != nil {
+		cli.PrintErrln(err.Error())
+		return 1
+	}
+
+	doltUsage := cmd.DoltCommand.GetUsage("dolt")
+	doltUsageMarkdown := fmt.Sprintf("```\n$ dolt\n%s```\n\n", doltUsage)
+	_, err = wr.Write([]byte(doltUsageMarkdown))
+	if err != nil {
+		cli.PrintErrln(err.Error())
+		return 1
+	}
+
+	err = cmd.writeGlobalArgumentsSection(wr)
 	if err != nil {
 		cli.PrintErrln(err.Error())
 		return 1
@@ -155,6 +171,17 @@ func CreateMarkdown(wr io.Writer, cmdDoc *cli.CommandDocumentation) error {
 	if err != nil {
 		return err
 	}
+	_, err = wr.Write([]byte(markdownDoc))
+	return err
+}
+
+func (cmd *DumpDocsCmd) writeGlobalArgumentsSection(wr io.Writer) error {
+	cmd.GlobalDocs.ShortDesc = cmd.GlobalSpecialMsg
+	markdownDoc, err := cmd.GlobalDocs.GlobalCmdDocToMd()
+	if err != nil {
+		return err
+	}
+
 	_, err = wr.Write([]byte(markdownDoc))
 	return err
 }

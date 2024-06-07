@@ -22,31 +22,39 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/store/prolly"
+	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/val"
 )
 
 type prollyFkIndexer struct {
-	writer *prollyTableWriter
-	index  index.DoltIndex
-	pRange prolly.Range
+	writer   *prollyTableWriter
+	index    index.DoltIndex
+	pRange   prolly.Range
+	refCheck bool
 }
 
 var _ sql.Table = (*prollyFkIndexer)(nil)
 var _ sql.IndexedTable = (*prollyFkIndexer)(nil)
+var _ sql.ReferenceChecker = (*prollyFkIndexer)(nil)
 
 // Name implements the interface sql.Table.
 func (n *prollyFkIndexer) Name() string {
-	return n.writer.tableName
+	return n.writer.tableName.Name
 }
 
 // String implements the interface sql.Table.
 func (n *prollyFkIndexer) String() string {
-	return n.writer.tableName
+	return n.writer.tableName.Name
 }
 
 // Schema implements the interface sql.Table.
 func (n *prollyFkIndexer) Schema() sql.Schema {
 	return n.writer.sqlSch
+}
+
+func (n *prollyFkIndexer) SetReferenceCheck() error {
+	n.refCheck = true
+	return nil
 }
 
 // Collation implements the interface sql.Table.
@@ -84,23 +92,19 @@ func (n *prollyFkIndexer) PartitionRows(ctx *sql.Context, _ sql.Partition) (sql.
 			pkToIdxMap[i] = j
 		}
 	}
-
+	rangeIter, err := idxWriter.IterRange(ctx, n.pRange)
+	if err != nil {
+		return nil, err
+	}
 	if primary, ok := n.writer.primary.(prollyIndexWriter); ok {
-		rangeIter, err := idxWriter.IterRange(ctx, n.pRange)
-		if err != nil {
-			return nil, err
-		}
 		return &prollyFkPkRowIter{
 			rangeIter:  rangeIter,
 			pkToIdxMap: pkToIdxMap,
 			primary:    primary,
 			sqlSch:     n.writer.sqlSch,
+			refCheck:   n.refCheck,
 		}, nil
 	} else {
-		rangeIter, err := idxWriter.IterRange(ctx, n.pRange)
-		if err != nil {
-			return nil, err
-		}
 		return &prollyFkKeylessRowIter{
 			rangeIter: rangeIter,
 			primary:   n.writer.primary.(prollyKeylessWriter),
@@ -115,6 +119,7 @@ type prollyFkPkRowIter struct {
 	pkToIdxMap val.OrdinalMapping
 	primary    prollyIndexWriter
 	sqlSch     sql.Schema
+	refCheck   bool
 }
 
 var _ sql.RowIter = prollyFkPkRowIter{}
@@ -149,16 +154,21 @@ func (iter prollyFkPkRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			continue // referential integrity broken
 		}
 
+		if iter.refCheck {
+			// no need to deserialize
+			return nil, nil
+		}
+
 		nextRow := make(sql.Row, len(iter.primary.keyMap)+len(iter.primary.valMap))
 		for from := range iter.primary.keyMap {
 			to := iter.primary.keyMap.MapOrdinal(from)
-			if nextRow[to], err = index.GetField(ctx, iter.primary.keyBld.Desc, from, tblKey, iter.primary.mut.NodeStore()); err != nil {
+			if nextRow[to], err = tree.GetField(ctx, iter.primary.keyBld.Desc, from, tblKey, iter.primary.mut.NodeStore()); err != nil {
 				return nil, err
 			}
 		}
 		for from := range iter.primary.valMap {
 			to := iter.primary.valMap.MapOrdinal(from)
-			if nextRow[to], err = index.GetField(ctx, iter.primary.valBld.Desc, from, tblVal, iter.primary.mut.NodeStore()); err != nil {
+			if nextRow[to], err = tree.GetField(ctx, iter.primary.valBld.Desc, from, tblVal, iter.primary.mut.NodeStore()); err != nil {
 				return nil, err
 			}
 		}
@@ -197,7 +207,7 @@ func (iter prollyFkKeylessRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 	err = iter.primary.mut.Get(ctx, primaryKey, func(tblKey, tblVal val.Tuple) error {
 		for from := range iter.primary.valMap {
 			to := iter.primary.valMap.MapOrdinal(from)
-			if nextRow[to], err = index.GetField(ctx, iter.primary.valBld.Desc, from+1, tblVal, iter.primary.mut.NodeStore()); err != nil {
+			if nextRow[to], err = tree.GetField(ctx, iter.primary.valBld.Desc, from+1, tblVal, iter.primary.mut.NodeStore()); err != nil {
 				return err
 			}
 		}

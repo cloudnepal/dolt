@@ -15,11 +15,13 @@
 package sqlutil
 
 import (
-	"context"
+	"fmt"
+	"strings"
 
+	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/parse"
-	"github.com/dolthub/vitess/go/vt/sqlparser"
+	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
@@ -27,38 +29,61 @@ import (
 
 // ParseCreateTableStatement will parse a CREATE TABLE ddl statement and use it to create a Dolt Schema. A RootValue
 // is used to generate unique tags for the Schema
-func ParseCreateTableStatement(ctx context.Context, root *doltdb.RootValue, query string) (string, schema.Schema, error) {
-	// todo: verify create table statement
-	ddl, err := sqlparser.Parse(query)
+func ParseCreateTableStatement(ctx *sql.Context, root doltdb.RootValue, engine *sqle.Engine, query string) (string, schema.Schema, error) {
+	binder := planbuilder.New(ctx, engine.Analyzer.Catalog, engine.Parser)
+	parsed, _, _, err := binder.Parse(query, false)
+	if err != nil {
+		return "", nil, err
+	}
+	create, ok := parsed.(*plan.CreateTable)
+	if !ok {
+		return "", nil, fmt.Errorf("expected create table, found %T", create)
+	}
 
+	sch, err := ToDoltSchema(ctx, root, create.Name(), create.PkSchema(), nil, create.Collation)
 	if err != nil {
 		return "", nil, err
 	}
 
-	ts := ddl.(*sqlparser.DDL).TableSpec
-	s, collation, err := parse.TableSpecToSchema(sql.NewContext(ctx), ts, false)
-	for _, col := range s.Schema {
-		if collatedType, ok := col.Type.(sql.TypeWithCollation); ok {
-			col.Type, err = collatedType.WithNewCollation(sql.Collation_Default)
-			if err != nil {
-				return "", nil, err
-			}
+	for _, idx := range create.Indexes() {
+		var prefixes []uint16
+		for _, c := range idx.Columns {
+			prefixes = append(prefixes, uint16(c.Length))
+		}
+		props := schema.IndexProperties{
+			IsUnique:   idx.IsUnique(),
+			IsSpatial:  idx.IsSpatial(),
+			IsFullText: idx.IsFullText(),
+			Comment:    idx.Comment,
+		}
+		name := getIndexName(idx)
+		_, err = sch.Indexes().AddIndexByColNames(name, idx.ColumnNames(), prefixes, props)
+		if err != nil {
+			return "", nil, err
 		}
 	}
 
-	if err != nil {
-		return "", nil, err
+	// foreign keys are stored on the *doltdb.Table object, ignore them here
+	for _, chk := range create.Checks() {
+		name := getCheckConstraintName(chk)
+		_, err = sch.Checks().AddCheck(name, chk.Expr.String(), chk.Enforced)
+		if err != nil {
+			return "", nil, err
+		}
 	}
+	return create.Name(), sch, err
+}
 
-	tn := ddl.(*sqlparser.DDL).Table
-	buf := sqlparser.NewTrackedBuffer(nil)
-	tn.Format(buf)
-	tableName := buf.String()
-	sch, err := ToDoltSchema(ctx, root, tableName, s, nil, collation)
-
-	if err != nil {
-		return "", nil, err
+func getIndexName(def *sql.IndexDef) string {
+	if def.Name != "" {
+		return def.Name
 	}
+	return strings.Join(def.ColumnNames(), "_") + "_key"
+}
 
-	return tableName, sch, err
+func getCheckConstraintName(chk *sql.CheckConstraint) string {
+	if chk.Name != "" {
+		return chk.Name
+	}
+	return chk.DebugString()
 }

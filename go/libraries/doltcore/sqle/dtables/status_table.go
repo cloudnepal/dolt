@@ -24,15 +24,32 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
-	"github.com/dolthub/dolt/go/libraries/doltcore/merge"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 )
+
+const statusDefaultRowCount = 10
 
 // StatusTable is a sql.Table implementation that implements a system table which shows the dolt branches
 type StatusTable struct {
 	ddb           *doltdb.DoltDB
+	workingSet    *doltdb.WorkingSet
 	rootsProvider env.RootsProvider
-	dbName        string
+}
+
+var _ sql.StatisticsTable = (*StatusTable)(nil)
+
+func (s StatusTable) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(s.Schema())
+	numRows, _, err := s.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
+}
+
+func (s StatusTable) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return statusDefaultRowCount, false, nil
 }
 
 func (s StatusTable) Name() string {
@@ -46,8 +63,8 @@ func (s StatusTable) String() string {
 func (s StatusTable) Schema() sql.Schema {
 	return []*sql.Column{
 		{Name: "table_name", Type: types.Text, Source: doltdb.StatusTableName, PrimaryKey: true, Nullable: false},
-		{Name: "staged", Type: types.Boolean, Source: doltdb.StatusTableName, PrimaryKey: false, Nullable: false},
-		{Name: "status", Type: types.Text, Source: doltdb.StatusTableName, PrimaryKey: false, Nullable: false},
+		{Name: "staged", Type: types.Boolean, Source: doltdb.StatusTableName, PrimaryKey: true, Nullable: false},
+		{Name: "status", Type: types.Text, Source: doltdb.StatusTableName, PrimaryKey: true, Nullable: false},
 	}
 }
 
@@ -64,20 +81,23 @@ func (s StatusTable) PartitionRows(context *sql.Context, _ sql.Partition) (sql.R
 }
 
 // NewStatusTable creates a StatusTable
-func NewStatusTable(_ *sql.Context, dbName string, ddb *doltdb.DoltDB, rp env.RootsProvider) sql.Table {
+func NewStatusTable(_ *sql.Context, ddb *doltdb.DoltDB, ws *doltdb.WorkingSet, rp env.RootsProvider) sql.Table {
 	return &StatusTable{
 		ddb:           ddb,
-		dbName:        dbName,
+		workingSet:    ws,
 		rootsProvider: rp,
 	}
 }
 
-// StatusIter is a sql.RowItr implementation which iterates over each commit as if it's a row in the table.
+// StatusItr is a sql.RowIter implementation which iterates over each commit as if it's a row in the table.
 type StatusItr struct {
-	tables   []string
-	isStaged []bool
-	statuses []string
-	idx      int
+	rows []statusTableRow
+}
+
+type statusTableRow struct {
+	tableName string
+	isStaged  bool
+	status    string
 }
 
 func newStatusItr(ctx *sql.Context, st *StatusTable) (*StatusItr, error) {
@@ -93,81 +113,95 @@ func newStatusItr(ctx *sql.Context, st *StatusTable) (*StatusItr, error) {
 		return nil, err
 	}
 
-	workingTblsInConflict, _, _, err := merge.GetTablesInConflict(ctx, roots)
+	rows := make([]statusTableRow, 0, len(stagedTables)+len(unstagedTables))
+	for _, td := range stagedTables {
+		tblName := tableName(td)
+		if doltdb.IsFullTextTable(tblName) {
+			continue
+		}
+		rows = append(rows, statusTableRow{
+			tableName: tblName,
+			isStaged:  true,
+			status:    statusString(td),
+		})
+	}
+	for _, td := range unstagedTables {
+		tblName := tableName(td)
+		if doltdb.IsFullTextTable(tblName) {
+			continue
+		}
+		rows = append(rows, statusTableRow{
+			tableName: tblName,
+			isStaged:  false,
+			status:    statusString(td),
+		})
+	}
+
+	if st.workingSet.MergeActive() {
+		ms := st.workingSet.MergeState()
+		for _, tbl := range ms.TablesWithSchemaConflicts() {
+			rows = append(rows, statusTableRow{
+				tableName: tbl,
+				isStaged:  false,
+				status:    "schema conflict",
+			})
+		}
+
+		for _, tbl := range ms.MergedTables() {
+			rows = append(rows, statusTableRow{
+				tableName: tbl,
+				isStaged:  true,
+				status:    mergedStatus,
+			})
+		}
+	}
+
+	cnfTables, err := doltdb.TablesWithDataConflicts(ctx, roots.Working)
 	if err != nil {
 		return nil, err
 	}
-
-	tLength := len(stagedTables) + len(unstagedTables) + len(workingTblsInConflict)
-
-	tables := make([]string, tLength)
-	isStaged := make([]bool, tLength)
-	statuses := make([]string, tLength)
-
-	itr := &StatusItr{tables: tables, isStaged: isStaged, statuses: statuses, idx: 0}
-
-	idx := handleStagedUnstagedTables(stagedTables, unstagedTables, itr, 0)
-	idx = handleWorkingTablesInConflict(workingTblsInConflict, itr, idx)
-	return itr, nil
-}
-
-var tblDiffTypeToLabel = map[diff.TableDiffType]string{
-	diff.ModifiedTable: "modified",
-	diff.RenamedTable:  "renamed",
-	diff.RemovedTable:  "deleted",
-	diff.AddedTable:    "new table",
-}
-
-func handleStagedUnstagedTables(staged, unstaged []diff.TableDelta, itr *StatusItr, idx int) int {
-	combined := append(staged, unstaged...)
-	for i, td := range combined {
-		itr.isStaged[idx] = i < len(staged)
-		if td.IsAdd() {
-			itr.tables[idx] = td.CurName()
-			itr.statuses[idx] = tblDiffTypeToLabel[diff.AddedTable]
-		} else if td.IsDrop() {
-			itr.tables[idx] = td.CurName()
-			itr.statuses[idx] = tblDiffTypeToLabel[diff.RemovedTable]
-		} else if td.IsRename() {
-			itr.tables[idx] = fmt.Sprintf("%s -> %s", td.FromName, td.ToName)
-			itr.statuses[idx] = tblDiffTypeToLabel[diff.RenamedTable]
-		} else {
-			itr.tables[idx] = td.CurName()
-			itr.statuses[idx] = tblDiffTypeToLabel[diff.ModifiedTable]
-		}
-
-		idx += 1
+	for _, tbl := range cnfTables {
+		rows = append(rows, statusTableRow{
+			tableName: tbl,
+			status:    mergeConflictStatus,
+		})
 	}
 
-	return idx
+	return &StatusItr{rows: rows}, nil
+}
+
+func tableName(td diff.TableDelta) string {
+	if td.IsRename() {
+		return fmt.Sprintf("%s -> %s", td.FromName, td.ToName)
+	} else {
+		return td.CurName()
+	}
+}
+
+func statusString(td diff.TableDelta) string {
+	if td.IsAdd() {
+		return "new table"
+	} else if td.IsDrop() {
+		return "deleted"
+	} else if td.IsRename() {
+		return "renamed"
+	} else {
+		return "modified"
+	}
 }
 
 const mergeConflictStatus = "conflict"
-
-func handleWorkingTablesInConflict(workingTables []string, itr *StatusItr, idx int) int {
-	for _, tableName := range workingTables {
-		itr.tables[idx] = tableName
-		itr.isStaged[idx] = false
-		itr.statuses[idx] = mergeConflictStatus
-
-		idx += 1
-	}
-
-	return idx
-}
+const mergedStatus = "merged"
 
 // Next retrieves the next row. It will return io.EOF if it's the last row.
 // After retrieving the last row, Close will be automatically closed.
 func (itr *StatusItr) Next(*sql.Context) (sql.Row, error) {
-	if itr.idx >= len(itr.tables) {
+	if len(itr.rows) <= 0 {
 		return nil, io.EOF
 	}
-
-	defer func() {
-		itr.idx++
-	}()
-
-	return sql.NewRow(itr.tables[itr.idx], itr.isStaged[itr.idx], itr.statuses[itr.idx]), nil
+	row := itr.rows[0]
+	itr.rows = itr.rows[1:]
+	return sql.NewRow(row.tableName, row.isStaged, row.status), nil
 }
 
 // Close closes the iterator.

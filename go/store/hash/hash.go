@@ -48,6 +48,7 @@ package hash
 import (
 	"bytes"
 	"crypto/sha512"
+	"encoding/binary"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -59,6 +60,12 @@ import (
 const (
 	// ByteLen is the number of bytes used to represent the Hash.
 	ByteLen = 20
+
+	// PrefixLen is the number of bytes used to represent the Prefix of the Hash.
+	PrefixLen = 8 // uint64
+
+	// SuffixLen is the number of bytes which come after the Prefix.
+	SuffixLen = ByteLen - PrefixLen
 
 	// StringLen is the number of characters need to represent the Hash using Base32.
 	StringLen = 32 // 20 * 8 / log2(32)
@@ -123,6 +130,16 @@ func Parse(s string) Hash {
 	return r
 }
 
+// Prefix returns the first 8 bytes of the hash as a unit64. Used for chunk indexing
+func (h Hash) Prefix() uint64 {
+	return binary.BigEndian.Uint64(h[:PrefixLen])
+}
+
+// Suffix returns the last 12 bytes of the hash. Used for chunk indexing
+func (h Hash) Suffix() []byte {
+	return h[PrefixLen:]
+}
+
 // Less compares two hashes returning whether this Hash is less than other.
 func (h Hash) Less(other Hash) bool {
 	return h.Compare(other) < 0
@@ -159,9 +176,9 @@ func (hs HashSet) Insert(hash Hash) {
 }
 
 // Has returns true if the HashSet contains hash.
-func (hs HashSet) Has(hash Hash) (has bool) {
-	_, has = hs[hash]
-	return
+func (hs HashSet) Has(hash Hash) bool {
+	_, has := hs[hash]
+	return has
 }
 
 // Remove removes hash from the HashSet.

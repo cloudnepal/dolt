@@ -14,7 +14,43 @@
 
 package main
 
-import "testing"
+import (
+	"flag"
+	"log"
+	"os"
+	"testing"
+)
+
+// We generate various TLS keys and certificates and some JWKS/JWT material
+// which the tests reference. We do this once for the test run, because it can
+// be expensive, and we expose the location of the generated files through an
+// environment variable. dtestutils/sql_server_driver interpolates that
+// environment variable into a few fields in the test definition.
+//
+// It's good enough for now, and it keeps us from checking in certificates or
+// JWT which will expire at some point in the future.
+func TestMain(m *testing.M) {
+	old := os.Getenv("TESTGENDIR")
+	defer func() {
+		os.Setenv("TESTGENDIR", old)
+	}()
+	gendir, err := os.MkdirTemp(os.TempDir(), "go-sql-server-driver-gen-*")
+	if err != nil {
+		log.Fatalf("could not create temp dir: %v", err)
+	}
+	defer os.RemoveAll(gendir)
+	err = GenerateTestJWTs(gendir)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	err = GenerateX509Certs(gendir)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	os.Setenv("TESTGENDIR", gendir)
+	flag.Parse()
+	os.Exit(m.Run())
+}
 
 func TestConfig(t *testing.T) {
 	RunTestsFile(t, "tests/sql-server-config.yaml")
@@ -28,6 +64,21 @@ func TestCluster(t *testing.T) {
 	RunTestsFile(t, "tests/sql-server-cluster.yaml")
 }
 
+func TestClusterUsersAndGrants(t *testing.T) {
+	RunTestsFile(t, "tests/sql-server-cluster-users-and-grants.yaml")
+}
+
+func TestRemotesAPI(t *testing.T) {
+	RunTestsFile(t, "tests/sql-server-remotesapi.yaml")
+}
+
+// TestSingle is a convenience method for running a single test from within an IDE. Unskip and set to the file and name
+// of the test you want to debug. See README.md in the `tests` directory for more debugging info.
+func TestSingle(t *testing.T) {
+	t.Skip()
+	RunSingleTest(t, "tests/sql-server-cluster.yaml", "primary comes up and replicates to standby")
+}
+
 func TestClusterTLS(t *testing.T) {
 	RunTestsFile(t, "tests/sql-server-cluster-tls.yaml")
 }
@@ -38,4 +89,8 @@ func TestOriginal(t *testing.T) {
 
 func TestTLS(t *testing.T) {
 	RunTestsFile(t, "tests/sql-server-tls.yaml")
+}
+
+func TestClusterReadOnly(t *testing.T) {
+	RunTestsFile(t, "tests/sql-server-cluster-read-only.yaml")
 }

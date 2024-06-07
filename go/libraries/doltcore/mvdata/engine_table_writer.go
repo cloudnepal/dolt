@@ -20,19 +20,17 @@ import (
 	"io"
 	"sync/atomic"
 
-	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/analyzer"
-	"github.com/dolthub/go-mysql-server/sql/expression"
+	"github.com/dolthub/go-mysql-server/sql/analyzer/analyzererrors"
 	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
+	"github.com/dolthub/go-mysql-server/sql/rowexec"
 	"github.com/dolthub/go-mysql-server/sql/transform"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/commands/engine"
-	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
-	dsqle "github.com/dolthub/dolt/go/libraries/doltcore/sqle"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/typed/noms"
 	"github.com/dolthub/dolt/go/store/types"
@@ -64,11 +62,9 @@ type SqlEngineTableWriter struct {
 }
 
 func NewSqlEngineTableWriter(ctx context.Context, dEnv *env.DoltEnv, createTableSchema, rowOperationSchema schema.Schema, options *MoverOptions, statsCB noms.StatsCB) (*SqlEngineTableWriter, error) {
-	if dEnv.IsLocked() {
-		return nil, env.ErrActiveServerLock.New(dEnv.LockFile())
-	}
+	// TODO: Assert that dEnv.DoltDB.AccessMode() != ReadOnly?
 
-	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +78,6 @@ func NewSqlEngineTableWriter(ctx context.Context, dEnv *env.DoltEnv, createTable
 	se, err := engine.NewSqlEngine(
 		ctx,
 		mrEnv,
-		engine.FormatCsv,
 		config,
 	)
 	if err != nil {
@@ -92,9 +87,9 @@ func NewSqlEngineTableWriter(ctx context.Context, dEnv *env.DoltEnv, createTable
 
 	dbName := mrEnv.GetFirstDatabase()
 
-	if se.GetUnderlyingEngine().IsReadOnly {
+	if se.GetUnderlyingEngine().IsReadOnly() {
 		// SqlEngineTableWriter does not respect read only mode
-		return nil, analyzer.ErrReadOnlyDatabase.New(dbName)
+		return nil, analyzererrors.ErrReadOnlyDatabase.New(dbName)
 	}
 
 	sqlCtx, err := se.NewLocalContext(ctx)
@@ -103,14 +98,12 @@ func NewSqlEngineTableWriter(ctx context.Context, dEnv *env.DoltEnv, createTable
 	}
 	sqlCtx.SetCurrentDatabase(dbName)
 
-	dsess.DSessFromSess(sqlCtx.Session).EnableBatchedMode()
-
-	doltCreateTableSchema, err := sqlutil.FromDoltSchema(options.TableToWriteTo, createTableSchema)
+	doltCreateTableSchema, err := sqlutil.FromDoltSchema("", options.TableToWriteTo, createTableSchema)
 	if err != nil {
 		return nil, err
 	}
 
-	doltRowOperationSchema, err := sqlutil.FromDoltSchema(options.TableToWriteTo, rowOperationSchema)
+	doltRowOperationSchema, err := sqlutil.FromDoltSchema("", options.TableToWriteTo, rowOperationSchema)
 	if err != nil {
 		return nil, err
 	}
@@ -133,58 +126,19 @@ func NewSqlEngineTableWriter(ctx context.Context, dEnv *env.DoltEnv, createTable
 	}, nil
 }
 
-// Used by Dolthub API
-func NewSqlEngineTableWriterWithEngine(ctx *sql.Context, eng *sqle.Engine, db dsqle.Database, createTableSchema, rowOperationSchema schema.Schema, options *MoverOptions, statsCB noms.StatsCB) (*SqlEngineTableWriter, error) {
-	dsess.DSessFromSess(ctx.Session).EnableBatchedMode()
-
-	err := ctx.Session.SetSessionVariable(ctx, sql.AutoCommitSessionVar, false)
-	if err != nil {
-		return nil, errhand.VerboseErrorFromError(err)
-	}
-
-	var doltCreateTableSchema sql.PrimaryKeySchema
-	if options.Operation == CreateOp {
-		doltCreateTableSchema, err = sqlutil.FromDoltSchema(options.TableToWriteTo, createTableSchema)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	doltRowOperationSchema, err := sqlutil.FromDoltSchema(options.TableToWriteTo, rowOperationSchema)
-	if err != nil {
-		return nil, err
-	}
-
-	return &SqlEngineTableWriter{
-		se:         engine.NewRebasedSqlEngine(eng, map[string]dsqle.SqlDatabase{db.Name(): db}),
-		sqlCtx:     ctx,
-		contOnErr:  options.ContinueOnErr,
-		force:      options.Force,
-		disableFks: options.DisableFks,
-
-		database:  db.Name(),
-		tableName: options.TableToWriteTo,
-		statsCB:   statsCB,
-
-		importOption:       options.Operation,
-		tableSchema:        doltCreateTableSchema,
-		rowOperationSchema: doltRowOperationSchema,
-	}, nil
-}
-
-func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan sql.Row, badRowCb func(row sql.Row, err error) bool) (err error) {
+func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan sql.Row, badRowCb func(row sql.Row, rowSchema sql.PrimaryKeySchema, tableName string, lineNumber int, err error) bool) (err error) {
 	err = s.forceDropTableIfNeeded()
 	if err != nil {
 		return err
 	}
 
-	_, _, err = s.se.Query(s.sqlCtx, fmt.Sprintf("START TRANSACTION"))
+	_, _, err = s.se.Query(s.sqlCtx, "START TRANSACTION")
 	if err != nil {
 		return err
 	}
 
 	if s.disableFks {
-		_, _, err = s.se.Query(s.sqlCtx, fmt.Sprintf("SET FOREIGN_KEY_CHECKS = 0"))
+		_, _, err = s.se.Query(s.sqlCtx, "SET FOREIGN_KEY_CHECKS = 0")
 		if err != nil {
 			return err
 		}
@@ -217,12 +171,12 @@ func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan 
 		}
 	}
 
-	insertOrUpdateOperation, err := s.getInsertNode(inputChannel)
+	insertOrUpdateOperation, err := s.getInsertNode(inputChannel, false)
 	if err != nil {
 		return err
 	}
 
-	iter, err := insertOrUpdateOperation.RowIter(s.sqlCtx, nil)
+	iter, err := rowexec.DefaultBuilder.Build(s.sqlCtx, insertOrUpdateOperation, nil)
 	if err != nil {
 		return err
 	}
@@ -234,6 +188,8 @@ func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan 
 		}
 	}()
 
+	line := 1
+
 	for {
 		if s.statsCB != nil && atomic.LoadInt32(&s.statOps) >= tableWriterStatUpdateRate {
 			atomic.StoreInt32(&s.statOps, 0)
@@ -241,6 +197,7 @@ func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan 
 		}
 
 		row, err := iter.Next(s.sqlCtx)
+		line += 1
 
 		// All other errors are handled by the errorHandler
 		if err == nil {
@@ -263,7 +220,7 @@ func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan 
 				offendingRow = n.OffendingRow
 			}
 
-			quit := badRowCb(offendingRow, err)
+			quit := badRowCb(offendingRow, s.tableSchema, s.tableName, line, err)
 			if quit {
 				return err
 			}
@@ -309,52 +266,79 @@ func (s *SqlEngineTableWriter) createOrEmptyTableIfNeeded() error {
 
 // createTable creates a table.
 func (s *SqlEngineTableWriter) createTable() error {
-	cr := plan.NewCreateTable(sql.UnresolvedDatabase(s.database), s.tableName, false, false, &plan.TableSpec{Schema: s.tableSchema})
-	analyzed, err := s.se.Analyze(s.sqlCtx, cr)
+	// TODO don't use internal interfaces to do this, we had to have a sql.Schema somewhere
+	// upstream to make the dolt schema
+	sqlCols := make([]string, len(s.tableSchema.Schema))
+	for i, c := range s.tableSchema.Schema {
+		sqlCols[i] = sql.GenerateCreateTableColumnDefinition(c, c.Default.String(), c.OnUpdate.String(), sql.Collation_Default)
+	}
+	var pks string
+	var sep string
+	for _, i := range s.tableSchema.PkOrdinals {
+		pks += sep + sql.QuoteIdentifier(s.tableSchema.Schema[i].Name)
+		sep = ", "
+	}
+	if len(sep) > 0 {
+		sqlCols = append(sqlCols, fmt.Sprintf("PRIMARY KEY (%s)", pks))
+	}
+
+	createTable := sql.GenerateCreateTableStatement(s.tableName, sqlCols, "", sql.CharacterSet_utf8mb4.String(), sql.Collation_Default.String(), "")
+	_, iter, err := s.se.Query(s.sqlCtx, createTable)
 	if err != nil {
 		return err
 	}
-
-	analyzedQueryProcess := analyzer.StripPassthroughNodes(analyzed.(*plan.QueryProcess))
-
-	ri, err := analyzedQueryProcess.RowIter(s.sqlCtx, nil)
-	if err != nil {
-		return err
-	}
-
-	for {
-		_, err = ri.Next(s.sqlCtx)
-		if err != nil {
-			return ri.Close(s.sqlCtx)
-		}
-	}
-}
-
-// getInsertNode returns the sql.Node to be iterated on given the import option.
-func (s *SqlEngineTableWriter) getInsertNode(inputChannel chan sql.Row) (sql.Node, error) {
-	switch s.importOption {
-	case CreateOp, ReplaceOp:
-		return s.createInsertImportNode(inputChannel, s.contOnErr, false, nil) // contonerr translates to ignore
-	case UpdateOp:
-		return s.createInsertImportNode(inputChannel, s.contOnErr, false, generateOnDuplicateKeyExpressions(s.rowOperationSchema.Schema)) // contonerr translates to ignore
-	default:
-		return nil, fmt.Errorf("unsupported import type")
-	}
+	_, err = sql.RowIterToRows(s.sqlCtx, iter)
+	return err
 }
 
 // createInsertImportNode creates the relevant/analyzed insert node given the import option. This insert node is wrapped
 // with an error handler.
-func (s *SqlEngineTableWriter) createInsertImportNode(source chan sql.Row, ignore bool, replace bool, onDuplicateExpression []sql.Expression) (sql.Node, error) {
-	src := NewChannelRowSource(s.rowOperationSchema.Schema, source)
-	dest := plan.NewUnresolvedTable(s.tableName, s.database)
-
-	colNames := make([]string, 0)
+func (s *SqlEngineTableWriter) getInsertNode(inputChannel chan sql.Row, replace bool) (sql.Node, error) {
+	update := s.importOption == UpdateOp
+	colNames := ""
+	values := ""
+	duplicate := ""
+	if update {
+		duplicate += " ON DUPLICATE KEY UPDATE "
+	}
+	sep := ""
 	for _, col := range s.rowOperationSchema.Schema {
-		colNames = append(colNames, col.Name)
+		colNames += fmt.Sprintf("%s%s", sep, sql.QuoteIdentifier(col.Name))
+		values += fmt.Sprintf("%s1", sep)
+		if update {
+			duplicate += fmt.Sprintf("%s`%s` = VALUES(`%s`)", sep, col.Name, col.Name)
+		}
+		sep = ", "
 	}
 
-	insert := plan.NewInsertInto(sql.UnresolvedDatabase(s.database), dest, src, replace, colNames, onDuplicateExpression, ignore)
-	analyzed, err := s.se.Analyze(s.sqlCtx, insert)
+	sqlEngine := s.se.GetUnderlyingEngine()
+	binder := planbuilder.New(s.sqlCtx, sqlEngine.Analyzer.Catalog, sqlEngine.Parser)
+	insert := fmt.Sprintf("insert into `%s` (%s) VALUES (%s)%s", s.tableName, colNames, values, duplicate)
+	parsed, _, _, err := binder.Parse(insert, false)
+	if err != nil {
+		return nil, fmt.Errorf("error constructing import query '%s': %w", insert, err)
+	}
+	parsedIns, ok := parsed.(*plan.InsertInto)
+	if !ok {
+		return nil, fmt.Errorf("import setup expected *plan.InsertInto root, found %T", parsed)
+	}
+	schema := make(sql.Schema, len(s.rowOperationSchema.Schema))
+	for i, c := range s.rowOperationSchema.Schema {
+		newC := c.Copy()
+		newC.Source = planbuilder.OnDupValuesPrefix
+		schema[i] = newC
+	}
+
+	switch n := parsedIns.Source.(type) {
+	case *plan.Values:
+		parsedIns.Source = NewChannelRowSource(schema, inputChannel)
+	case *plan.Project:
+		n.Child = NewChannelRowSource(schema, inputChannel)
+	}
+
+	parsedIns.Ignore = s.contOnErr
+	parsedIns.IsReplace = replace
+	analyzed, err := s.se.Analyze(s.sqlCtx, parsedIns)
 	if err != nil {
 		return nil, err
 	}
@@ -373,16 +357,4 @@ func (s *SqlEngineTableWriter) createInsertImportNode(source chan sql.Row, ignor
 	})
 
 	return analyzed, nil
-}
-
-// generateOnDuplicateKeyExpressions generates the duplicate key expressions needed for the update import option.
-func generateOnDuplicateKeyExpressions(sch sql.Schema) []sql.Expression {
-	ret := make([]sql.Expression, len(sch))
-	for i, col := range sch {
-		columnExpression := expression.NewUnresolvedColumn(col.Name)
-		functionExpression := expression.NewUnresolvedFunction("values", false, nil, expression.NewUnresolvedColumn(col.Name))
-		ret[i] = expression.NewSetField(columnExpression, functionExpression)
-	}
-
-	return ret
 }

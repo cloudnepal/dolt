@@ -6,7 +6,10 @@ ARG BUILDARCH
 
 RUN apt update -y && \
     apt install -y \
-        tini
+        tini \
+        ca-certificates && \
+    apt clean && \
+    rm -rf /var/lib/apt/lists/*
 
 ADD https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-${BUILDARCH}.tar.gz dolt-linux-${BUILDARCH}.tar.gz
 RUN tar zxvf dolt-linux-${BUILDARCH}.tar.gz && \

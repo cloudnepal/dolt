@@ -18,11 +18,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
+	"github.com/dolthub/go-mysql-server/sql"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/conflict"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
 	"github.com/dolthub/dolt/go/libraries/doltcore/row"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
@@ -40,8 +43,78 @@ type rowMerger func(ctx context.Context, nbf *types.NomsBinFormat, sch schema.Sc
 
 type applicator func(ctx context.Context, sch schema.Schema, tableEditor editor.TableEditor, rowData types.Map, stats *MergeStats, change types.ValueChanged) error
 
+// mergeNomsTable merges a Noms table, which includes updating row data, secondary index data, and applying the specified |mergedSch|.
+func mergeNomsTable(ctx *sql.Context, tm *TableMerger, mergedSch schema.Schema, vrw types.ValueReadWriter, opts editor.Options) (*doltdb.Table, *MergeStats, error) {
+	// For schema changes on Nom data, we don't need to migrate the existing data, because each column is mapped by
+	// a hash key, and isn't a direct []byte lookup, like with Prolly storage, so it's safe to immediately update
+	// the table to the merged schema.
+	mergeTbl, err := tm.leftTbl.UpdateSchema(ctx, mergedSch)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// If any indexes were added during the merge, then we need to generate their row data to add to our updated table.
+	addedIndexesSet := make(map[string]string)
+	for _, index := range mergedSch.Indexes().AllIndexes() {
+		addedIndexesSet[strings.ToLower(index.Name())] = index.Name()
+	}
+	for _, index := range tm.leftSch.Indexes().AllIndexes() {
+		delete(addedIndexesSet, strings.ToLower(index.Name()))
+	}
+	for _, addedIndex := range addedIndexesSet {
+		newIndexData, err := editor.RebuildIndex(ctx, mergeTbl, addedIndex, opts)
+		if err != nil {
+			return nil, nil, err
+		}
+		mergeTbl, err = mergeTbl.SetNomsIndexRows(ctx, addedIndex, newIndexData)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	updatedTblEditor, err := editor.NewTableEditor(ctx, mergeTbl, mergedSch, tm.name, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rows, err := tm.leftTbl.GetNomsRowData(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mergeRows, err := tm.rightTbl.GetNomsRowData(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ancRows, err := tm.ancTbl.GetRowData(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resultTbl, cons, stats, err := mergeNomsTableData(ctx, vrw, tm.name, mergedSch, rows, mergeRows, durable.NomsMapFromIndex(ancRows), updatedTblEditor)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if cons.Len() > 0 {
+		resultTbl, err = setConflicts(ctx, durable.ConflictIndexFromNomsMap(cons, vrw), tm.leftTbl, tm.rightTbl, tm.ancTbl, resultTbl)
+		if err != nil {
+			return nil, nil, err
+		}
+		stats.DataConflicts = int(cons.Len())
+	}
+
+	resultTbl, err = mergeAutoIncrementValues(ctx, tm.leftTbl, tm.rightTbl, resultTbl)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return resultTbl, stats, nil
+}
+
 func mergeNomsTableData(
-	ctx context.Context,
+	ctx *sql.Context,
 	vrw types.ValueReadWriter,
 	tblName string,
 	sch schema.Schema,
@@ -61,7 +134,8 @@ func mergeNomsTableData(
 	changeChan, mergeChangeChan := make(chan types.ValueChanged, 32), make(chan types.ValueChanged, 32)
 
 	originalCtx := ctx
-	eg, ctx := errgroup.WithContext(ctx)
+	eg, errGrCtx := errgroup.WithContext(ctx)
+	ctx = originalCtx.WithContext(errGrCtx)
 
 	eg.Go(func() error {
 		defer close(changeChan)

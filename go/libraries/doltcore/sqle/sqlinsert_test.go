@@ -238,7 +238,7 @@ var BasicInsertTests = []InsertTest{
 	{
 		Name: "insert partial columns existing pk",
 		AdditionalSetup: ExecuteSetupSQL(context.Background(), `
-			CREATE TABLE temppeople (id bigint primary key, first_name varchar(16383), last_name varchar(16383));
+			CREATE TABLE temppeople (id bigint primary key, first_name varchar(1023), last_name varchar(1023));
 			INSERT INTO temppeople VALUES (2, 'Bart', 'Simpson');`),
 		InsertQuery: "insert into temppeople (id, first_name, last_name) values (2, 'Bart', 'Simpson')",
 		ExpectedErr: "duplicate primary key",
@@ -360,7 +360,7 @@ var BasicInsertTests = []InsertTest{
 		SelectQuery: "select id, first_name, last_name, is_married, age, rating from people where id = 7 ORDER BY id",
 		ExpectedRows: ToSqlRows(
 			CompressSchema(SubsetSchema(PeopleTestSchema, "id", "first_name", "last_name", "is_married", "age", "rating")),
-			NewResultSetRow(types.Int(7), types.String("true"), types.String("Simpson" /*"West"*/), types.Int(0), types.Int(1), types.Float(5.1)),
+			NewResultSetRow(types.Int(7), types.String("1"), types.String("Simpson" /*"West"*/), types.Int(0), types.Int(1), types.Float(5.1)),
 		),
 		ExpectedSchema: CompressSchema(SubsetSchema(PeopleTestSchema, "id", "first_name", "last_name", "is_married", "age", "rating")),
 	},
@@ -432,6 +432,7 @@ func testInsertQuery(t *testing.T, test InsertTest) {
 
 	dEnv, err := CreateEmptyTestDatabase()
 	require.NoError(t, err)
+	defer dEnv.DoltDB.Close()
 
 	if test.AdditionalSetup != nil {
 		test.AdditionalSetup(t, dEnv)

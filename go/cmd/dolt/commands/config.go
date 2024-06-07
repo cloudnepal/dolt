@@ -103,7 +103,7 @@ func (cmd ConfigCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd ConfigCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithVariableArgs(cmd.Name())
 	ap.SupportsFlag(globalParamName, "", "Use global config.")
 	ap.SupportsFlag(localParamName, "", "Use repository local config.")
 	ap.SupportsFlag(addOperationStr, "", "Set the value of one or more config parameters")
@@ -116,7 +116,7 @@ func (cmd ConfigCmd) ArgParser() *argparser.ArgParser {
 
 // Exec is used by the config command to allow users to view / edit their global and repository local configurations.
 // Exec executes the command
-func (cmd ConfigCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd ConfigCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, cfgDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
@@ -207,7 +207,13 @@ func addOperation(dEnv *env.DoltEnv, setCfgTypes *set.StrSet, args []string, usa
 
 	updates := make(map[string]string)
 	for i := 0; i < len(args); i += 2 {
-		updates[strings.ToLower(args[i])] = args[i+1]
+		option := strings.ToLower(args[i])
+		value := args[i+1]
+		if _, ok := config.ConfigOptions[option]; !ok && !strings.HasPrefix(option, env.SqlServerGlobalsPrefix) {
+			cli.Println("error: invalid config option, use dolt config --help to check valid configuration variables")
+			return 1
+		}
+		updates[option] = value
 	}
 
 	var cfgType string
@@ -227,7 +233,12 @@ func addOperation(dEnv *env.DoltEnv, setCfgTypes *set.StrSet, args []string, usa
 		case globalParamName:
 			panic("Should not have been able to get this far without a global config.")
 		case localParamName:
-			err := dEnv.Config.CreateLocalConfig(updates)
+			configDir, err := dEnv.FS.Abs(".")
+			if err != nil {
+				cli.PrintErrln(color.RedString("Unable to resolve current path to create repo local config file"))
+				return 1
+			}
+			err = dEnv.Config.CreateLocalConfig(configDir, updates)
 			if err != nil {
 				cli.PrintErrln(color.RedString("Unable to create repo local config file"))
 				return 1

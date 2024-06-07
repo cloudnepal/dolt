@@ -38,7 +38,7 @@ type RefSpec interface {
 	// for the source reference of an operation involving a reference spec
 	SrcRef(cwbRef DoltRef) DoltRef
 
-	// DestRef will take a source reference and return a reference to what shat should be used for the destination
+	// DestRef will take a source reference and return a reference to what should be used for the destination
 	// reference of an operation involving a reference spec.
 	DestRef(srcRef DoltRef) DoltRef
 }
@@ -101,7 +101,7 @@ func ParseRefSpecForRemote(remote, refSpecStr string) (RefSpec, error) {
 	}
 
 	if fromRef.GetType() == BranchRefType && toRef.GetType() == RemoteRefType {
-		return newLocalToRemoteTrackingRef(remote, fromRef.(BranchRef), toRef.(RemoteRef))
+		return NewLocalToRemoteTrackingRef(remote, fromRef.(BranchRef), toRef.(RemoteRef))
 	} else if fromRef.GetType() == BranchRefType && toRef.GetType() == BranchRefType {
 		return NewBranchToBranchRefSpec(fromRef.(BranchRef), toRef.(BranchRef))
 	} else if fromRef.GetType() == TagRefType && toRef.GetType() == TagRefType {
@@ -206,7 +206,7 @@ type BranchToTrackingBranchRefSpec struct {
 	remRefToLocal branchMapper
 }
 
-func newLocalToRemoteTrackingRef(remote string, srcRef BranchRef, destRef RemoteRef) (RefSpec, error) {
+func NewLocalToRemoteTrackingRef(remote string, srcRef BranchRef, destRef RemoteRef) (RefSpec, error) {
 	srcWCs := strings.Count(srcRef.GetPath(), "*")
 	destWCs := strings.Count(destRef.GetPath(), "*")
 
@@ -224,7 +224,7 @@ func newLocalToRemoteTrackingRef(remote string, srcRef BranchRef, destRef Remote
 		if srcWCs == 0 {
 			srcPattern := strPattern(srcRef.GetPath())
 			destPattern := strPattern(destRef.GetPath())
-			srcToDestMapper := identityBranchMapper(destRef.GetPath()[len(remoteInRef):])
+			srcToDestMapper := identityBranchMapper(destRef.GetPath()[len(remoteInRef)+1:])
 			destToSrcMapper := identityBranchMapper(srcRef.GetPath())
 
 			return BranchToTrackingBranchRefSpec{

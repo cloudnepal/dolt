@@ -22,17 +22,19 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/fatih/color"
 
 	eventsapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/eventsapi/v1alpha1"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/events"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
+	config "github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/store/nbs"
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-func isHelp(str string) bool {
+func IsHelp(str string) bool {
 	str = strings.TrimSpace(str)
 
 	if len(str) == 0 {
@@ -50,7 +52,7 @@ func isHelp(str string) bool {
 
 func hasHelpFlag(args []string) bool {
 	for _, arg := range args {
-		if isHelp(arg) {
+		if IsHelp(arg) {
 			return true
 		}
 	}
@@ -64,7 +66,7 @@ type Command interface {
 	// Description returns a description of the command
 	Description() string
 	// Exec executes the command
-	Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int
+	Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx CliContext) int
 	// Docs returns the documentation for this command, or nil if it's undocumented
 	Docs() *CommandDocumentation
 	// ArgParser returns the arg parser for this command
@@ -78,6 +80,12 @@ type SignalCommand interface {
 
 	// InstallsSignalHandlers returns whether this command manages its own signal handlers for interruption / termination.
 	InstallsSignalHandlers() bool
+}
+
+// Queryist is generic interface for executing queries. Commands will be provided a Queryist to perform any work using
+// SQL. The Queryist can be obtained from the CliContext passed into the Exec method by calling the QueryEngine method.
+type Queryist interface {
+	Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, error)
 }
 
 // This type is to store the content of a documented command, elsewhere we can transform this struct into
@@ -169,9 +177,9 @@ func (hc SubCommandHandler) Hidden() bool {
 	return hc.hidden
 }
 
-func (hc SubCommandHandler) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (hc SubCommandHandler) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx CliContext) int {
 	if len(args) < 1 && hc.Unspecified == nil {
-		hc.printUsage(commandStr)
+		hc.PrintUsage(commandStr)
 		return 1
 	}
 
@@ -183,23 +191,23 @@ func (hc SubCommandHandler) Exec(ctx context.Context, commandStr string, args []
 	for _, cmd := range hc.Subcommands {
 		lwrName := strings.ToLower(cmd.Name())
 		if lwrName == subCommandStr {
-			return hc.handleCommand(ctx, commandStr+" "+subCommandStr, cmd, args[1:], dEnv)
+			return hc.handleCommand(ctx, commandStr+" "+subCommandStr, cmd, args[1:], dEnv, cliCtx)
 		}
 	}
 	if hc.Unspecified != nil {
-		return hc.handleCommand(ctx, commandStr, hc.Unspecified, args, dEnv)
+		return hc.handleCommand(ctx, commandStr, hc.Unspecified, args, dEnv, cliCtx)
 	}
 
-	if !isHelp(subCommandStr) {
+	if !IsHelp(subCommandStr) {
 		PrintErrln(color.RedString("Unknown Command " + subCommandStr))
 		return 1
 	}
 
-	hc.printUsage(commandStr)
+	hc.PrintUsage(commandStr)
 	return 0
 }
 
-func (hc SubCommandHandler) handleCommand(ctx context.Context, commandStr string, cmd Command, args []string, dEnv *env.DoltEnv) int {
+func (hc SubCommandHandler) handleCommand(ctx context.Context, commandStr string, cmd Command, args []string, dEnv *env.DoltEnv, cliCtx CliContext) int {
 	cmdRequiresRepo := true
 	if rnrCmd, ok := cmd.(RepoNotRequiredCommand); ok {
 		cmdRequiresRepo = rnrCmd.RequiresRepo()
@@ -234,10 +242,10 @@ func (hc SubCommandHandler) handleCommand(ctx context.Context, commandStr string
 		return 1
 	}
 
-	ret := cmd.Exec(ctx, commandStr, args, dEnv)
+	ret := cmd.Exec(ctx, commandStr, args, dEnv, cliCtx)
 
 	if evt != nil {
-		events.GlobalCollector.CloseEventAndAdd(evt)
+		events.GlobalCollector().CloseEventAndAdd(evt)
 	}
 
 	return ret
@@ -246,7 +254,7 @@ func (hc SubCommandHandler) handleCommand(ctx context.Context, commandStr string
 // CheckEnvIsValid validates that a DoltEnv has been initialized properly and no errors occur during load, and prints
 // error messages to the user if there are issues with the environment or if errors were encountered while loading it.
 func CheckEnvIsValid(dEnv *env.DoltEnv) bool {
-	if !dEnv.HasDoltDir() {
+	if !dEnv.HasDoltDataDir() {
 		PrintErrln(color.RedString("The current directory is not a valid dolt repository."))
 		PrintErrln("run: dolt init before trying to run this command")
 		return false
@@ -286,14 +294,14 @@ fatal: empty ident name not allowed
 
 // CheckUserNameAndEmail returns true if the user name and email are set for this environment, or prints an error and
 // returns false if not.
-func CheckUserNameAndEmail(dEnv *env.DoltEnv) bool {
-	_, err := dEnv.Config.GetString(env.UserEmailKey)
+func CheckUserNameAndEmail(cfg *env.DoltCliConfig) bool {
+	_, err := cfg.GetString(config.UserEmailKey)
 	if err != nil {
 		PrintErr(userNameRequiredError)
 		return false
 	}
 
-	_, err = dEnv.Config.GetString(env.UserNameKey)
+	_, err = cfg.GetString(config.UserNameKey)
 	if err != nil {
 		PrintErr(userNameRequiredError)
 		return false
@@ -302,8 +310,8 @@ func CheckUserNameAndEmail(dEnv *env.DoltEnv) bool {
 	return true
 }
 
-func (hc SubCommandHandler) printUsage(commandStr string) {
-	Println("Valid commands for", commandStr, "are")
+func (hc SubCommandHandler) GetUsage(commandStr string) string {
+	str := "Valid commands for " + commandStr + " are\n"
 
 	for _, cmd := range hc.Subcommands {
 		if hiddenCmd, ok := cmd.(HiddenCommand); ok {
@@ -312,6 +320,13 @@ func (hc SubCommandHandler) printUsage(commandStr string) {
 			}
 		}
 
-		Printf("    %16s - %s\n", cmd.Name(), cmd.Description())
+		str += fmt.Sprintf("    %16s - %s\n", cmd.Name(), cmd.Description())
 	}
+
+	return str
+}
+
+func (hc SubCommandHandler) PrintUsage(commandStr string) {
+	usage := hc.GetUsage(commandStr)
+	Println(usage)
 }

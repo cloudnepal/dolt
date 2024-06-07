@@ -3,6 +3,7 @@ load $BATS_TEST_DIRNAME/helper/common.bash
 
 setup() {
     setup_common
+    export DOLT_DBNAME_REPLACE="true"
     database_name=dolt_repo_$$
 
     dolt sql -q "CREATE TABLE test(pk int PRIMARY KEY, color varchar(200))"
@@ -44,6 +45,7 @@ use $database_name/branch1;
 show databases;
 SQL
     [ "$status" -eq "0" ]
+    [[ "$output" =~ "$database_name" ]] || false
     [[ "$output" =~ "$database_name/branch1" ]] || false
 
     # Can be used as part of a fully qualified table name
@@ -80,6 +82,7 @@ use $database_name/v1;
 show databases;
 SQL
     [ "$status" -eq "0" ]
+    [[ "$output" =~ "$database_name" ]] || false
     [[ "$output" =~ "$database_name/v1" ]] || false
 
     # Can be used as part of a fully qualified table name
@@ -118,6 +121,7 @@ use $database_name/$commit;
 show databases;
 SQL
     [ "$status" -eq "0" ]
+    [[ "$output" =~ "$database_name" ]] || false
     [[ "$output" =~ "$database_name/$commit" ]] || false
 
     # Can be used as part of a fully qualified table name

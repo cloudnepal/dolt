@@ -28,17 +28,26 @@ import (
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
-const HashOfFuncName = "hashof"
+const DeprecatedHashOfFuncName = "hashof"
+const HashOfFuncName = "dolt_hashof"
 
 type HashOf struct {
 	expression.UnaryExpression
+	name string
 }
 
 var _ sql.FunctionExpression = (*HashOf)(nil)
 
-// NewHashOf creates a new HashOf expression.
-func NewHashOf(e sql.Expression) sql.Expression {
-	return &HashOf{expression.UnaryExpression{Child: e}}
+// NewHashOfFunc creates a constructor for a Hashof function which will properly initialize the name
+func NewHashOfFunc(name string) sql.CreateFunc1Args {
+	return func(e sql.Expression) sql.Expression {
+		return newHashOf(e, name)
+	}
+}
+
+// newHashOf creates a new HashOf expression.
+func newHashOf(e sql.Expression, name string) sql.Expression {
+	return &HashOf{expression.UnaryExpression{Child: e}, name}
 }
 
 // Eval implements the Expression interface.
@@ -74,6 +83,7 @@ func (t *HashOf) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 	if strings.ToUpper(name) == "HEAD" {
 		sess := dsess.DSessFromSess(ctx.Session)
 
+		// TODO: this should resolve the current DB through the analyzer so it can use the revision qualified name here
 		cm, err = sess.GetHeadCommit(ctx, dbName)
 		if err != nil {
 			return nil, err
@@ -84,9 +94,13 @@ func (t *HashOf) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 			hsh, parsed := hash.MaybeParse(name)
 			if parsed {
 				orgErr := err
-				cm, err = ddb.ReadCommit(ctx, hsh)
+				optCmt, err := ddb.ReadCommit(ctx, hsh)
 				if err != nil {
 					return nil, orgErr
+				}
+				cm, ok = optCmt.ToCommit()
+				if !ok {
+					return nil, doltdb.ErrGhostCommitEncountered
 				}
 			} else {
 				return nil, err
@@ -99,9 +113,13 @@ func (t *HashOf) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 		}
 	}
 
-	cm, err = cm.GetAncestor(ctx, as)
+	optCmt, err := cm.GetAncestor(ctx, as)
 	if err != nil {
 		return nil, err
+	}
+	cm, ok = optCmt.ToCommit()
+	if !ok {
+		return nil, doltdb.ErrGhostCommitEncountered
 	}
 
 	h, err := cm.HashOf()
@@ -114,12 +132,12 @@ func (t *HashOf) Eval(ctx *sql.Context, row sql.Row) (interface{}, error) {
 
 // String implements the Stringer interface.
 func (t *HashOf) String() string {
-	return fmt.Sprintf("HASHOF(%s)", t.Child.String())
+	return fmt.Sprintf("%s(%s)", t.name, t.Child.String())
 }
 
 // FunctionName implements the FunctionExpression interface
 func (t *HashOf) FunctionName() string {
-	return HashOfFuncName
+	return t.name
 }
 
 // Description implements the FunctionExpression interface
@@ -137,7 +155,7 @@ func (t *HashOf) WithChildren(children ...sql.Expression) (sql.Expression, error
 	if len(children) != 1 {
 		return nil, sql.ErrInvalidChildrenNumber.New(t, len(children), 1)
 	}
-	return NewHashOf(children[0]), nil
+	return newHashOf(children[0], t.name), nil
 }
 
 // Type implements the Expression interface.

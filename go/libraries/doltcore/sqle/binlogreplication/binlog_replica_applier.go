@@ -26,17 +26,18 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
-	"github.com/dolthub/go-mysql-server/sql/parse"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
+	"github.com/dolthub/go-mysql-server/sql/rowexec"
 	"github.com/dolthub/go-mysql-server/sql/types"
 	"github.com/dolthub/vitess/go/mysql"
 	"github.com/dolthub/vitess/go/sqltypes"
 	vquery "github.com/dolthub/vitess/go/vt/proto/query"
 	"github.com/sirupsen/logrus"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/globalstate"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqlserver"
 )
@@ -288,12 +289,11 @@ func (a *binlogReplicaApplier) replicaBinlogEventHandler(ctx *sql.Context) error
 
 		case err := <-eventProducer.ErrorChan():
 			if sqlError, isSqlError := err.(*mysql.SQLError); isSqlError {
-				if sqlError.Message == io.EOF.Error() {
-					ctx.GetLogger().Trace("No more binlog messages; retrying in 1s...")
-					time.Sleep(1 * time.Second)
-				} else if strings.HasPrefix(sqlError.Message, io.ErrUnexpectedEOF.Error()) {
+				badConnection := sqlError.Message == io.EOF.Error() ||
+					strings.HasPrefix(sqlError.Message, io.ErrUnexpectedEOF.Error())
+				if badConnection {
 					DoltBinlogReplicaController.updateStatus(func(status *binlogreplication.ReplicaStatus) {
-						status.LastIoError = io.ErrUnexpectedEOF.Error()
+						status.LastIoError = sqlError.Message
 						status.LastIoErrNumber = ERNetReadError
 						currentTime := time.Now()
 						status.LastIoErrorTimestamp = &currentTime
@@ -683,7 +683,7 @@ func (a *binlogReplicaApplier) processRowEvent(ctx *sql.Context, event mysql.Bin
 //
 
 // closeWriteSession flushes and closes the specified |writeSession| and returns an error if anything failed.
-func closeWriteSession(ctx *sql.Context, engine *gms.Engine, databaseName string, writeSession writer.WriteSession) error {
+func closeWriteSession(ctx *sql.Context, engine *gms.Engine, databaseName string, writeSession dsess.WriteSession) error {
 	newWorkingSet, err := writeSession.Flush(ctx)
 	if err != nil {
 		return err
@@ -706,7 +706,7 @@ func closeWriteSession(ctx *sql.Context, engine *gms.Engine, databaseName string
 		return err
 	}
 
-	return sqlDatabase.DbData().Ddb.UpdateWorkingSet(ctx, newWorkingSet.Ref(), newWorkingSet, hash, newWorkingSet.Meta())
+	return sqlDatabase.DbData().Ddb.UpdateWorkingSet(ctx, newWorkingSet.Ref(), newWorkingSet, hash, newWorkingSet.Meta(), nil)
 }
 
 // getTableSchema returns a sql.Schema for the specified table in the specified database.
@@ -727,7 +727,7 @@ func getTableSchema(ctx *sql.Context, engine *gms.Engine, tableName, databaseNam
 }
 
 // getTableWriter returns a WriteSession and a TableWriter for writing to the specified |table| in the specified |database|.
-func getTableWriter(ctx *sql.Context, engine *gms.Engine, tableName, databaseName string, foreignKeyChecksDisabled bool) (writer.WriteSession, writer.TableWriter, error) {
+func getTableWriter(ctx *sql.Context, engine *gms.Engine, tableName, databaseName string, foreignKeyChecksDisabled bool) (dsess.WriteSession, dsess.TableWriter, error) {
 	database, err := engine.Analyzer.Catalog.Database(ctx, databaseName)
 	if err != nil {
 		return nil, nil, err
@@ -747,7 +747,7 @@ func getTableWriter(ctx *sql.Context, engine *gms.Engine, tableName, databaseNam
 		return nil, nil, err
 	}
 
-	tracker, err := globalstate.NewAutoIncrementTracker(ctx, ws)
+	tracker, err := dsess.NewAutoIncrementTracker(ctx, sqlDatabase.Name(), ws)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -757,8 +757,9 @@ func getTableWriter(ctx *sql.Context, engine *gms.Engine, tableName, databaseNam
 	writeSession := writer.NewWriteSession(binFormat, ws, tracker, options)
 
 	ds := dsess.DSessFromSess(ctx.Session)
-	setter := ds.SetRoot
-	tableWriter, err := writeSession.GetTableWriter(ctx, tableName, databaseName, setter, false)
+	setter := ds.SetWorkingRoot
+
+	tableWriter, err := writeSession.GetTableWriter(ctx, doltdb.TableName{Name: tableName}, databaseName, setter)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -837,16 +838,16 @@ func convertSqlTypesValue(ctx *sql.Context, value sqltypes.Value, column *sql.Co
 		if err != nil {
 			return nil, err
 		}
-		convertedValue, err = column.Type.Convert(atoi)
+		convertedValue, _, err = column.Type.Convert(atoi)
 	case types.IsDecimal(column.Type):
 		// Decimal values need to have any leading/trailing whitespace trimmed off
 		// TODO: Consider moving this into DecimalType_.Convert; if DecimalType_.Convert handled trimming
 		//       leading/trailing whitespace, this special case for Decimal types wouldn't be needed.
-		convertedValue, err = column.Type.Convert(strings.TrimSpace(value.ToString()))
+		convertedValue, _, err = column.Type.Convert(strings.TrimSpace(value.ToString()))
 	case types.IsJSON(column.Type):
 		convertedValue, err = convertVitessJsonExpressionString(ctx, value)
 	default:
-		convertedValue, err = column.Type.Convert(value.ToString())
+		convertedValue, _, err = column.Type.Convert(value.ToString())
 	}
 	if err != nil {
 		return nil, fmt.Errorf("unable to convert value %q, for column of type %T: %v", value.ToString(), column.Type, err.Error())
@@ -871,21 +872,23 @@ func convertVitessJsonExpressionString(ctx *sql.Context, value sqltypes.Value) (
 		strValue = strValue[len("EXPRESSION(") : len(strValue)-1]
 	}
 
-	node, err := parse.Parse(ctx, "SELECT "+strValue)
-	if err != nil {
-		return nil, err
-	}
-
 	server := sqlserver.GetRunningServer()
 	if server == nil {
 		return nil, fmt.Errorf("unable to access running SQL server")
+	}
+
+	binder := planbuilder.New(ctx, server.Engine.Analyzer.Catalog, server.Engine.Parser)
+	node, _, _, err := binder.Parse("SELECT "+strValue, false)
+	if err != nil {
+		return nil, err
 	}
 
 	analyze, err := server.Engine.Analyzer.Analyze(ctx, node, nil)
 	if err != nil {
 		return nil, err
 	}
-	rowIter, err := analyze.RowIter(ctx, nil)
+
+	rowIter, err := rowexec.DefaultBuilder.Build(ctx, analyze, nil)
 	if err != nil {
 		return nil, err
 	}

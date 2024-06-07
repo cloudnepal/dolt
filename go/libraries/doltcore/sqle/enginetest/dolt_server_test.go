@@ -31,6 +31,9 @@ import (
 
 	"github.com/dolthub/dolt/go/cmd/dolt/commands/sqlserver"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dtestutils"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/servercfg"
+	"github.com/dolthub/dolt/go/libraries/utils/svcs"
 )
 
 // DoltBranchMultiSessionScriptTests contain tests that need to be run in a multi-session server environment
@@ -46,7 +49,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 		Assertions: []queries.ScriptTestAssertion{
 			{
 				Query:    "/* client a */ CALL DOLT_CHECKOUT('branch1');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'branch1'"}},
 			},
 			{
 				Query:    "/* client a */ select active_branch();",
@@ -54,11 +57,11 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:          "/* client b */ CALL DOLT_BRANCH('-d', 'branch1');",
-				ExpectedErrStr: "Error 1105: unsafe to delete or rename branches in use in other sessions; use --force to force the change",
+				ExpectedErrStr: "Error 1105 (HY000): unsafe to delete or rename branches in use in other sessions; use --force to force the change",
 			},
 			{
 				Query:    "/* client a */ CALL DOLT_CHECKOUT('branch2');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'branch2'"}},
 			},
 			{
 				Query:    "/* client b */ CALL DOLT_BRANCH('-d', 'branch1');",
@@ -66,7 +69,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:          "/* client b */ CALL DOLT_BRANCH('-d', 'branch2');",
-				ExpectedErrStr: "Error 1105: unsafe to delete or rename branches in use in other sessions; use --force to force the change",
+				ExpectedErrStr: "Error 1105 (HY000): unsafe to delete or rename branches in use in other sessions; use --force to force the change",
 			},
 			{
 				Query:    "/* client b */ CALL DOLT_BRANCH('-df', 'branch2');",
@@ -87,7 +90,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 		Assertions: []queries.ScriptTestAssertion{
 			{
 				Query:    "/* client a */ CALL DOLT_CHECKOUT('branch1');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'branch1'"}},
 			},
 			{
 				Query:    "/* client a */ select active_branch();",
@@ -95,7 +98,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:          "/* client b */ CALL DOLT_BRANCH('-m', 'branch1', 'movedBranch1');",
-				ExpectedErrStr: "Error 1105: unsafe to delete or rename branches in use in other sessions; use --force to force the change",
+				ExpectedErrStr: "Error 1105 (HY000): unsafe to delete or rename branches in use in other sessions; use --force to force the change",
 			},
 			{
 				Query:    "/* client b */ CALL DOLT_BRANCH('-mf', 'branch1', 'movedBranch1');",
@@ -136,7 +139,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:          "/* client a */ CALL DOLT_BRANCH('-d', 'branch2');",
-				ExpectedErrStr: "Error 1105: unsafe to delete or rename branches in use in other sessions; use --force to force the change",
+				ExpectedErrStr: "Error 1105 (HY000): unsafe to delete or rename branches in use in other sessions; use --force to force the change",
 			},
 			{
 				Query:    "/* client a */ CALL DOLT_BRANCH('-df', 'branch2');",
@@ -145,6 +148,10 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			{
 				Query:    "/* client a */ SHOW DATABASES;",
 				Expected: []sql.Row{{"dolt"}, {"dolt/branch1"}, {"information_schema"}, {"mysql"}},
+			},
+			{
+				Query:    "/* client a */ SELECT DATABASE(), ACTIVE_BRANCH();",
+				Expected: []sql.Row{{"dolt/branch1", "branch1"}},
 			},
 			{
 				// Call a stored procedure since this searches across all databases and will
@@ -183,7 +190,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:          "/* client a */ CALL DOLT_BRANCH('-m', 'branch2', 'newName');",
-				ExpectedErrStr: "Error 1105: unsafe to delete or rename branches in use in other sessions; use --force to force the change",
+				ExpectedErrStr: "Error 1105 (HY000): unsafe to delete or rename branches in use in other sessions; use --force to force the change",
 			},
 			{
 				Query:    "/* client a */ CALL DOLT_BRANCH('-mf', 'branch2', 'newName');",
@@ -210,7 +217,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:    "/* client a */ CALL DOLT_CHECKOUT('-b', 'branch1');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'branch1'"}},
 			},
 			{
 				Query:    "/* client a */ select active_branch();",
@@ -234,11 +241,11 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:          "/* client a */ select name from dolt_branches;",
-				ExpectedErrStr: "Error 1105: current branch has been force deleted. run 'USE <database>/<branch>' to checkout a different branch, or reconnect to the server",
+				ExpectedErrStr: "Error 1049 (HY000): database not found: dolt/branch1",
 			},
 			{
 				Query:          "/* client a */ CALL DOLT_CHECKOUT('main');",
-				ExpectedErrStr: "Error 1105: current branch has been force deleted. run 'USE <database>/<branch>' to checkout a different branch, or reconnect to the server",
+				ExpectedErrStr: "Error 1049 (HY000): database not found: dolt/branch1",
 			},
 			{
 				Query:    "/* client a */ USE dolt/main;",
@@ -259,7 +266,7 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:    "/* client a */ CALL DOLT_CHECKOUT('-b', 'branch1');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'branch1'"}},
 			},
 			{
 				Query:    "/* client a */ select active_branch();",
@@ -283,11 +290,12 @@ var DoltBranchMultiSessionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:          "/* client a */ select name from dolt_branches;",
-				ExpectedErrStr: "Error 1105: current branch has been force deleted. run 'USE <database>/<branch>' to checkout a different branch, or reconnect to the server",
+				ExpectedErrStr: "Error 1049 (HY000): database not found: dolt/branch1",
 			},
 			{
+				// TODO: this could be handled better, not the best experience. Maybe kill the session?
 				Query:          "/* client a */ CALL DOLT_CHECKOUT('main');",
-				ExpectedErrStr: "Error 1105: current branch has been force deleted. run 'USE <database>/<branch>' to checkout a different branch, or reconnect to the server",
+				ExpectedErrStr: "Error 1049 (HY000): database not found: dolt/branch1",
 			},
 			{
 				Query:    "/* client a */ USE dolt/main;",
@@ -404,13 +412,63 @@ var DropDatabaseMultiSessionScriptTests = []queries.ScriptTest{
 				Expected: []sql.Row{},
 			},
 			{
-				// At this point, this is an invalid revision database, and any queries against it will fail.
 				Query:    "/* client b */ select database();",
 				Expected: []sql.Row{{"db01/branch1"}},
 			},
 			{
 				Query:          "/* client b */ show tables;",
-				ExpectedErrStr: "Error 1105: database not found: db01/branch1",
+				ExpectedErrStr: "Error 1049 (HY000): database not found: db01/branch1",
+			},
+		},
+	},
+}
+
+var PersistVariableTests = []queries.ScriptTest{
+	{
+		Name: "set persisted variables with on and off",
+		SetUpScript: []string{
+			"set @@persist.dolt_skip_replication_errors = on;",
+			"set @@persist.dolt_read_replica_force_pull = off;",
+		},
+	},
+	{
+		Name: "retrieve persisted variables",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select @@dolt_skip_replication_errors",
+				Expected: []sql.Row{
+					{1},
+				},
+			},
+			{
+				Query: "select @@dolt_read_replica_force_pull",
+				Expected: []sql.Row{
+					{0},
+				},
+			},
+		},
+	},
+	{
+		Name: "set persisted variables with 1 and 0",
+		SetUpScript: []string{
+			"set @@persist.dolt_skip_replication_errors = 0;",
+			"set @@persist.dolt_read_replica_force_pull = 1;",
+		},
+	},
+	{
+		Name: "retrieve persisted variables",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select @@dolt_skip_replication_errors",
+				Expected: []sql.Row{
+					{0},
+				},
+			},
+			{
+				Query: "select @@dolt_read_replica_force_pull",
+				Expected: []sql.Row{
+					{1},
+				},
 			},
 		},
 	},
@@ -428,12 +486,18 @@ func TestDropDatabaseMultiSessionBehavior(t *testing.T) {
 	testMultiSessionScriptTests(t, DropDatabaseMultiSessionScriptTests)
 }
 
+// TestPersistVariable tests persisting variables across server starts
+func TestPersistVariable(t *testing.T) {
+	testSerialSessionScriptTests(t, PersistVariableTests)
+}
+
 func testMultiSessionScriptTests(t *testing.T, tests []queries.ScriptTest) {
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
-			sc, serverConfig := startServer(t, true, "", "")
+			dEnv, sc, serverConfig := startServer(t, true, "", "")
 			err := sc.WaitForStart()
 			require.NoError(t, err)
+			defer dEnv.DoltDB.Close()
 
 			conn1, sess1 := newConnection(t, serverConfig)
 			conn2, sess2 := newConnection(t, serverConfig)
@@ -460,7 +524,66 @@ func testMultiSessionScriptTests(t *testing.T, tests []queries.ScriptTest) {
 						if len(assertion.ExpectedErrStr) > 0 {
 							require.EqualError(t, err, assertion.ExpectedErrStr)
 						} else if assertion.ExpectedErr != nil {
-							require.True(t, assertion.ExpectedErr.Is(err))
+							require.True(t, assertion.ExpectedErr.Is(err), "expected error %v, got %v", assertion.ExpectedErr, err)
+						} else if assertion.Expected != nil {
+							require.NoError(t, err)
+							assertResultsEqual(t, assertion.Expected, rows)
+						} else if assertion.SkipResultsCheck {
+							// no-op
+						} else {
+							t.Fatalf("unsupported ScriptTestAssertion property: %v", assertion)
+						}
+						if rows != nil {
+							require.NoError(t, rows.Close())
+						}
+					})
+				}
+			})
+
+			require.NoError(t, conn1.Close())
+			require.NoError(t, conn2.Close())
+
+			sc.Stop()
+			err = sc.WaitForStop()
+			require.NoError(t, err)
+		})
+	}
+}
+
+// testSerialSessionScriptTests creates an environment, then for each script starts a server and runs assertions,
+// stopping the server in between scripts. Unlike other script test executors, scripts may influence later scripts in
+// the block.
+func testSerialSessionScriptTests(t *testing.T, tests []queries.ScriptTest) {
+	dEnv := dtestutils.CreateTestEnv()
+	serverConfig := sqlserver.DefaultCommandLineServerConfig()
+	rand.Seed(time.Now().UnixNano())
+	port := 15403 + rand.Intn(25)
+	serverConfig = serverConfig.WithPort(port)
+	defer dEnv.DoltDB.Close()
+
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			sc, serverConfig := startServerOnEnv(t, serverConfig, dEnv)
+			err := sc.WaitForStart()
+			require.NoError(t, err)
+
+			conn1, sess1 := newConnection(t, serverConfig)
+
+			t.Run(test.Name, func(t *testing.T) {
+				for _, setupStatement := range test.SetUpScript {
+					_, err := sess1.Exec(setupStatement)
+					require.NoError(t, err)
+				}
+
+				for _, assertion := range test.Assertions {
+					t.Run(assertion.Query, func(t *testing.T) {
+						activeSession := sess1
+						rows, err := activeSession.Query(assertion.Query)
+
+						if len(assertion.ExpectedErrStr) > 0 {
+							require.EqualError(t, err, assertion.ExpectedErrStr)
+						} else if assertion.ExpectedErr != nil {
+							require.True(t, assertion.ExpectedErr.Is(err), "expected error %v, got %v", assertion.ExpectedErr, err)
 						} else if assertion.Expected != nil {
 							require.NoError(t, err)
 							assertResultsEqual(t, assertion.Expected, rows)
@@ -475,10 +598,9 @@ func testMultiSessionScriptTests(t *testing.T, tests []queries.ScriptTest) {
 			})
 
 			require.NoError(t, conn1.Close())
-			require.NoError(t, conn2.Close())
 
-			sc.StopServer()
-			err = sc.WaitForClose()
+			sc.Stop()
+			err = sc.WaitForStop()
 			require.NoError(t, err)
 		})
 	}
@@ -539,10 +661,9 @@ func assertResultsEqual(t *testing.T, expected []sql.Row, rows *gosql.Rows) {
 }
 
 // startServer will start sql-server with given host, unix socket file path and whether to use specific port, which is defined randomly.
-func startServer(t *testing.T, withPort bool, host string, unixSocketPath string) (*sqlserver.ServerController, sqlserver.ServerConfig) {
+func startServer(t *testing.T, withPort bool, host string, unixSocketPath string) (*env.DoltEnv, *svcs.Controller, servercfg.ServerConfig) {
 	dEnv := dtestutils.CreateTestEnv()
-	serverConfig := sqlserver.DefaultServerConfig()
-
+	serverConfig := sqlserver.DefaultCommandLineServerConfig()
 	if withPort {
 		rand.Seed(time.Now().UnixNano())
 		port := 15403 + rand.Intn(25)
@@ -555,7 +676,12 @@ func startServer(t *testing.T, withPort bool, host string, unixSocketPath string
 		serverConfig = serverConfig.WithSocket(unixSocketPath)
 	}
 
-	sc := sqlserver.NewServerController()
+	onEnv, config := startServerOnEnv(t, serverConfig, dEnv)
+	return dEnv, onEnv, config
+}
+
+func startServerOnEnv(t *testing.T, serverConfig servercfg.ServerConfig, dEnv *env.DoltEnv) (*svcs.Controller, servercfg.ServerConfig) {
+	sc := svcs.NewController()
 	go func() {
 		_, _ = sqlserver.Serve(context.Background(), "0.0.0", serverConfig, sc, dEnv)
 	}()
@@ -566,9 +692,9 @@ func startServer(t *testing.T, withPort bool, host string, unixSocketPath string
 }
 
 // newConnection takes sqlserver.serverConfig and opens a connection, and will return that connection with a new session
-func newConnection(t *testing.T, serverConfig sqlserver.ServerConfig) (*dbr.Connection, *dbr.Session) {
+func newConnection(t *testing.T, serverConfig servercfg.ServerConfig) (*dbr.Connection, *dbr.Session) {
 	const dbName = "dolt"
-	conn, err := dbr.Open("mysql", sqlserver.ConnectionString(serverConfig, dbName), nil)
+	conn, err := dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
 	require.NoError(t, err)
 	sess := conn.NewSession(nil)
 	return conn, sess
@@ -581,9 +707,10 @@ func TestDoltServerRunningUnixSocket(t *testing.T) {
 	const defaultUnixSocketPath = "/tmp/mysql.sock"
 
 	// Running unix socket server
-	sc, serverConfig := startServer(t, false, "", defaultUnixSocketPath)
+	dEnv, sc, serverConfig := startServer(t, false, "", defaultUnixSocketPath)
 	sc.WaitForStart()
-	require.True(t, strings.Contains(sqlserver.ConnectionString(serverConfig, "dolt"), "unix"))
+	defer dEnv.DoltDB.Close()
+	require.True(t, strings.Contains(servercfg.ConnectionString(serverConfig, "dolt"), "unix"))
 
 	// default unix socket connection works
 	localConn, localSess := newConnection(t, serverConfig)
@@ -593,21 +720,21 @@ func TestDoltServerRunningUnixSocket(t *testing.T) {
 
 	t.Run("connecting to local server with tcp connections", func(t *testing.T) {
 		// connect with port defined
-		serverConfigWithPortOnly := sqlserver.DefaultServerConfig().WithPort(3306)
+		serverConfigWithPortOnly := sqlserver.DefaultCommandLineServerConfig().WithPort(3306)
 		conn1, sess1 := newConnection(t, serverConfigWithPortOnly)
 		rows1, err := sess1.Query("select 1")
 		require.NoError(t, err)
 		assertResultsEqual(t, []sql.Row{{1}}, rows1)
 
 		// connect with host defined
-		serverConfigWithPortandHost := sqlserver.DefaultServerConfig().WithHost("127.0.0.1")
+		serverConfigWithPortandHost := sqlserver.DefaultCommandLineServerConfig().WithHost("127.0.0.1")
 		conn2, sess2 := newConnection(t, serverConfigWithPortandHost)
 		rows2, err := sess2.Query("select 1")
 		require.NoError(t, err)
 		assertResultsEqual(t, []sql.Row{{1}}, rows2)
 
 		// connect with port and host defined
-		serverConfigWithPortandHost1 := sqlserver.DefaultServerConfig().WithPort(3306).WithHost("0.0.0.0")
+		serverConfigWithPortandHost1 := sqlserver.DefaultCommandLineServerConfig().WithPort(3306).WithHost("0.0.0.0")
 		conn3, sess3 := newConnection(t, serverConfigWithPortandHost1)
 		rows3, err := sess3.Query("select 1")
 		require.NoError(t, err)
@@ -622,19 +749,20 @@ func TestDoltServerRunningUnixSocket(t *testing.T) {
 	require.NoError(t, localConn.Close())
 
 	// Stopping unix socket server
-	sc.StopServer()
-	err = sc.WaitForClose()
+	sc.Stop()
+	err = sc.WaitForStop()
 	require.NoError(t, err)
 	require.NoFileExists(t, defaultUnixSocketPath)
 
 	// Running TCP socket server
-	tcpSc, tcpServerConfig := startServer(t, true, "0.0.0.0", "")
+	dEnv, tcpSc, tcpServerConfig := startServer(t, true, "0.0.0.0", "")
 	tcpSc.WaitForStart()
-	require.False(t, strings.Contains(sqlserver.ConnectionString(tcpServerConfig, "dolt"), "unix"))
+	defer dEnv.DoltDB.Close()
+	require.False(t, strings.Contains(servercfg.ConnectionString(tcpServerConfig, "dolt"), "unix"))
 
 	t.Run("host and port specified, there should not be unix socket created", func(t *testing.T) {
 		// unix socket connection should fail
-		localServerConfig := sqlserver.DefaultServerConfig().WithSocket(defaultUnixSocketPath)
+		localServerConfig := sqlserver.DefaultCommandLineServerConfig().WithSocket(defaultUnixSocketPath)
 		conn, sess := newConnection(t, localServerConfig)
 		_, err := sess.Query("select 1")
 		require.Error(t, err)
@@ -649,7 +777,7 @@ func TestDoltServerRunningUnixSocket(t *testing.T) {
 	})
 
 	// Stopping TCP socket server
-	tcpSc.StopServer()
-	err = tcpSc.WaitForClose()
+	tcpSc.Stop()
+	err = tcpSc.WaitForStop()
 	require.NoError(t, err)
 }

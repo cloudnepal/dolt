@@ -82,6 +82,10 @@ func (e *StaticErrorEditor) SetAutoIncrementValue(*sql.Context, uint64) error {
 	return e.err
 }
 
+func (e *StaticErrorEditor) AcquireAutoIncrementLock(ctx *sql.Context) (func(), error) {
+	return func() {}, nil
+}
+
 func (e *StaticErrorEditor) StatementBegin(ctx *sql.Context) {}
 
 func (e *StaticErrorEditor) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
@@ -101,8 +105,12 @@ func (e *StaticErrorEditor) Close(*sql.Context) error {
 	return nil
 }
 
-func (e *StaticErrorEditor) IndexedAccess(_ sql.IndexLookup) sql.IndexedTable {
+func (e *StaticErrorEditor) IndexedAccess(lookup sql.IndexLookup) sql.IndexedTable {
 	return &StaticErrorTable{nil, e.err}
+}
+
+func (e *StaticErrorEditor) PreciseMatch() bool {
+	return true
 }
 
 func (e *StaticErrorEditor) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {

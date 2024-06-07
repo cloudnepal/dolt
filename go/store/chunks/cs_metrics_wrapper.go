@@ -60,6 +60,8 @@ type CSMetricWrapper struct {
 	cs                  ChunkStore
 }
 
+var _ ChunkStore = &CSMetricWrapper{}
+
 // NewCSMetricWrapper returns a new CSMetricWrapper
 func NewCSMetricWrapper(cs ChunkStore) *CSMetricWrapper {
 	return &CSMetricWrapper{
@@ -100,7 +102,7 @@ func (csMW *CSMetricWrapper) HasMany(ctx context.Context, hashes hash.HashSet) (
 // subsequent Get and Has calls, but must not be persistent until a call
 // to Flush(). Put may be called concurrently with other calls to Put(),
 // Get(), GetMany(), Has() and HasMany().
-func (csMW *CSMetricWrapper) Put(ctx context.Context, c Chunk, getAddrs GetAddrsCb) error {
+func (csMW *CSMetricWrapper) Put(ctx context.Context, c Chunk, getAddrs GetAddrsCurry) error {
 	atomic.AddInt32(&csMW.TotalChunkPuts, 1)
 	return csMW.cs.Put(ctx, c, getAddrs)
 }
@@ -108,6 +110,10 @@ func (csMW *CSMetricWrapper) Put(ctx context.Context, c Chunk, getAddrs GetAddrs
 // Returns the NomsBinFormat with which this ChunkSource is compatible.
 func (csMW *CSMetricWrapper) Version() string {
 	return csMW.cs.Version()
+}
+
+func (csMW *CSMetricWrapper) AccessMode() ExclusiveAccessMode {
+	return csMW.cs.AccessMode()
 }
 
 // Rebase brings this ChunkStore into sync with the persistent storage's
@@ -149,4 +155,8 @@ func (csMW *CSMetricWrapper) StatsSummary() string {
 // undefined and probably crashy.
 func (csMW *CSMetricWrapper) Close() error {
 	return csMW.cs.Close()
+}
+
+func (csMW *CSMetricWrapper) PersistGhostHashes(ctx context.Context, refs hash.HashSet) error {
+	return csMW.PersistGhostHashes(ctx, refs)
 }

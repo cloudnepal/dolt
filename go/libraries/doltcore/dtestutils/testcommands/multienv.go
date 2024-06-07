@@ -20,6 +20,10 @@ import (
 	"os"
 	"path/filepath"
 
+	cmd "github.com/dolthub/dolt/go/cmd/dolt/commands"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dprocedures"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
+
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
@@ -118,8 +122,8 @@ func (mr *MultiRepoTestSetup) NewDB(dbName string) {
 	}
 	cfg, _ := dEnv.Config.GetConfig(env.GlobalConfig)
 	cfg.SetStrings(map[string]string{
-		env.UserNameKey:  name,
-		env.UserEmailKey: email,
+		config.UserNameKey:  name,
+		config.UserEmailKey: email,
 	})
 	err = dEnv.InitRepo(context.Background(), types.Format_Default, name, email, defaultBranch)
 	if err != nil {
@@ -156,7 +160,7 @@ func (mr *MultiRepoTestSetup) NewRemote(remoteName string) {
 
 func (mr *MultiRepoTestSetup) NewBranch(dbName, branchName string) {
 	dEnv := mr.envs[dbName]
-	err := actions.CreateBranchWithStartPt(context.Background(), dEnv.DbData(), branchName, "head", false)
+	err := actions.CreateBranchWithStartPt(context.Background(), dEnv.DbData(), branchName, "head", false, nil)
 	if err != nil {
 		mr.Errhand(err)
 	}
@@ -164,7 +168,13 @@ func (mr *MultiRepoTestSetup) NewBranch(dbName, branchName string) {
 
 func (mr *MultiRepoTestSetup) CheckoutBranch(dbName, branchName string) {
 	dEnv := mr.envs[dbName]
-	err := actions.CheckoutBranch(context.Background(), dEnv, branchName, false)
+	cliCtx, _ := cmd.NewArgFreeCliContext(context.Background(), dEnv)
+	_, sqlCtx, closeFunc, err := cliCtx.QueryEngine(context.Background())
+	if err != nil {
+		mr.Errhand(err)
+	}
+	defer closeFunc()
+	err = dprocedures.MoveWorkingSetToBranch(sqlCtx, branchName, false, false)
 	if err != nil {
 		mr.Errhand(err)
 	}
@@ -186,7 +196,7 @@ func (mr *MultiRepoTestSetup) CloneDB(fromRemote, dbName string) {
 		mr.Errhand(err)
 	}
 
-	err = actions.CloneRemote(ctx, srcDB, r.Name, "", dEnv)
+	err = actions.CloneRemote(ctx, srcDB, r.Name, "", false, -1, dEnv)
 	if err != nil {
 		mr.Errhand(err)
 	}
@@ -201,12 +211,7 @@ func (mr *MultiRepoTestSetup) CloneDB(fromRemote, dbName string) {
 	}
 	defer os.Chdir(wd)
 
-	ddb, err := doltdb.LoadDoltDB(ctx, types.Format_Default, doltdb.LocalDirDoltDB, filesys.LocalFS)
-	if err != nil {
-		mr.Errhand("Failed to initialize environment:" + err.Error())
-	}
-
-	dEnv = env.Load(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
+	ddb := dEnv.DoltDB
 
 	mr.envs[dbName] = dEnv
 	mr.DoltDBs[dbName] = ddb
@@ -248,12 +253,12 @@ func (mr *MultiRepoTestSetup) CommitWithWorkingSet(dbName string) *doltdb.Commit
 		mergeParentCommits = []*doltdb.Commit{ws.MergeState().Commit()}
 	}
 
-	t := datas.CommitNowFunc()
+	t := datas.CommitterDate()
 	roots, err := dEnv.Roots(ctx)
 	if err != nil {
 		panic("couldn't get roots: " + err.Error())
 	}
-	pendingCommit, err := actions.GetCommitStaged(ctx, roots, ws.MergeActive(), mergeParentCommits, dEnv.DbData().Ddb, actions.CommitStagedProps{
+	pendingCommit, err := actions.GetCommitStaged(ctx, roots, ws, mergeParentCommits, dEnv.DbData().Ddb, actions.CommitStagedProps{
 		Message:    "auto commit",
 		Date:       t,
 		AllowEmpty: true,
@@ -265,14 +270,20 @@ func (mr *MultiRepoTestSetup) CommitWithWorkingSet(dbName string) *doltdb.Commit
 		panic("pending commit error: " + err.Error())
 	}
 
+	headRef, err := dEnv.RepoStateReader().CWBHeadRef()
+	if err != nil {
+		panic("couldn't get working set: " + err.Error())
+	}
+
 	commit, err := dEnv.DoltDB.CommitWithWorkingSet(
 		ctx,
-		dEnv.RepoStateReader().CWBHeadRef(),
+		headRef,
 		ws.Ref(),
 		pendingCommit,
 		ws.WithStagedRoot(pendingCommit.Roots.Staged).WithWorkingRoot(pendingCommit.Roots.Working).ClearMerge(),
 		prevHash,
 		doltdb.TodoWorkingSetMeta(),
+		nil,
 	)
 	if err != nil {
 		panic("couldn't commit: " + err.Error())
@@ -324,7 +335,7 @@ func (mr *MultiRepoTestSetup) StageAll(dbName string) {
 		mr.Errhand(fmt.Sprintf("Failed to get roots: %s", dbName))
 	}
 
-	roots, err = actions.StageAllTables(ctx, roots)
+	roots, err = actions.StageAllTables(ctx, roots, true)
 	if err != nil {
 		mr.Errhand(fmt.Sprintf("Failed to stage tables: %s", dbName))
 	}
@@ -343,21 +354,31 @@ func (mr *MultiRepoTestSetup) PushToRemote(dbName, remoteName, branchName string
 	if err != nil {
 		mr.Errhand(fmt.Sprintf("Failed to push remote: %s", err.Error()))
 	}
-	opts, err := env.NewPushOpts(ctx, apr, dEnv.RepoStateReader(), dEnv.DoltDB, false, false, false)
+	targets, remote, err := env.NewPushOpts(ctx, apr, dEnv.RepoStateReader(), dEnv.DoltDB, false, false, false, false)
 	if err != nil {
 		mr.Errhand(fmt.Sprintf("Failed to push remote: %s", err.Error()))
 	}
 
-	remoteDB, err := opts.Remote.GetRemoteDB(ctx, dEnv.DoltDB.ValueReadWriter().Format(), mr.envs[dbName])
+	remoteDB, err := remote.GetRemoteDB(ctx, dEnv.DoltDB.ValueReadWriter().Format(), mr.envs[dbName])
 	if err != nil {
-		mr.Errhand(actions.HandleInitRemoteStorageClientErr(opts.Remote.Name, opts.Remote.Url, err))
+		mr.Errhand(actions.HandleInitRemoteStorageClientErr(remote.Name, remote.Url, err))
 	}
 
 	tmpDir, err := dEnv.TempTableFilesDir()
 	if err != nil {
 		mr.Errhand(fmt.Sprintf("Failed to access .dolt directory: %s", err.Error()))
 	}
-	err = actions.DoPush(ctx, dEnv.RepoStateReader(), dEnv.RepoStateWriter(), dEnv.DoltDB, remoteDB, tmpDir, opts, actions.NoopRunProgFuncs, actions.NoopStopProgFuncs)
+
+	pushOptions := &env.PushOptions{
+		Targets: targets,
+		Remote:  remote,
+		Rsr:     dEnv.RepoStateReader(),
+		Rsw:     dEnv.RepoStateWriter(),
+		SrcDb:   dEnv.DoltDB,
+		DestDb:  remoteDB,
+		TmpDir:  tmpDir,
+	}
+	_, err = actions.DoPush(ctx, pushOptions, actions.NoopRunProgFuncs, actions.NoopStopProgFuncs)
 	if err != nil {
 		mr.Errhand(fmt.Sprintf("Failed to push remote: %s", err.Error()))
 	}
@@ -389,7 +410,7 @@ func createTestTable(dEnv *env.DoltEnv, tableName string, sch schema.Schema) err
 		return fmt.Errorf("%w: %v", doltdb.ErrNomsIO, err)
 	}
 
-	newRoot, err := root.PutTable(ctx, tableName, tbl)
+	newRoot, err := root.PutTable(ctx, doltdb.TableName{Name: tableName}, tbl)
 	if err != nil {
 		return err
 	}

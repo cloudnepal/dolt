@@ -32,7 +32,6 @@ teardown() {
     [[ "$output" =~ "commit - Record changes to the repository." ]] || false
     [[ "$output" =~ "sql - Run a SQL query against tables in repository." ]] || false
     [[ "$output" =~ "sql-server - Start a MySQL-compatible server." ]] || false
-    [[ "$output" =~ "sql-client - Starts a built-in MySQL client." ]] || false
     [[ "$output" =~ "log - Show commit logs." ]] || false
     [[ "$output" =~ "branch - Create, list, edit, delete branches." ]] || false
     [[ "$output" =~ "checkout - Checkout a branch or overwrite a table from HEAD." ]] || false
@@ -60,7 +59,7 @@ teardown() {
     [[ "$output" =~ "gc - Cleans up unreferenced data from the repository." ]] || false
     [[ "$output" =~ "filter-branch - Edits the commit history using the provided query." ]] || false
     [[ "$output" =~ "merge-base - Find the common ancestor of two commits." ]] || false
-    [[ "$output" =~ "version - Displays the current Dolt cli version." ]] || false
+    [[ "$output" =~ "version - Displays the version for the Dolt binary." ]] || false
     [[ "$output" =~ "dump - Export all tables in the working set into a file." ]] || false
 }
 
@@ -77,16 +76,15 @@ teardown() {
 @test "no-repo: check all commands for valid help text" {
     # pipe all commands to a file
     # cut -s suppresses the line if it doesn't contain the delim
-    dolt | cut -f 1 -d " - " -s | sed "s/ //g" > all.txt
+    dolt | awk -F ' - ' '/ - / {print $1}' > all_raw.txt
+    sed "s/ //g" all_raw.txt > all.txt
 
     # filter out commands without "-h"
     cat all.txt \
-        | sed "s/creds//g"     \
         | sed "s/version//g"   \
-        | sed "s/schema//g"    \
-        | sed "s/table//g"     \
-        | sed "s/conflicts//g" \
         > commands.txt
+
+    touch subcommands.txt
 
     cat commands.txt | while IFS= read -r cmd;
     do
@@ -96,9 +94,30 @@ teardown() {
 
         run dolt "$cmd" -h
         [ "$status" -eq 0 ]
+
+        if [[ "$output" =~ "Valid commands for dolt $cmd are" ]]; then
+            echo "$output" | awk -F ' - ' "/ - / {print \"$cmd\", \$1}" >> subcommands.txt
+            continue
+        fi
+
         [[ "$output" =~ "NAME" ]] || false
         [[ "$output" =~ "DESCRIPTION" ]] || false
     done
+
+    cat subcommands.txt | while IFS= read -r cmd;
+    do
+        if [ -z "$cmd" ]; then
+            continue
+        fi
+
+        run dolt $cmd -h
+
+        [ "$status" -eq 0 ]
+
+        [[ "$output" =~ "NAME" ]] || false
+        [[ "$output" =~ "DESCRIPTION" ]] || false
+    done
+
 }
 
 @test "no-repo: testing dolt version output" {
@@ -106,13 +125,12 @@ teardown() {
     [ "$status" -eq 0 ]
     regex='dolt version [0-9]+.[0-9]+.[0-9]+'
     [[ "$output" =~ $regex ]] || false
+    [[ ! "$output" =~ "database storage format" ]] || false
 }
 
 @test "no-repo: dolt version does not need write permissions" {
     chmod 111 .
-    run dolt version
-    skip "dolt version needs write perms"
-    [ "$status" -eq 0 ]
+    dolt version
     chmod 755 .
 }
 
@@ -120,6 +138,53 @@ teardown() {
     mkdir .dolt
     run dolt version
     [ "$status" -eq 0 ]
+}
+
+@test "no-repo: dolt version prints out of date warning" {
+    echo "2.0.0" > $DOLT_ROOT_PATH/.dolt/version_check.txt
+
+    run dolt version
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Warning: you are on an old version of Dolt" ]] || false
+}
+
+@test "no-repo: dolt version ahead of saved version does not print warning" {
+    echo "1.27.0" > $DOLT_ROOT_PATH/.dolt/version_check.txt
+
+    run dolt version
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "Warning: you are on an old version of Dolt" ]] || false
+}
+
+@test "no-repo: dolt version with bad version_check.txt does not print error" {
+    echo "bad version" > $DOLT_ROOT_PATH/.dolt/version_check.txt
+
+    run dolt version
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "failed to parse version number" ]] || false
+}
+
+@test "no-repo: disabling version check suppresses out of date warning" {
+    echo "2.0.0" > $DOLT_ROOT_PATH/.dolt/version_check.txt
+    dolt config --global --add versioncheck.disabled true
+
+    run dolt version
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "Warning: you are on an old version of Dolt" ]] || false
+}
+
+@test "no-repo: disable version check warning only appears once" {
+    echo "2.0.0" > $DOLT_ROOT_PATH/.dolt/version_check.txt
+
+    run dolt version
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Warning: you are on an old version of Dolt" ]] || false
+    [[ "$output" =~ "To disable this warning, run 'dolt config --global --add versioncheck.disabled true'" ]] || false
+
+    run dolt version
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Warning: you are on an old version of Dolt" ]] || false
+    [[ ! "$output" =~ "To disable this warning, run 'dolt config --global --add versioncheck.disabled true'" ]] || false
 }
 
 # Tests for dolt commands outside of a dolt repository
@@ -320,17 +385,10 @@ NOT_VALID_REPO_ERROR="The current directory is not a valid dolt repository."
 @test "no-repo: don't panic if invalid HOME" {
     DOLT_ROOT_PATH=
     HOME=/this/is/garbage
-    run dolt
+    run dolt status
     [ "$status" -eq 1 ]
-    [[ ! "$output" =~ "panic" ]]
-    [[ "$output" =~ "Failed to load the HOME directory" ]]
-}
-
-@test "no-repo: init with new storage version" {
-    DOLT_DEFAULT_BIN_FORMAT="__DOLT__" dolt init
-    run cat .dolt/noms/manifest
-    [[ "$output" =~ "__DOLT__" ]]
-    [[ ! "$output" =~ "__LD_1__" ]]
+    [[ ! "$output" =~ "panic" ]] || false
+    [[ "$output" =~ "Failed to load the HOME directory" ]] || false
 }
 
 @test "no-repo: dolt login exits when receiving SIGINT" {
@@ -342,4 +400,25 @@ NOT_VALID_REPO_ERROR="The current directory is not a valid dolt repository."
     run grep -q 'dolt' <(ps) # Ensure no process named dolt is running
     [ "$output" == "" ]
     run kill -9 $PID # Kill process if it doesn't pass
+}
+
+@test "no-repo: check that we correctly parse args when connecting with a username that matches a subcommand" {
+    run dolt --user ls sql -q "select 1"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "1" ]] || false
+}
+
+@test "no-repo: check that we error on commands with no subcommand" {
+    run dolt --user admin
+
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "No valid dolt subcommand found. See 'dolt --help' for usage." ]] || false
+}
+
+@test "no-repo: check that we error on invalid subcommand" {
+    run dolt --user admin notarealcommand
+
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "Unknown Command notarealcommand" ]] || false
 }

@@ -33,6 +33,8 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	dsql "github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statsnoms"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statspro"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/types"
@@ -49,6 +51,13 @@ type DoltHarness struct {
 	Version string
 	engine  *sqle.Engine
 	sess    *dsess.DoltSession
+}
+
+func (h *DoltHarness) Close() {
+	dbs := h.sess.Provider().AllDatabases(sql.NewEmptyContext())
+	for _, db := range dbs {
+		db.(dsess.SqlDatabase).DbData().Ddb.Close()
+	}
 }
 
 func (h *DoltHarness) EngineStr() string {
@@ -109,6 +118,10 @@ func (h *DoltHarness) ExecuteQuery(statement string) (schema string, results []s
 	return schemaString, results, nil
 }
 
+func (h *DoltHarness) GetTimeout() int64 {
+	return 0
+}
+
 func innerInit(h *DoltHarness, dEnv *env.DoltEnv) error {
 	if !dEnv.HasDoltDir() {
 		err := dEnv.InitRepoWithTime(context.Background(), types.Format_Default, name, email, env.DefaultInitBranch, time.Now())
@@ -130,7 +143,7 @@ func innerInit(h *DoltHarness, dEnv *env.DoltEnv) error {
 		return err
 	}
 
-	ctx := dsql.NewTestSQLCtxWithProvider(context.Background(), pro)
+	ctx := dsql.NewTestSQLCtxWithProvider(context.Background(), pro, statspro.NewProvider(pro.(*dsql.DoltDatabaseProvider), statsnoms.NewNomsStatsFactory(env.NewGRPCDialProviderFromDoltEnv(dEnv))))
 	h.sess = ctx.Session.(*dsess.DoltSession)
 
 	dbs := h.engine.Analyzer.Catalog.AllDatabases(ctx)
@@ -214,7 +227,8 @@ func toSqlString(val interface{}) string {
 		return fmt.Sprintf("%.3f", v)
 	case decimal.Decimal:
 		// exactly 3 decimal points for floats
-		return v.StringFixed(3)
+		res, _ := v.Float64()
+		return fmt.Sprintf("%.3f", res)
 	case int:
 		return strconv.Itoa(v)
 	case uint:
@@ -279,7 +293,7 @@ func sqlNewEngine(dEnv *env.DoltEnv) (*sqle.Engine, dsess.DoltDatabaseProvider, 
 		return nil, nil, err
 	}
 
-	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -291,6 +305,7 @@ func sqlNewEngine(dEnv *env.DoltEnv) (*sqle.Engine, dsess.DoltDatabaseProvider, 
 	}
 
 	pro = pro.WithDbFactoryUrl(doltdb.InMemDoltDB)
+
 	engine := sqle.NewDefault(pro)
 
 	return engine, pro, nil

@@ -15,6 +15,7 @@
 package actions
 
 import (
+	"bytes"
 	"strings"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
@@ -23,10 +24,11 @@ import (
 type tblErrorType string
 
 const (
-	tblErrInvalid        tblErrorType = "invalid"
-	tblErrTypeNotExist   tblErrorType = "do not exist"
-	tblErrTypeInConflict tblErrorType = "are in conflict"
-	tblErrTypeConstViols tblErrorType = "have constraint violations"
+	tblErrInvalid         tblErrorType = "invalid"
+	tblErrTypeNotExist    tblErrorType = "do not exist"
+	tblErrTypeInConflict  tblErrorType = "are in conflict"
+	tblErrTypeSchConflict tblErrorType = "have schema conflicts"
+	tblErrTypeConstViols  tblErrorType = "have constraint violations"
 )
 
 type TblError struct {
@@ -40,6 +42,10 @@ func NewTblNotExistError(tbls []string) TblError {
 
 func NewTblInConflictError(tbls []string) TblError {
 	return TblError{tbls, tblErrTypeInConflict}
+}
+
+func NewTblSchemaConflictError(tbls []string) TblError {
+	return TblError{tbls, tblErrTypeSchConflict}
 }
 
 func NewTblHasConstraintViolations(tbls []string) TblError {
@@ -86,21 +92,29 @@ func GetTablesForError(err error) []string {
 	return te.tables
 }
 
-type CheckoutWouldOverwrite struct {
+type ErrCheckoutWouldOverwrite struct {
 	tables []string
 }
 
-func (cwo CheckoutWouldOverwrite) Error() string {
-	return "local changes would be overwritten by overwrite"
+func (cwo ErrCheckoutWouldOverwrite) Error() string {
+	var buffer bytes.Buffer
+	buffer.WriteString("Your local changes to the following tables would be overwritten by checkout:\n")
+	for _, tbl := range cwo.tables {
+		buffer.WriteString("\t" + tbl + "\n")
+	}
+
+	buffer.WriteString("Please commit your changes or stash them before you switch branches.\n")
+	buffer.WriteString("Aborting")
+	return buffer.String()
 }
 
 func IsCheckoutWouldOverwrite(err error) bool {
-	_, ok := err.(CheckoutWouldOverwrite)
+	_, ok := err.(ErrCheckoutWouldOverwrite)
 	return ok
 }
 
 func CheckoutWouldOverwriteTables(err error) []string {
-	cwo, ok := err.(CheckoutWouldOverwrite)
+	cwo, ok := err.(ErrCheckoutWouldOverwrite)
 
 	if !ok {
 		panic("Must validate with IsCheckoutWouldOverwrite before calling CheckoutWouldOverwriteTables")

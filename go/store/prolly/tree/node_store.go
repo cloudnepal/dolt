@@ -48,6 +48,7 @@ type NodeStore interface {
 	Format() *types.NomsBinFormat
 
 	BlobBuilder() *BlobBuilder
+	PutBlobBuilder(*BlobBuilder)
 }
 
 type nodeStore struct {
@@ -149,13 +150,16 @@ func (ns nodeStore) Write(ctx context.Context, nd Node) (hash.Hash, error) {
 	c := chunks.NewChunk(nd.bytes())
 	assertTrue(c.Size() > 0, "cannot write empty chunk to ChunkStore")
 
-	getAddrs := func(ctx context.Context, ch chunks.Chunk) (addrs hash.HashSet, err error) {
-		addrs = hash.NewHashSet()
-		err = message.WalkAddresses(ctx, ch.Data(), func(ctx context.Context, a hash.Hash) error {
-			addrs.Insert(a)
-			return nil
-		})
-		return
+	getAddrs := func(ch chunks.Chunk) chunks.GetAddrsCb {
+		return func(ctx context.Context, addrs hash.HashSet, exists chunks.PendingRefExists) (err error) {
+			err = message.WalkAddresses(ctx, ch.Data(), func(ctx context.Context, a hash.Hash) error {
+				if !exists(a) {
+					addrs.Insert(a)
+				}
+				return nil
+			})
+			return
+		}
 	}
 
 	if err := ns.store.Put(ctx, c, getAddrs); err != nil {
@@ -173,10 +177,14 @@ func (ns nodeStore) Pool() pool.BuffPool {
 // BlobBuilder implements NodeStore.
 func (ns nodeStore) BlobBuilder() *BlobBuilder {
 	bb := ns.bbp.Get().(*BlobBuilder)
-	if bb.ns == nil {
-		bb.SetNodeStore(ns)
-	}
+	bb.SetNodeStore(ns)
 	return bb
+}
+
+// PutBlobBuilder implements NodeStore.
+func (ns nodeStore) PutBlobBuilder(bb *BlobBuilder) {
+	bb.Reset()
+	ns.bbp.Put(bb)
 }
 
 func (ns nodeStore) Format() *types.NomsBinFormat {

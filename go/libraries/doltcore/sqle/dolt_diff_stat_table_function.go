@@ -22,15 +22,21 @@ import (
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/types"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 )
 
+const diffStatDefaultRowCount = 10
+
 var _ sql.TableFunction = (*DiffStatTableFunction)(nil)
+var _ sql.ExecSourceRel = (*DiffStatTableFunction)(nil)
 
 type DiffStatTableFunction struct {
 	ctx *sql.Context
@@ -72,6 +78,19 @@ func (ds *DiffStatTableFunction) NewInstance(ctx *sql.Context, db sql.Database, 
 	return node, nil
 }
 
+func (ds *DiffStatTableFunction) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(ds.Schema())
+	numRows, _, err := ds.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
+}
+
+func (ds *DiffStatTableFunction) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return diffStatDefaultRowCount, false, nil
+}
+
 // Database implements the sql.Databaser interface
 func (ds *DiffStatTableFunction) Database() sql.Database {
 	return ds.database
@@ -102,6 +121,10 @@ func (ds *DiffStatTableFunction) Resolved() bool {
 		return ds.commitsResolved() && ds.tableNameExpr.Resolved()
 	}
 	return ds.commitsResolved()
+}
+
+func (ds *DiffStatTableFunction) IsReadOnly() bool {
+	return true
 }
 
 // String implements the Stringer interface
@@ -152,9 +175,10 @@ func (ds *DiffStatTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql
 			return false
 		}
 
+		subject := sql.PrivilegeCheckSubject{Database: ds.database.Name(), Table: tableName}
+
 		// TODO: Add tests for privilege checking
-		return opChecker.UserHasPrivileges(ctx,
-			sql.NewPrivilegedOperation(ds.database.Name(), tableName, "", sql.PrivilegeType_Select))
+		return opChecker.UserHasPrivileges(ctx, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 	}
 
 	tblNames, err := ds.database.GetTableNames(ctx)
@@ -162,9 +186,10 @@ func (ds *DiffStatTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql
 		return false
 	}
 
-	var operations []sql.PrivilegedOperation
+	operations := make([]sql.PrivilegedOperation, 0, len(tblNames))
 	for _, tblName := range tblNames {
-		operations = append(operations, sql.NewPrivilegedOperation(ds.database.Name(), tblName, "", sql.PrivilegeType_Select))
+		subject := sql.PrivilegeCheckSubject{Database: ds.database.Name(), Table: tblName}
+		operations = append(operations, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 	}
 
 	return opChecker.UserHasPrivileges(ctx, operations...)
@@ -185,12 +210,12 @@ func (ds *DiffStatTableFunction) Expressions() []sql.Expression {
 }
 
 // WithExpressions implements the sql.Expressioner interface.
-func (ds *DiffStatTableFunction) WithExpressions(expression ...sql.Expression) (sql.Node, error) {
-	if len(expression) < 1 {
-		return nil, sql.ErrInvalidArgumentNumber.New(ds.Name(), "1 to 3", len(expression))
+func (ds *DiffStatTableFunction) WithExpressions(exprs ...sql.Expression) (sql.Node, error) {
+	if len(exprs) < 1 {
+		return nil, sql.ErrInvalidArgumentNumber.New(ds.Name(), "1 to 3", len(exprs))
 	}
 
-	for _, expr := range expression {
+	for _, expr := range exprs {
 		if !expr.Resolved() {
 			return nil, ErrInvalidNonLiteralArgument.New(ds.Name(), expr.String())
 		}
@@ -201,41 +226,41 @@ func (ds *DiffStatTableFunction) WithExpressions(expression ...sql.Expression) (
 	}
 
 	newDstf := *ds
-	if strings.Contains(expression[0].String(), "..") {
-		if len(expression) < 1 || len(expression) > 2 {
-			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "1 or 2", len(expression))
+	if strings.Contains(exprs[0].String(), "..") {
+		if len(exprs) < 1 || len(exprs) > 2 {
+			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "1 or 2", len(exprs))
 		}
-		newDstf.dotCommitExpr = expression[0]
-		if len(expression) == 2 {
-			newDstf.tableNameExpr = expression[1]
+		newDstf.dotCommitExpr = exprs[0]
+		if len(exprs) == 2 {
+			newDstf.tableNameExpr = exprs[1]
 		}
 	} else {
-		if len(expression) < 2 || len(expression) > 3 {
-			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "2 or 3", len(expression))
+		if len(exprs) < 2 || len(exprs) > 3 {
+			return nil, sql.ErrInvalidArgumentNumber.New(newDstf.Name(), "2 or 3", len(exprs))
 		}
-		newDstf.fromCommitExpr = expression[0]
-		newDstf.toCommitExpr = expression[1]
-		if len(expression) == 3 {
-			newDstf.tableNameExpr = expression[2]
+		newDstf.fromCommitExpr = exprs[0]
+		newDstf.toCommitExpr = exprs[1]
+		if len(exprs) == 3 {
+			newDstf.tableNameExpr = exprs[2]
 		}
 	}
 
 	// validate the expressions
 	if newDstf.dotCommitExpr != nil {
-		if !types.IsText(newDstf.dotCommitExpr.Type()) {
+		if !types.IsText(newDstf.dotCommitExpr.Type()) && !expression.IsBindVar(newDstf.dotCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.dotCommitExpr.String())
 		}
 	} else {
-		if !types.IsText(newDstf.fromCommitExpr.Type()) {
+		if !types.IsText(newDstf.fromCommitExpr.Type()) && !expression.IsBindVar(newDstf.fromCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.fromCommitExpr.String())
 		}
-		if !types.IsText(newDstf.toCommitExpr.Type()) {
+		if !types.IsText(newDstf.toCommitExpr.Type()) && !expression.IsBindVar(newDstf.toCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.toCommitExpr.String())
 		}
 	}
 
 	if newDstf.tableNameExpr != nil {
-		if !types.IsText(newDstf.tableNameExpr.Type()) {
+		if !types.IsText(newDstf.tableNameExpr.Type()) && !expression.IsBindVar(newDstf.tableNameExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newDstf.Name(), newDstf.tableNameExpr.String())
 		}
 	}
@@ -250,7 +275,7 @@ func (ds *DiffStatTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.Row
 		return nil, err
 	}
 
-	sqledb, ok := ds.database.(SqlDatabase)
+	sqledb, ok := ds.database.(dsess.SqlDatabase)
 	if !ok {
 		return nil, fmt.Errorf("unexpected database type: %T", ds.database)
 	}
@@ -281,15 +306,16 @@ func (ds *DiffStatTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.Row
 	var diffStats []diffStatNode
 	for _, delta := range deltas {
 		tblName := delta.ToName
-		if tblName == "" {
+		if tblName.Name == "" {
 			tblName = delta.FromName
 		}
-		diffStat, hasDiff, err := getDiffStatNodeFromDelta(ctx, delta, fromRefDetails.root, toRefDetails.root, tblName)
+		// TODO: schema name
+		diffStat, hasDiff, err := getDiffStatNodeFromDelta(ctx, delta, fromRefDetails.root, toRefDetails.root, tblName.Name)
 		if err != nil {
 			if errors.Is(err, diff.ErrPrimaryKeySetChanged) {
 				ctx.Warn(dtables.PrimaryKeyChangeWarningCode, fmt.Sprintf("stat for table %s cannot be determined. Primary key set changed.", tblName))
 				// Report an empty diff for tables that have primary key set changes
-				diffStats = append(diffStats, diffStatNode{tblName: tblName})
+				diffStats = append(diffStats, diffStatNode{tblName: tblName.Name})
 				continue
 			}
 			return nil, err
@@ -343,10 +369,10 @@ func (ds *DiffStatTableFunction) evaluateArguments() (interface{}, interface{}, 
 
 // getDiffStatNodeFromDelta returns diffStatNode object and whether there is data diff or not. It gets tables
 // from roots and diff stat if there is a valid table exists in both fromRoot and toRoot.
-func getDiffStatNodeFromDelta(ctx *sql.Context, delta diff.TableDelta, fromRoot, toRoot *doltdb.RootValue, tableName string) (diffStatNode, bool, error) {
+func getDiffStatNodeFromDelta(ctx *sql.Context, delta diff.TableDelta, fromRoot, toRoot doltdb.RootValue, tableName string) (diffStatNode, bool, error) {
 	var oldColLen int
 	var newColLen int
-	fromTable, _, fromTableExists, err := fromRoot.GetTableInsensitive(ctx, tableName)
+	fromTable, _, fromTableExists, err := doltdb.GetTableInsensitive(ctx, fromRoot, doltdb.TableName{Name: tableName})
 	if err != nil {
 		return diffStatNode{}, false, err
 	}
@@ -359,7 +385,7 @@ func getDiffStatNodeFromDelta(ctx *sql.Context, delta diff.TableDelta, fromRoot,
 		oldColLen = len(fromSch.GetAllCols().GetColumns())
 	}
 
-	toTable, _, toTableExists, err := toRoot.GetTableInsensitive(ctx, tableName)
+	toTable, _, toTableExists, err := doltdb.GetTableInsensitive(ctx, toRoot, doltdb.TableName{Name: tableName})
 	if err != nil {
 		return diffStatNode{}, false, err
 	}

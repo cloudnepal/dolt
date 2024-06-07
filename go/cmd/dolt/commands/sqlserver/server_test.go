@@ -15,7 +15,6 @@
 package sqlserver
 
 import (
-	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -30,9 +29,11 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/dtestutils/testcommands"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/servercfg"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/libraries/utils/svcs"
 )
 
 //TODO: server tests need to expose a higher granularity for server interactions:
@@ -50,7 +51,7 @@ type testPerson struct {
 	Title      string
 }
 
-type testBranch struct {
+type testResult struct {
 	Branch string
 }
 
@@ -61,14 +62,14 @@ var (
 )
 
 func TestServerArgs(t *testing.T) {
-	serverController := NewServerController()
+	controller := svcs.NewController()
 	dEnv, err := sqle.CreateEnvWithSeedData()
 	require.NoError(t, err)
 	defer func() {
 		assert.NoError(t, dEnv.DoltDB.Close())
 	}()
 	go func() {
-		startServer(context.Background(), "0.0.0", "dolt sql-server", []string{
+		StartServer(context.Background(), "0.0.0", "dolt sql-server", []string{
 			"-H", "localhost",
 			"-P", "15200",
 			"-u", "username",
@@ -76,16 +77,16 @@ func TestServerArgs(t *testing.T) {
 			"-t", "5",
 			"-l", "info",
 			"-r",
-		}, dEnv, serverController)
+		}, dEnv, controller)
 	}()
-	err = serverController.WaitForStart()
+	err = controller.WaitForStart()
 	require.NoError(t, err)
 	conn, err := dbr.Open("mysql", "username:password@tcp(localhost:15200)/", nil)
 	require.NoError(t, err)
 	err = conn.Close()
 	require.NoError(t, err)
-	serverController.StopServer()
-	err = serverController.WaitForClose()
+	controller.Stop()
+	err = controller.WaitForStop()
 	assert.NoError(t, err)
 }
 
@@ -111,22 +112,22 @@ listener:
 	defer func() {
 		assert.NoError(t, dEnv.DoltDB.Close())
 	}()
-	serverController := NewServerController()
+	controller := svcs.NewController()
 	go func() {
 
-		dEnv.FS.WriteFile("config.yaml", []byte(yamlConfig))
-		startServer(context.Background(), "0.0.0", "dolt sql-server", []string{
+		dEnv.FS.WriteFile("config.yaml", []byte(yamlConfig), os.ModePerm)
+		StartServer(context.Background(), "0.0.0", "dolt sql-server", []string{
 			"--config", "config.yaml",
-		}, dEnv, serverController)
+		}, dEnv, controller)
 	}()
-	err = serverController.WaitForStart()
+	err = controller.WaitForStart()
 	require.NoError(t, err)
 	conn, err := dbr.Open("mysql", "username:password@tcp(localhost:15200)/", nil)
 	require.NoError(t, err)
 	err = conn.Close()
 	require.NoError(t, err)
-	serverController.StopServer()
-	err = serverController.WaitForClose()
+	controller.Stop()
+	err = controller.WaitForStop()
 	assert.NoError(t, err)
 }
 
@@ -146,18 +147,15 @@ func TestServerBadArgs(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		test := test
 		t.Run(strings.Join(test, " "), func(t *testing.T) {
-			serverController := NewServerController()
-			go func(serverController *ServerController) {
-				startServer(context.Background(), "test", "dolt sql-server", test, env, serverController)
-			}(serverController)
-
-			// In the event that a test fails, we need to prevent a test from hanging due to a running server
-			err := serverController.WaitForStart()
-			require.Error(t, err)
-			serverController.StopServer()
-			err = serverController.WaitForClose()
-			assert.NoError(t, err)
+			controller := svcs.NewController()
+			go func() {
+				StartServer(context.Background(), "test", "dolt sql-server", test, env, controller)
+			}()
+			if !assert.Error(t, controller.WaitForStart()) {
+				controller.Stop()
+			}
 		})
 	}
 }
@@ -169,36 +167,36 @@ func TestServerGoodParams(t *testing.T) {
 		assert.NoError(t, env.DoltDB.Close())
 	}()
 
-	tests := []ServerConfig{
-		DefaultServerConfig(),
-		DefaultServerConfig().WithHost("127.0.0.1").WithPort(15400),
-		DefaultServerConfig().WithHost("localhost").WithPort(15401),
-		//DefaultServerConfig().WithHost("::1").WithPort(15402), // Fails on Jenkins, assuming no IPv6 support
-		DefaultServerConfig().withUser("testusername").WithPort(15403),
-		DefaultServerConfig().withPassword("hunter2").WithPort(15404),
-		DefaultServerConfig().withTimeout(0).WithPort(15405),
-		DefaultServerConfig().withTimeout(5).WithPort(15406),
-		DefaultServerConfig().withLogLevel(LogLevel_Debug).WithPort(15407),
-		DefaultServerConfig().withLogLevel(LogLevel_Info).WithPort(15408),
-		DefaultServerConfig().withReadOnly(true).WithPort(15409),
-		DefaultServerConfig().withUser("testusernamE").withPassword("hunter2").withTimeout(4).WithPort(15410),
-		DefaultServerConfig().withAllowCleartextPasswords(true),
+	tests := []servercfg.ServerConfig{
+		DefaultCommandLineServerConfig(),
+		DefaultCommandLineServerConfig().WithHost("127.0.0.1").WithPort(15400),
+		DefaultCommandLineServerConfig().WithHost("localhost").WithPort(15401),
+		//DefaultCommandLineServerConfig().WithHost("::1").WithPort(15402), // Fails on Jenkins, assuming no IPv6 support
+		DefaultCommandLineServerConfig().withUser("testusername").WithPort(15403),
+		DefaultCommandLineServerConfig().withPassword("hunter2").WithPort(15404),
+		DefaultCommandLineServerConfig().withTimeout(0).WithPort(15405),
+		DefaultCommandLineServerConfig().withTimeout(5).WithPort(15406),
+		DefaultCommandLineServerConfig().withLogLevel(servercfg.LogLevel_Debug).WithPort(15407),
+		DefaultCommandLineServerConfig().withLogLevel(servercfg.LogLevel_Info).WithPort(15408),
+		DefaultCommandLineServerConfig().withReadOnly(true).WithPort(15409),
+		DefaultCommandLineServerConfig().withUser("testusernamE").withPassword("hunter2").withTimeout(4).WithPort(15410),
+		DefaultCommandLineServerConfig().withAllowCleartextPasswords(true),
 	}
 
 	for _, test := range tests {
-		t.Run(ConfigInfo(test), func(t *testing.T) {
-			sc := NewServerController()
-			go func(config ServerConfig, sc *ServerController) {
+		t.Run(servercfg.ConfigInfo(test), func(t *testing.T) {
+			sc := svcs.NewController()
+			go func(config servercfg.ServerConfig, sc *svcs.Controller) {
 				_, _ = Serve(context.Background(), "0.0.0", config, sc, env)
 			}(test, sc)
 			err := sc.WaitForStart()
 			require.NoError(t, err)
-			conn, err := dbr.Open("mysql", ConnectionString(test, "dbname"), nil)
+			conn, err := dbr.Open("mysql", servercfg.ConnectionString(test, "dbname"), nil)
 			require.NoError(t, err)
 			err = conn.Close()
 			require.NoError(t, err)
-			sc.StopServer()
-			err = sc.WaitForClose()
+			sc.Stop()
+			err = sc.WaitForStop()
 			assert.NoError(t, err)
 		})
 	}
@@ -211,10 +209,10 @@ func TestServerSelect(t *testing.T) {
 		assert.NoError(t, env.DoltDB.Close())
 	}()
 
-	serverConfig := DefaultServerConfig().withLogLevel(LogLevel_Fatal).WithPort(15300)
+	serverConfig := DefaultCommandLineServerConfig().withLogLevel(servercfg.LogLevel_Fatal).WithPort(15300)
 
-	sc := NewServerController()
-	defer sc.StopServer()
+	sc := svcs.NewController()
+	defer sc.Stop()
 	go func() {
 		_, _ = Serve(context.Background(), "0.0.0", serverConfig, sc, env)
 	}()
@@ -222,7 +220,7 @@ func TestServerSelect(t *testing.T) {
 	require.NoError(t, err)
 
 	const dbName = "dolt"
-	conn, err := dbr.Open("mysql", ConnectionString(serverConfig, dbName), nil)
+	conn, err := dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
 	require.NoError(t, err)
 	defer conn.Close()
 	sess := conn.NewSession(nil)
@@ -262,7 +260,7 @@ func TestServerSelect(t *testing.T) {
 
 // If a port is already in use, throw error "Port XXXX already in use."
 func TestServerFailsIfPortInUse(t *testing.T) {
-	serverController := NewServerController()
+	controller := svcs.NewController()
 	server := &http.Server{
 		Addr:    ":15200",
 		Handler: http.DefaultServeMux,
@@ -280,7 +278,7 @@ func TestServerFailsIfPortInUse(t *testing.T) {
 		server.ListenAndServe()
 	}()
 	go func() {
-		startServer(context.Background(), "test", "dolt sql-server", []string{
+		StartServer(context.Background(), "test", "dolt sql-server", []string{
 			"-H", "localhost",
 			"-P", "15200",
 			"-u", "username",
@@ -288,13 +286,19 @@ func TestServerFailsIfPortInUse(t *testing.T) {
 			"-t", "5",
 			"-l", "info",
 			"-r",
-		}, dEnv, serverController)
+		}, dEnv, controller)
 	}()
 
-	err = serverController.WaitForStart()
+	err = controller.WaitForStart()
 	require.Error(t, err)
 	server.Close()
 	wg.Wait()
+}
+
+type defaultBranchTest struct {
+	query          *dbr.SelectStmt
+	expectedRes    []testResult
+	expectedErrStr string
 }
 
 func TestServerSetDefaultBranch(t *testing.T) {
@@ -304,10 +308,10 @@ func TestServerSetDefaultBranch(t *testing.T) {
 		assert.NoError(t, dEnv.DoltDB.Close())
 	}()
 
-	serverConfig := DefaultServerConfig().withLogLevel(LogLevel_Fatal).WithPort(15302)
+	serverConfig := DefaultCommandLineServerConfig().withLogLevel(servercfg.LogLevel_Fatal).WithPort(15302)
 
-	sc := NewServerController()
-	defer sc.StopServer()
+	sc := svcs.NewController()
+	defer sc.Stop()
 	go func() {
 		_, _ = Serve(context.Background(), "0.0.0", serverConfig, sc, dEnv)
 	}()
@@ -316,118 +320,129 @@ func TestServerSetDefaultBranch(t *testing.T) {
 
 	const dbName = "dolt"
 
-	conn, err := dbr.Open("mysql", ConnectionString(serverConfig, dbName), nil)
+	defaultBranch := env.DefaultInitBranch
+
+	conn, err := dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
 	require.NoError(t, err)
 	sess := conn.NewSession(nil)
 
-	defaultBranch := env.DefaultInitBranch
-
-	tests := []struct {
-		query       *dbr.SelectStmt
-		expectedRes []testBranch
-	}{
+	tests := []defaultBranchTest{
 		{
-			query:       sess.Select("active_branch() as branch"),
-			expectedRes: []testBranch{{defaultBranch}},
-		},
-		{
-			query:       sess.SelectBySql("set GLOBAL dolt_default_branch = 'refs/heads/new'"),
-			expectedRes: []testBranch{},
-		},
-		{
-			query:       sess.Select("active_branch() as branch"),
-			expectedRes: []testBranch{{defaultBranch}},
+			query:       sess.SelectBySql("select active_branch() as branch"),
+			expectedRes: []testResult{{defaultBranch}},
 		},
 		{
 			query:       sess.SelectBySql("call dolt_checkout('-b', 'new')"),
-			expectedRes: []testBranch{{""}},
+			expectedRes: []testResult{{""}},
+		},
+		{
+			query:       sess.SelectBySql("call dolt_checkout('-b', 'new2')"),
+			expectedRes: []testResult{{""}},
+		},
+	}
+
+	runDefaultBranchTests(t, tests, conn)
+
+	conn, err = dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
+	require.NoError(t, err)
+	sess = conn.NewSession(nil)
+
+	tests = []defaultBranchTest{
+		{
+			query:       sess.SelectBySql("select active_branch() as branch"),
+			expectedRes: []testResult{{defaultBranch}},
+		},
+		{
+			query:       sess.SelectBySql("set GLOBAL dolt_default_branch = 'refs/heads/new'"),
+			expectedRes: nil,
+		},
+		{
+			query:       sess.SelectBySql("select active_branch() as branch"),
+			expectedRes: []testResult{{"main"}},
 		},
 		{
 			query:       sess.SelectBySql("call dolt_checkout('main')"),
-			expectedRes: []testBranch{{""}},
+			expectedRes: []testResult{{""}},
 		},
 	}
 
-	for _, test := range tests {
-		t.Run(test.query.Query, func(t *testing.T) {
-			var branch []testBranch
-			_, err := test.query.LoadContext(context.Background(), &branch)
-			assert.NoError(t, err)
-			assert.ElementsMatch(t, branch, test.expectedRes)
-		})
-	}
-	conn.Close()
+	runDefaultBranchTests(t, tests, conn)
 
-	conn, err = dbr.Open("mysql", ConnectionString(serverConfig, dbName), nil)
+	conn, err = dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
 	require.NoError(t, err)
-	defer conn.Close()
-
 	sess = conn.NewSession(nil)
 
-	tests = []struct {
-		query       *dbr.SelectStmt
-		expectedRes []testBranch
-	}{
+	tests = []defaultBranchTest{
 		{
-			query:       sess.Select("active_branch() as branch"),
-			expectedRes: []testBranch{{"new"}},
+			query:       sess.SelectBySql("select active_branch() as branch"),
+			expectedRes: []testResult{{"new"}},
 		},
 		{
-			query:       sess.SelectBySql("set GLOBAL dolt_default_branch = 'new'"),
-			expectedRes: []testBranch{},
+			query:       sess.SelectBySql("set GLOBAL dolt_default_branch = 'new2'"),
+			expectedRes: nil,
 		},
 	}
 
-	defer func(sess *dbr.Session) {
-		var res []struct {
-			int
-		}
-		sess.SelectBySql("set GLOBAL dolt_default_branch = ''").LoadContext(context.Background(), &res)
-	}(sess)
+	runDefaultBranchTests(t, tests, conn)
 
-	for _, test := range tests {
-		t.Run(test.query.Query, func(t *testing.T) {
-			var branch []testBranch
-			_, err := test.query.LoadContext(context.Background(), &branch)
-			assert.NoError(t, err)
-			assert.ElementsMatch(t, branch, test.expectedRes)
-		})
-	}
-	conn.Close()
-
-	conn, err = dbr.Open("mysql", ConnectionString(serverConfig, dbName), nil)
+	conn, err = dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
 	require.NoError(t, err)
-	defer conn.Close()
-
 	sess = conn.NewSession(nil)
 
-	tests = []struct {
-		query       *dbr.SelectStmt
-		expectedRes []testBranch
-	}{
+	tests = []defaultBranchTest{
 		{
-			query:       sess.Select("active_branch() as branch"),
-			expectedRes: []testBranch{{"new"}},
+			query:       sess.SelectBySql("select active_branch() as branch"),
+			expectedRes: []testResult{{"new2"}},
 		},
 	}
 
-	for _, test := range tests {
-		t.Run(test.query.Query, func(t *testing.T) {
-			var branch []testBranch
-			_, err := test.query.LoadContext(context.Background(), &branch)
-			assert.NoError(t, err)
-			assert.ElementsMatch(t, branch, test.expectedRes)
-		})
+	runDefaultBranchTests(t, tests, conn)
+
+	conn, err = dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
+	require.NoError(t, err)
+	sess = conn.NewSession(nil)
+
+	tests = []defaultBranchTest{
+		{
+			query:       sess.SelectBySql("set GLOBAL dolt_default_branch = 'doesNotExist'"),
+			expectedRes: nil,
+		},
 	}
 
-	var res []struct {
-		int
+	runDefaultBranchTests(t, tests, conn)
+
+	conn, err = dbr.Open("mysql", servercfg.ConnectionString(serverConfig, dbName), nil)
+	require.NoError(t, err)
+	sess = conn.NewSession(nil)
+
+	tests = []defaultBranchTest{
+		{
+			query:          sess.SelectBySql("select active_branch() as branch"),
+			expectedErrStr: "cannot resolve default branch head", // TODO: should be a better error message
+		},
 	}
-	sess.SelectBySql("set GLOBAL dolt_default_branch = ''").LoadContext(context.Background(), &res)
+
+	runDefaultBranchTests(t, tests, conn)
+}
+
+func runDefaultBranchTests(t *testing.T, tests []defaultBranchTest, conn *dbr.Connection) {
+	for _, test := range tests {
+		t.Run(test.query.Query, func(t *testing.T) {
+			var branch []testResult
+			_, err := test.query.LoadContext(context.Background(), &branch)
+			if test.expectedErrStr != "" {
+				require.Error(t, err)
+				assert.Containsf(t, err.Error(), test.expectedErrStr, "expected error string not found")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, test.expectedRes, branch)
+			}
+		})
+	}
+	require.NoError(t, conn.Close())
 }
 
 func TestReadReplica(t *testing.T) {
-	var err error
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("no working directory: %s", err.Error())
@@ -437,8 +452,8 @@ func TestReadReplica(t *testing.T) {
 	ctx := context.Background()
 
 	multiSetup := testcommands.NewMultiRepoTestSetup(t.Fatal)
-	defer multiSetup.Close()
 	defer os.RemoveAll(multiSetup.Root)
+	defer multiSetup.Close()
 
 	multiSetup.NewDB("read_replica")
 	multiSetup.NewRemote("remote1")
@@ -449,28 +464,24 @@ func TestReadReplica(t *testing.T) {
 	sourceDbName := multiSetup.DbNames[1]
 
 	localCfg, ok := multiSetup.GetEnv(readReplicaDbName).Config.GetConfig(env.LocalConfig)
-	if !ok {
-		t.Fatal("local config does not exist")
-	}
-	config.NewPrefixConfig(localCfg, env.SqlServerGlobalsPrefix).SetStrings(map[string]string{dsess.ReadReplicaRemote: "remote1", dsess.ReplicateHeads: "main,feature"})
+	require.True(t, ok, "local config does not exist")
+	config.NewPrefixConfig(localCfg, env.SqlServerGlobalsPrefix).SetStrings(map[string]string{dsess.ReadReplicaRemote: "remote1", dsess.ReplicateHeads: "main"})
 	dsess.InitPersistedSystemVars(multiSetup.GetEnv(readReplicaDbName))
 
 	// start server as read replica
-	sc := NewServerController()
-	serverConfig := DefaultServerConfig().withLogLevel(LogLevel_Fatal).WithPort(15303)
+	sc := svcs.NewController()
+	serverConfig := DefaultCommandLineServerConfig().withLogLevel(servercfg.LogLevel_Fatal).WithPort(15303)
 
 	// set socket to nil to force tcp
 	serverConfig = serverConfig.WithHost("127.0.0.1").WithSocket("")
 
-	func() {
-		os.Chdir(multiSetup.DbPaths[readReplicaDbName])
-		go func() {
-			_, _ = Serve(context.Background(), "0.0.0", serverConfig, sc, multiSetup.GetEnv(readReplicaDbName))
-		}()
-		err = sc.WaitForStart()
+	os.Chdir(multiSetup.DbPaths[readReplicaDbName])
+	go func() {
+		err, _ = Serve(context.Background(), "0.0.0", serverConfig, sc, multiSetup.GetEnv(readReplicaDbName))
 		require.NoError(t, err)
 	}()
-	defer sc.StopServer()
+	require.NoError(t, sc.WaitForStart())
+	defer sc.Stop()
 
 	replicatedTable := "new_table"
 	multiSetup.CreateTable(ctx, sourceDbName, replicatedTable)
@@ -479,19 +490,21 @@ func TestReadReplica(t *testing.T) {
 	multiSetup.PushToRemote(sourceDbName, "remote1", "main")
 
 	t.Run("read replica pulls multiple branches", func(t *testing.T) {
-		conn, err := dbr.Open("mysql", ConnectionString(serverConfig, readReplicaDbName), nil)
+		conn, err := dbr.Open("mysql", servercfg.ConnectionString(serverConfig, readReplicaDbName), nil)
 		defer conn.Close()
 		require.NoError(t, err)
 		sess := conn.NewSession(nil)
 
-		newBranch := "feature"
-		multiSetup.NewBranch(sourceDbName, newBranch)
-		multiSetup.CheckoutBranch(sourceDbName, newBranch)
-		multiSetup.PushToRemote(sourceDbName, "remote1", newBranch)
+		multiSetup.NewBranch(sourceDbName, "feature")
+		multiSetup.CheckoutBranch(sourceDbName, "feature")
+		multiSetup.PushToRemote(sourceDbName, "remote1", "feature")
+
+		// Configure the read replica to pull the new feature branch we just created
+		config.NewPrefixConfig(localCfg, env.SqlServerGlobalsPrefix).SetStrings(map[string]string{dsess.ReadReplicaRemote: "remote1", dsess.ReplicateHeads: "main,feature"})
+		dsess.InitPersistedSystemVars(multiSetup.GetEnv(readReplicaDbName))
 
 		var res []int
-
-		q := sess.SelectBySql(fmt.Sprintf("call dolt_checkout('%s')", newBranch))
+		q := sess.SelectBySql("call dolt_checkout('feature');")
 		_, err = q.LoadContext(context.Background(), &res)
 		require.NoError(t, err)
 		assert.ElementsMatch(t, res, []int{0})

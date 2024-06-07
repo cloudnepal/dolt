@@ -22,13 +22,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/row"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
 	"github.com/dolthub/dolt/go/store/types"
 )
@@ -37,13 +35,11 @@ type tableEditorTest struct {
 	// The name of this test. Names should be unique and descriptive.
 	name string
 	// Test setup to run
-	setup func(ctx *sql.Context, t *testing.T, ed writer.TableWriter)
+	setup func(ctx *sql.Context, t *testing.T, ed dsess.TableWriter)
 	// The select query to run to verify the results
 	selectQuery string
 	// The rows this query should return, nil if an error is expected
 	expectedRows []sql.Row
-	// Expected error string, if any
-	expectedErr string
 }
 
 func TestTableEditor(t *testing.T) {
@@ -60,13 +56,12 @@ func TestTableEditor(t *testing.T) {
 	fatTony := sqle.NewPeopleRow(16, "Fat", "Tony", false, 53, 5.0)
 	troyMclure := sqle.NewPeopleRow(17, "Troy", "McClure", false, 58, 7.0)
 
-	var expectedErr error
 	// Some of these are pretty exotic use cases, but since we support all these operations it's nice to know they work
 	// in tandem.
 	testCases := []tableEditorTest{
 		{
 			name: "all inserts",
-			setup: func(ctx *sql.Context, t *testing.T, ed writer.TableWriter) {
+			setup: func(ctx *sql.Context, t *testing.T, ed dsess.TableWriter) {
 				require.NoError(t, ed.Insert(ctx, r(edna, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Insert(ctx, r(krusty, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Insert(ctx, r(smithers, sqle.PeopleTestSchema)))
@@ -83,7 +78,7 @@ func TestTableEditor(t *testing.T) {
 		},
 		{
 			name: "inserts and deletes",
-			setup: func(ctx *sql.Context, t *testing.T, ed writer.TableWriter) {
+			setup: func(ctx *sql.Context, t *testing.T, ed dsess.TableWriter) {
 				require.NoError(t, ed.Insert(ctx, r(edna, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Insert(ctx, r(krusty, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Delete(ctx, r(edna, sqle.PeopleTestSchema)))
@@ -95,7 +90,7 @@ func TestTableEditor(t *testing.T) {
 		},
 		{
 			name: "inserts and deletes 2",
-			setup: func(ctx *sql.Context, t *testing.T, ed writer.TableWriter) {
+			setup: func(ctx *sql.Context, t *testing.T, ed dsess.TableWriter) {
 				require.NoError(t, ed.Insert(ctx, r(edna, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Insert(ctx, r(krusty, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Delete(ctx, r(edna, sqle.PeopleTestSchema)))
@@ -109,7 +104,7 @@ func TestTableEditor(t *testing.T) {
 		},
 		{
 			name: "inserts and updates",
-			setup: func(ctx *sql.Context, t *testing.T, ed writer.TableWriter) {
+			setup: func(ctx *sql.Context, t *testing.T, ed dsess.TableWriter) {
 				require.NoError(t, ed.Insert(ctx, r(edna, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Insert(ctx, r(krusty, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Update(ctx, r(edna, sqle.PeopleTestSchema), r(sqle.MutateRow(sqle.PeopleTestSchema, edna, sqle.AgeTag, 1), sqle.PeopleTestSchema)))
@@ -122,7 +117,7 @@ func TestTableEditor(t *testing.T) {
 		},
 		{
 			name: "inserts updates and deletes",
-			setup: func(ctx *sql.Context, t *testing.T, ed writer.TableWriter) {
+			setup: func(ctx *sql.Context, t *testing.T, ed dsess.TableWriter) {
 				require.NoError(t, ed.Insert(ctx, r(edna, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Insert(ctx, r(krusty, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Update(ctx, r(edna, sqle.PeopleTestSchema), r(sqle.MutateRow(sqle.PeopleTestSchema, edna, sqle.AgeTag, 1), sqle.PeopleTestSchema)))
@@ -144,7 +139,7 @@ func TestTableEditor(t *testing.T) {
 		},
 		{
 			name: "inserts and updates to primary key",
-			setup: func(ctx *sql.Context, t *testing.T, ed writer.TableWriter) {
+			setup: func(ctx *sql.Context, t *testing.T, ed dsess.TableWriter) {
 				require.NoError(t, ed.Insert(ctx, r(edna, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Insert(ctx, r(krusty, sqle.PeopleTestSchema)))
 				require.NoError(t, ed.Update(ctx, r(edna, sqle.PeopleTestSchema), r(sqle.MutateRow(sqle.PeopleTestSchema, edna, sqle.IdTag, 30), sqle.PeopleTestSchema)))
@@ -159,48 +154,37 @@ func TestTableEditor(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
-			expectedErr = nil
-
 			dEnv, err := sqle.CreateTestDatabase()
-			require.NoError(t, err)
-
-			ctx := sqle.NewTestSQLCtx(context.Background())
-			root, err := dEnv.WorkingRoot(context.Background())
 			require.NoError(t, err)
 
 			tmpDir, err := dEnv.TempTableFilesDir()
 			require.NoError(t, err)
 			opts := editor.Options{Deaf: dEnv.DbEaFactory(), Tempdir: tmpDir}
-			db, err := sqle.NewDatabase(ctx, "dolt", dEnv.DbData(), opts)
+			db, err := sqle.NewDatabase(context.Background(), "dolt", dEnv.DbData(), opts)
 			require.NoError(t, err)
 
-			err = dsess.DSessFromSess(ctx.Session).AddDB(ctx, getDbState(t, db, dEnv))
+			engine, ctx, err := sqle.NewTestEngine(dEnv, context.Background(), db)
 			require.NoError(t, err)
 
-			ctx.SetCurrentDatabase(db.Name())
-			err = db.SetRoot(ctx, root)
-			require.NoError(t, err)
 			peopleTable, _, err := db.GetTableInsensitive(ctx, "people")
 			require.NoError(t, err)
 
 			dt := peopleTable.(sql.UpdatableTable)
-			ed := dt.Updater(ctx).(writer.TableWriter)
+			ed := dt.Updater(ctx).(dsess.TableWriter)
 
 			test.setup(ctx, t, ed)
-			if len(test.expectedErr) > 0 {
-				require.Error(t, expectedErr)
-				assert.Contains(t, expectedErr.Error(), test.expectedErr)
-				return
-			} else {
-				require.NoError(t, ed.Close(ctx))
-			}
+			require.NoError(t, ed.Close(ctx))
 
-			root, err = db.GetRoot(ctx)
+			root, err := db.GetRoot(ctx)
 			require.NoError(t, err)
 
+			// TODO: not clear why this is necessary, the call to ed.Close should update the working set already
 			require.NoError(t, dEnv.UpdateWorkingRoot(context.Background(), root))
 
-			actualRows, err := sqle.ExecuteSelect(dEnv, root, test.selectQuery)
+			_, rowIter, err := engine.Query(ctx, test.selectQuery)
+			require.NoError(t, err)
+
+			actualRows, err := sql.RowIterToRows(ctx, rowIter)
 			require.NoError(t, err)
 
 			assert.Equal(t, test.expectedRows, actualRows)
@@ -214,23 +198,4 @@ func r(r row.Row, sch schema.Schema) sql.Row {
 		panic(err)
 	}
 	return sqlRow
-}
-
-func getDbState(t *testing.T, db sql.Database, dEnv *env.DoltEnv) dsess.InitialDbState {
-	ctx := context.Background()
-
-	head := dEnv.RepoStateReader().CWBHeadSpec()
-	headCommit, err := dEnv.DoltDB.Resolve(ctx, head, dEnv.RepoStateReader().CWBHeadRef())
-	require.NoError(t, err)
-
-	ws, err := dEnv.WorkingSet(ctx)
-	require.NoError(t, err)
-
-	return dsess.InitialDbState{
-		Db:         db,
-		HeadCommit: headCommit,
-		WorkingSet: ws,
-		DbData:     dEnv.DbData(),
-		Remotes:    dEnv.RepoState.Remotes,
-	}
 }

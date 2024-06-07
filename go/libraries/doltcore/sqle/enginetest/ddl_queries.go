@@ -86,7 +86,7 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 		SetUpScript: SimpsonsSetup,
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "alter table people modify column first_name varchar(16383) not null after last_name",
+				Query:            "alter table people modify column first_name varchar(163) not null after last_name",
 				SkipResultsCheck: true,
 			},
 			{
@@ -94,7 +94,7 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 				Expected: []sql.Row{sql.Row{"people", "CREATE TABLE `people` (\n" +
 					"  `id` int NOT NULL,\n" +
 					"  `last_name` varchar(100) NOT NULL,\n" +
-					"  `first_name` varchar(16383) NOT NULL,\n" +
+					"  `first_name` varchar(163) NOT NULL,\n" +
 					"  `is_married` tinyint,\n" +
 					"  `age` int,\n" +
 					"  `rating` float,\n" +
@@ -121,13 +121,13 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 		SetUpScript: SimpsonsSetup,
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "alter table people modify column first_name varchar(16383) not null first",
+				Query:            "alter table people modify column first_name varchar(163) not null first",
 				SkipResultsCheck: true,
 			},
 			{
 				Query: "show create table people",
 				Expected: []sql.Row{sql.Row{"people", "CREATE TABLE `people` (\n" +
-					"  `first_name` varchar(16383) NOT NULL,\n" +
+					"  `first_name` varchar(163) NOT NULL,\n" +
 					"  `id` int NOT NULL,\n" +
 					"  `last_name` varchar(100) NOT NULL,\n" +
 					"  `is_married` tinyint,\n" +
@@ -156,14 +156,14 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 		SetUpScript: SimpsonsSetup,
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "alter table people modify column first_name varchar(16383) null",
+				Query:            "alter table people modify column first_name varchar(163) null",
 				SkipResultsCheck: true,
 			},
 			{
 				Query: "show create table people",
 				Expected: []sql.Row{sql.Row{"people", "CREATE TABLE `people` (\n" +
 					"  `id` int NOT NULL,\n" +
-					"  `first_name` varchar(16383),\n" +
+					"  `first_name` varchar(163),\n" +
 					"  `last_name` varchar(100) NOT NULL,\n" +
 					"  `is_married` tinyint,\n" +
 					"  `age` int,\n" +
@@ -184,7 +184,7 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 		SetUpScript: SimpsonsSetup,
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "alter table people change first_name christian_name varchar(16383) not null after last_name",
+				Query:            "alter table people change first_name christian_name varchar(163) not null after last_name",
 				SkipResultsCheck: true,
 			},
 			{
@@ -192,7 +192,7 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 				Expected: []sql.Row{sql.Row{"people", "CREATE TABLE `people` (\n" +
 					"  `id` int NOT NULL,\n" +
 					"  `last_name` varchar(100) NOT NULL,\n" +
-					"  `christian_name` varchar(16383) NOT NULL,\n" +
+					"  `christian_name` varchar(163) NOT NULL,\n" +
 					"  `is_married` tinyint,\n" +
 					"  `age` int,\n" +
 					"  `rating` float,\n" +
@@ -219,13 +219,13 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 		SetUpScript: SimpsonsSetup,
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "alter table people change column first_name christian_name varchar(16383) not null first",
+				Query:            "alter table people change column first_name christian_name varchar(163) not null first",
 				SkipResultsCheck: true,
 			},
 			{
 				Query: "show create table people",
 				Expected: []sql.Row{sql.Row{"people", "CREATE TABLE `people` (\n" +
-					"  `christian_name` varchar(16383) NOT NULL,\n" +
+					"  `christian_name` varchar(163) NOT NULL,\n" +
 					"  `id` int NOT NULL,\n" +
 					"  `last_name` varchar(100) NOT NULL,\n" +
 					"  `is_married` tinyint,\n" +
@@ -254,14 +254,14 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 		SetUpScript: SimpsonsSetup,
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "alter table people change column first_name first_name varchar(16383) null",
+				Query:            "alter table people change column first_name first_name varchar(163) null",
 				SkipResultsCheck: true,
 			},
 			{
 				Query: "show create table people",
 				Expected: []sql.Row{sql.Row{"people", "CREATE TABLE `people` (\n" +
 					"  `id` int NOT NULL,\n" +
-					"  `first_name` varchar(16383),\n" +
+					"  `first_name` varchar(163),\n" +
 					"  `last_name` varchar(100) NOT NULL,\n" +
 					"  `is_married` tinyint,\n" +
 					"  `age` int,\n" +
@@ -294,6 +294,19 @@ var ModifyAndChangeColumnScripts = []queries.ScriptTest{
 			{
 				Query:       "alter table people modify num_episodes bigint unsigned not null",
 				ExpectedErr: sql.ErrInsertIntoNonNullableProvidedNull,
+			},
+		},
+	},
+	{
+		Name: "alter, rename primary key column",
+		SetUpScript: []string{
+			"create table t (pk1 varchar(100), pk2 varchar(50), PRIMARY KEY (pk1, pk2))",
+			"alter table t change column pk2 pkTwo varchar(20)",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "show create table t",
+				Expected: []sql.Row{{"t", "CREATE TABLE `t` (\n  `pk1` varchar(100) NOT NULL,\n  `pkTwo` varchar(20) NOT NULL,\n  PRIMARY KEY (`pk1`,`pkTwo`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
 			},
 		},
 	},
@@ -427,13 +440,13 @@ var ModifyColumnTypeScripts = []queries.ScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "alter table test modify column pk datetime",
+				Query:            "alter table test modify column pk datetime(6)",
 				SkipResultsCheck: true,
 			},
 			{
 				Query: "show create table test",
 				Expected: []sql.Row{{"test", "CREATE TABLE `test` (\n" +
-					"  `pk` datetime NOT NULL,\n" +
+					"  `pk` datetime(6) NOT NULL,\n" +
 					"  `v1` bit(20),\n" +
 					"  PRIMARY KEY (`pk`),\n" +
 					"  KEY `v1` (`v1`)\n" +

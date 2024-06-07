@@ -51,11 +51,15 @@ func (nb nullBlockStore) HasMany(ctx context.Context, hashes hash.HashSet) (pres
 	panic("not impl")
 }
 
-func (nb nullBlockStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCb) error {
+func (nb nullBlockStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCurry) error {
 	return nil
 }
 
 func (nb nullBlockStore) Version() string {
+	panic("not impl")
+}
+
+func (nb nullBlockStore) AccessMode() chunks.ExclusiveAccessMode {
 	panic("not impl")
 }
 
@@ -81,4 +85,8 @@ func (nb nullBlockStore) Root(ctx context.Context) (hash.Hash, error) {
 
 func (nb nullBlockStore) Commit(ctx context.Context, current, last hash.Hash) (bool, error) {
 	return true, nil
+}
+
+func (nb nullBlockStore) PersistGhostHashes(ctx context.Context, refs hash.HashSet) error {
+	panic("not impl")
 }

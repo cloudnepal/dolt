@@ -23,15 +23,19 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 )
+
+const remotesDefaultRowCount = 1
 
 var _ sql.Table = (*RemotesTable)(nil)
 var _ sql.UpdatableTable = (*RemotesTable)(nil)
 var _ sql.DeletableTable = (*RemotesTable)(nil)
 var _ sql.InsertableTable = (*RemotesTable)(nil)
 var _ sql.ReplaceableTable = (*RemotesTable)(nil)
+var _ sql.StatisticsTable = (*RemotesTable)(nil)
 
 // RemotesTable is a sql.Table implementation that implements a system table which shows the dolt remotes
 type RemotesTable struct {
@@ -41,6 +45,19 @@ type RemotesTable struct {
 // NewRemotesTable creates a RemotesTable
 func NewRemotesTable(_ *sql.Context, ddb *doltdb.DoltDB) sql.Table {
 	return &RemotesTable{ddb}
+}
+
+func (bt *RemotesTable) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(bt.Schema())
+	numRows, _, err := bt.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
+}
+
+func (bt *RemotesTable) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return remotesDefaultRowCount, false, nil
 }
 
 // Name is a sql.Table interface function which returns the name of the table which is defined by the constant
@@ -104,12 +121,12 @@ func NewRemoteItr(ctx *sql.Context, ddb *doltdb.DoltDB) (*RemoteItr, error) {
 	if err != nil {
 		return nil, err
 	}
-	remotes := make([]env.Remote, len(remoteMap))
-	i := 0
-	for _, r := range remoteMap {
-		remotes[i] = r
-		i++
-	}
+	remotes := []env.Remote{}
+
+	remoteMap.Iter(func(key string, val env.Remote) bool {
+		remotes = append(remotes, val)
+		return true
+	})
 
 	return &RemoteItr{remotes, 0}, nil
 }
@@ -127,11 +144,11 @@ func (itr *RemoteItr) Next(*sql.Context) (sql.Row, error) {
 
 	remote := itr.remotes[itr.idx]
 
-	fs, err := types.JSON.Convert(remote.FetchSpecs)
+	fs, _, err := types.JSON.Convert(remote.FetchSpecs)
 	if err != nil {
 		return nil, err
 	}
-	params, err := types.JSON.Convert(remote.Params)
+	params, _, err := types.JSON.Convert(remote.Params)
 	if err != nil {
 		return nil, err
 	}

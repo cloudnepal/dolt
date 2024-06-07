@@ -18,7 +18,7 @@ import (
 	"encoding/binary"
 	"unsafe"
 
-	fb "github.com/google/flatbuffers/go"
+	fb "github.com/dolthub/flatbuffers/v23/go"
 )
 
 // KEEP THESE IN SYNC WITH .fbs FILES!
@@ -39,6 +39,8 @@ const BlobFileID = "BLOB"
 const BranchControlFileID = "BRCL"
 const StashListFileID = "SLST"
 const StashFileID = "STSH"
+const StatisticFileID = "STAT"
+const DoltgresRootValueFileID = "DGRV"
 
 const MessageTypesKind int = 27
 

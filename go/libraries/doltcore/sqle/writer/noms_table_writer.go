@@ -17,7 +17,8 @@ package writer
 import (
 	"github.com/dolthub/go-mysql-server/sql"
 
-	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/globalstate"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
@@ -26,14 +27,11 @@ import (
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-type TableWriter interface {
-	sql.TableEditor
-	sql.ForeignKeyEditor
-	sql.AutoIncrementEditor
+// AutoIncrementGetter is implemented by editors that support AUTO_INCREMENT to return the next value that will be
+// inserted.
+type AutoIncrementGetter interface {
+	GetNextAutoIncrementValue(ctx *sql.Context, insertVal interface{}) (uint64, error)
 }
-
-// SessionRootSetter sets the root value for the session.
-type SessionRootSetter func(ctx *sql.Context, dbName string, root *doltdb.RootValue) error
 
 // nomsTableWriter is a wrapper for *doltdb.SessionedTableEditor that complies with the SQL interface.
 //
@@ -53,15 +51,21 @@ type nomsTableWriter struct {
 	vrw         types.ValueReadWriter
 	kvToSQLRow  *index.KVToSqlRowConverter
 	tableEditor editor.TableEditor
-	flusher     WriteSessionFlusher
-	batched     bool
+	flusher     dsess.WriteSessionFlusher
 
-	autoInc globalstate.AutoIncrementTracker
+	autoInc                globalstate.AutoIncrementTracker
+	nextAutoIncrementValue map[string]uint64
 
-	setter SessionRootSetter
+	setter         dsess.SessionRootSetter
+	errEncountered error
 }
 
-var _ TableWriter = &nomsTableWriter{}
+func (te *nomsTableWriter) PreciseMatch() bool {
+	return true
+}
+
+var _ dsess.TableWriter = &nomsTableWriter{}
+var _ AutoIncrementGetter = &nomsTableWriter{}
 
 func (te *nomsTableWriter) duplicateKeyErrFunc(keyString, indexName string, k, v types.Tuple, isPk bool) error {
 	oldRow, err := te.kvToSQLRow.ConvertKVTuplesToSqlRow(k, v)
@@ -129,14 +133,19 @@ func (te *nomsTableWriter) GetNextAutoIncrementValue(ctx *sql.Context, insertVal
 }
 
 func (te *nomsTableWriter) SetAutoIncrementValue(ctx *sql.Context, val uint64) error {
-	seq, err := globalstate.CoerceAutoIncrementValue(val)
+	seq, err := te.autoInc.CoerceAutoIncrementValue(val)
 	if err != nil {
 		return err
 	}
-	te.autoInc.Set(te.tableName, seq)
-	te.tableEditor.MarkDirty()
+
+	te.nextAutoIncrementValue = make(map[string]uint64)
+	te.nextAutoIncrementValue[te.tableName] = seq
 
 	return te.flush(ctx)
+}
+
+func (te *nomsTableWriter) AcquireAutoIncrementLock(ctx *sql.Context) (func(), error) {
+	return te.autoInc.AcquireTableLock(ctx, te.tableName)
 }
 
 func (te *nomsTableWriter) IndexedAccess(i sql.IndexLookup) sql.IndexedTable {
@@ -159,21 +168,25 @@ func (te *nomsTableWriter) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
 
 // Close implements Closer
 func (te *nomsTableWriter) Close(ctx *sql.Context) error {
-	// If we're running in batched mode, don't flush the edits until explicitly told to do so
-	if te.batched {
-		return nil
+	if te.errEncountered == nil {
+		return te.flush(ctx)
 	}
-
-	return te.flush(ctx)
+	return nil
 }
 
 // StatementBegin implements the interface sql.TableEditor.
 func (te *nomsTableWriter) StatementBegin(ctx *sql.Context) {
+	// Table writers are reused in a session, which means we need to reset the error state resulting from previous
+	// errors on every new statement.
+	te.errEncountered = nil
 	te.tableEditor.StatementStarted(ctx)
 }
 
 // DiscardChanges implements the interface sql.TableEditor.
 func (te *nomsTableWriter) DiscardChanges(ctx *sql.Context, errorEncountered error) error {
+	if _, ignored := errorEncountered.(sql.IgnorableError); !ignored {
+		te.errEncountered = errorEncountered
+	}
 	return te.tableEditor.StatementFinished(ctx, true)
 }
 
@@ -188,16 +201,4 @@ func (te *nomsTableWriter) flush(ctx *sql.Context) error {
 		return err
 	}
 	return te.setter(ctx, te.dbName, ws.WorkingRoot())
-}
-
-func autoIncrementColFromSchema(sch schema.Schema) schema.Column {
-	var autoCol schema.Column
-	_ = sch.GetAllCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
-		if col.AutoIncrement {
-			autoCol = col
-			stop = true
-		}
-		return
-	})
-	return autoCol
 }

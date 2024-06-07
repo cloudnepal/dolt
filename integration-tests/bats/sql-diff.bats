@@ -130,7 +130,7 @@ SQL
     [ "$output" = "" ]
 }
 
-@test "sql-diff: output reconciles change to PRIMARY KEY field in row " {
+@test "sql-diff: output reconciles change to PRIMARY KEY field in row" {
     dolt checkout -b firstbranch
     dolt sql <<SQL
 CREATE TABLE test (
@@ -863,4 +863,11 @@ ${output}
 EOF
 
     diff -w expected actual    
+}
+
+@test "sql-diff: stat" {
+    dolt sql -q "create table t (i int primary key);"
+    run dolt diff --stat -r sql
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "diff stats are not supported for sql output" ]] || false
 }

@@ -20,9 +20,10 @@ import (
 
 	"github.com/dolthub/go-mysql-server/enginetest/queries"
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/vitess/go/sqltypes"
+	"github.com/dolthub/vitess/go/vt/proto/query"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 )
@@ -69,15 +70,15 @@ var ViewsWithAsOfScriptTest = queries.ScriptTest{
 		{
 			// At this point table t1 doesn't exist yet, so the view should return an error
 			Query:          "select * from v1 as of 'HEAD~3'",
-			ExpectedErrStr: "table not found: t2, maybe you mean t1?",
+			ExpectedErrStr: "View 'mydb.v1' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them",
 		},
 		{
 			Query:          "select * from v1 as of 'HEAD~4'",
-			ExpectedErrStr: "table not found: t2, maybe you mean t1?",
+			ExpectedErrStr: "View 'mydb.v1' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them",
 		},
 		{
 			Query:          "select * from v1 as of 'HEAD~5'",
-			ExpectedErrStr: "table not found: t1",
+			ExpectedErrStr: "View 'mydb.v1' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them",
 		},
 		{
 			Query:    "select * from v1 as of HEAD",
@@ -90,72 +91,227 @@ var ViewsWithAsOfScriptTest = queries.ScriptTest{
 	},
 }
 
-var ShowCreateTableAsOfScriptTest = queries.ScriptTest{
-	Name: "Show create table as of",
-	SetUpScript: []string{
-		"set @Commit0 = '';",
-		"set @Commit1 = '';",
-		"set @Commit2 = '';",
-		"set @Commit3 = '';",
-		"set @Commit0 = hashof('main');",
-		"create table a (pk int primary key, c1 int);",
-		"call dolt_add('.');",
-		"call dolt_commit_hash_out(@Commit1, '-am', 'creating table a');",
-		"alter table a add column c2 varchar(20);",
-		"call dolt_commit_hash_out(@Commit2, '-am', 'adding column c2');",
-		"alter table a drop column c1;",
-		"alter table a add constraint unique_c2 unique(c2);",
-		"call dolt_commit_hash_out(@Commit3, '-am', 'dropping column c1');",
+var ShowCreateTableScriptTests = []queries.ScriptTest{
+	{
+		Name: "Show create table as of",
+		SetUpScript: []string{
+			"set @Commit0 = '';",
+			"set @Commit1 = '';",
+			"set @Commit2 = '';",
+			"set @Commit3 = '';",
+			"set @Commit0 = hashof('main');",
+			"create table a (pk int primary key, c1 int);",
+			"call dolt_add('.');",
+			"call dolt_commit_hash_out(@Commit1, '-am', 'creating table a');",
+			"alter table a add column c2 varchar(20);",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'adding column c2');",
+			"alter table a drop column c1;",
+			"alter table a add constraint unique_c2 unique(c2);",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'dropping column c1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:       "show create table a as of @Commit0;",
+				ExpectedErr: sql.ErrTableNotFound,
+			},
+			{
+				Query: "show create table a as of @Commit1;",
+				Expected: []sql.Row{
+					{"a", "CREATE TABLE `a` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c1` int,\n" +
+						"  PRIMARY KEY (`pk`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
+				},
+			},
+			{
+				Query: "show create table a as of @Commit2;",
+				Expected: []sql.Row{
+					{"a", "CREATE TABLE `a` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c1` int,\n" +
+						"  `c2` varchar(20),\n" +
+						"  PRIMARY KEY (`pk`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
+				},
+			},
+			{
+				Query: "show create table a as of @Commit3;",
+				Expected: []sql.Row{
+					{"a", "CREATE TABLE `a` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c2` varchar(20),\n" +
+						"  PRIMARY KEY (`pk`),\n" +
+						"  UNIQUE KEY `unique_c2` (`c2`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
+				},
+			},
+			{
+				Query: "show create table a as of HEAD;",
+				Expected: []sql.Row{
+					{"a", "CREATE TABLE `a` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c2` varchar(20),\n" +
+						"  PRIMARY KEY (`pk`),\n" +
+						"  UNIQUE KEY `unique_c2` (`c2`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
+				},
+			},
+		},
 	},
-	Assertions: []queries.ScriptTestAssertion{
-		{
-			Query:       "show create table a as of @Commit0;",
-			ExpectedErr: sql.ErrTableNotFound,
+	{
+		// "https://github.com/dolthub/dolt/issues/5478"
+		Name: "show table for default types with unique indexes",
+		SetUpScript: []string{
+			`create table tbl (a int primary key,
+                                   b int not null default 42,
+                                   c int not null default (24),
+                                   d int not null default '-108',
+                                   e int not null default ((((7+11)))),
+                                   f int default (now()))`,
+			`call dolt_commit('-Am', 'new table');`,
+			`create index tbl_bc on tbl (b,c);`,
+			`create unique index tbl_cbd on tbl (c,b,d);`,
+			`create unique index tbl_c on tbl (c);`,
+			`create unique index tbl_e on tbl (e);`,
 		},
-		{
-			Query: "show create table a as of @Commit1;",
-			Expected: []sql.Row{
-				{"a", "CREATE TABLE `a` (\n" +
-					"  `pk` int NOT NULL,\n" +
-					"  `c1` int,\n" +
-					"  PRIMARY KEY (`pk`)\n" +
-					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
-				},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "show create table tbl",
+				Expected: []sql.Row{{"tbl", "CREATE TABLE `tbl` (\n" +
+					"  `a` int NOT NULL,\n" +
+					"  `b` int NOT NULL DEFAULT '42',\n" + //
+					"  `c` int NOT NULL DEFAULT (24),\n" + // Ensure these match setup above.
+					"  `d` int NOT NULL DEFAULT '-108',\n" + //
+					"  `e` int NOT NULL DEFAULT ((7 + 11)),\n" + // Matches MySQL behavior.
+					"  `f` int DEFAULT CURRENT_TIMESTAMP,\n" + // MySql preserves now as lower case.
+					"  PRIMARY KEY (`a`),\n" +
+					"  KEY `tbl_bc` (`b`,`c`),\n" +
+					"  UNIQUE KEY `tbl_c` (`c`),\n" +
+					"  UNIQUE KEY `tbl_cbd` (`c`,`b`,`d`),\n" +
+					"  UNIQUE KEY `tbl_e` (`e`)\n" +
+					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
 			},
 		},
-		{
-			Query: "show create table a as of @Commit2;",
-			Expected: []sql.Row{
-				{"a", "CREATE TABLE `a` (\n" +
-					"  `pk` int NOT NULL,\n" +
-					"  `c1` int,\n" +
-					"  `c2` varchar(20),\n" +
-					"  PRIMARY KEY (`pk`)\n" +
-					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
-				},
+	},
+	{
+		// "https://github.com/dolthub/dolt/issues/5478"
+		Name: "show table for default types with unique indexes no PK",
+		SetUpScript: []string{
+			`create table tbl (a int not null default (now()),
+                                   b int not null default 42,
+                                   c int not null default (24),
+                                   d int not null default '-108',
+                                   e int not null default ((((7+11)))));`,
+			`call dolt_commit('-Am', 'new table');`,
+			`create index tbl_bc on tbl (b,c);`,
+			`create unique index tbl_cab on tbl (c,a,b);`,
+			`create unique index tbl_c on tbl (c);`,
+			`create unique index tbl_e on tbl (e);`,
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "show create table tbl",
+				Expected: []sql.Row{{"tbl", "CREATE TABLE `tbl` (\n" +
+					"  `a` int NOT NULL DEFAULT CURRENT_TIMESTAMP,\n" + // MySql preserves now as lower case.
+					"  `b` int NOT NULL DEFAULT '42',\n" + //
+					"  `c` int NOT NULL DEFAULT (24),\n" + // Ensure these match setup above.
+					"  `d` int NOT NULL DEFAULT '-108',\n" + //
+					"  `e` int NOT NULL DEFAULT ((7 + 11)),\n" + // Matches MySQL behavior.
+					"  KEY `tbl_bc` (`b`,`c`),\n" +
+					"  UNIQUE KEY `tbl_c` (`c`),\n" +
+					"  UNIQUE KEY `tbl_cab` (`c`,`a`,`b`),\n" +
+					"  UNIQUE KEY `tbl_e` (`e`)\n" +
+					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
 			},
 		},
-		{
-			Query: "show create table a as of @Commit3;",
-			Expected: []sql.Row{
-				{"a", "CREATE TABLE `a` (\n" +
-					"  `pk` int NOT NULL,\n" +
-					"  `c2` varchar(20),\n" +
-					"  PRIMARY KEY (`pk`),\n" +
-					"  UNIQUE KEY `unique_c2` (`c2`)\n" +
-					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+	},
+	{
+		Name: "Show create table as of with FKs",
+		SetUpScript: []string{
+			"set @Commit0 = '';",
+			"set @Commit1 = '';",
+			"set @Commit2 = '';",
+			"set @Commit3 = '';",
+			"set @Commit0 = hashof('main');",
+			"create table parent(id int primary key,  pv1 int,  pv2 varchar(20), index v1 (pv1),  index v2 (pv2));",
+			"create table child (pk int primary key, c1 int, c3 int);",
+			"alter table child add constraint fk1 foreign key (c1) references parent(pv1);",
+			"call dolt_add('.');",
+			"call dolt_commit_hash_out(@Commit1, '-am', 'creating tables parent and child');",
+			"alter table child add column c2 varchar(20);",
+			"alter table child drop foreign key fk1;",
+			"alter table child add constraint fk2 foreign key (c2) references parent(pv2);",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'adding column c2 and constraint');",
+			"alter table child drop column c1;",
+			"alter table child add constraint unique_c2 unique(c2);",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'dropping column c1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:       "show create table child as of @Commit0;",
+				ExpectedErr: sql.ErrTableNotFound,
+			},
+			{
+				Query: "show create table child as of @Commit1;",
+				Expected: []sql.Row{
+					{"child", "CREATE TABLE `child` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c1` int,\n" +
+						"  `c3` int,\n" +
+						"  PRIMARY KEY (`pk`),\n" +
+						"  KEY `c1` (`c1`),\n" +
+						"  CONSTRAINT `fk1` FOREIGN KEY (`c1`) REFERENCES `parent` (`pv1`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
 				},
 			},
-		},
-		{
-			Query: "show create table a as of HEAD;",
-			Expected: []sql.Row{
-				{"a", "CREATE TABLE `a` (\n" +
-					"  `pk` int NOT NULL,\n" +
-					"  `c2` varchar(20),\n" +
-					"  PRIMARY KEY (`pk`),\n" +
-					"  UNIQUE KEY `unique_c2` (`c2`)\n" +
-					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+			{
+				Query: "show create table child as of @Commit2;",
+				Expected: []sql.Row{
+					{"child", "CREATE TABLE `child` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c1` int,\n" +
+						"  `c3` int,\n" +
+						"  `c2` varchar(20),\n" +
+						"  PRIMARY KEY (`pk`),\n" +
+						"  KEY `c1` (`c1`),\n" +
+						"  KEY `c2` (`c2`),\n" +
+						"  CONSTRAINT `fk2` FOREIGN KEY (`c2`) REFERENCES `parent` (`pv2`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
+				},
+			},
+			{
+				Query: "show create table child as of @Commit3;",
+				Expected: []sql.Row{
+					{"child", "CREATE TABLE `child` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c3` int,\n" +
+						"  `c2` varchar(20),\n" +
+						"  PRIMARY KEY (`pk`),\n" +
+						"  UNIQUE KEY `unique_c2` (`c2`),\n" +
+						"  CONSTRAINT `fk2` FOREIGN KEY (`c2`) REFERENCES `parent` (`pv2`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
+				},
+			},
+			{
+				Query: "show create table child as of HEAD;",
+				Expected: []sql.Row{
+					{"child", "CREATE TABLE `child` (\n" +
+						"  `pk` int NOT NULL,\n" +
+						"  `c3` int,\n" +
+						"  `c2` varchar(20),\n" +
+						"  PRIMARY KEY (`pk`),\n" +
+						"  UNIQUE KEY `unique_c2` (`c2`),\n" +
+						"  CONSTRAINT `fk2` FOREIGN KEY (`c2`) REFERENCES `parent` (`pv2`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin",
+					},
 				},
 			},
 		},
@@ -186,30 +342,30 @@ var DescribeTableAsOfScriptTest = queries.ScriptTest{
 		{
 			Query: "describe a as of @Commit1;",
 			Expected: []sql.Row{
-				{"pk", "int", "NO", "PRI", "NULL", ""},
-				{"c1", "int", "YES", "", "NULL", ""},
+				{"pk", "int", "NO", "PRI", nil, ""},
+				{"c1", "int", "YES", "", nil, ""},
 			},
 		},
 		{
 			Query: "describe a as of @Commit2;",
 			Expected: []sql.Row{
-				{"pk", "int", "NO", "PRI", "NULL", ""},
-				{"c1", "int", "YES", "", "NULL", ""},
-				{"c2", "varchar(20)", "YES", "", "NULL", ""},
+				{"pk", "int", "NO", "PRI", nil, ""},
+				{"c1", "int", "YES", "", nil, ""},
+				{"c2", "varchar(20)", "YES", "", nil, ""},
 			},
 		},
 		{
 			Query: "describe a as of @Commit3;",
 			Expected: []sql.Row{
-				{"pk", "int", "NO", "PRI", "NULL", ""},
-				{"c2", "varchar(20)", "YES", "", "NULL", ""},
+				{"pk", "int", "NO", "PRI", nil, ""},
+				{"c2", "varchar(20)", "YES", "", nil, ""},
 			},
 		},
 		{
 			Query: "describe a as of HEAD;",
 			Expected: []sql.Row{
-				{"pk", "int", "NO", "PRI", "NULL", ""},
-				{"c2", "varchar(20)", "YES", "", "NULL", ""},
+				{"pk", "int", "NO", "PRI", nil, ""},
+				{"c2", "varchar(20)", "YES", "", nil, ""},
 			},
 		},
 	},
@@ -244,9 +400,18 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 				Expected: []sql.Row{},
 			},
 			{
-				// The database name should be the revision spec we started with, not its resolved hash
-				Query:    "select database() regexp '^mydb/[0-9a-v]{32}$', database() = 'mydb/tag1~';",
-				Expected: []sql.Row{{false, true}},
+				// The database name is always the requested name
+				Query:    "select database()",
+				Expected: []sql.Row{{"mydb/tag1~"}},
+			},
+			{
+				Query:    "show databases;",
+				Expected: []sql.Row{{"mydb"}, {"mydb/tag1~"}, {"information_schema"}, {"mysql"}},
+			},
+			{
+				// The branch is nil in the case of a non-branch revision DB
+				Query:    "select active_branch()",
+				Expected: []sql.Row{{nil}},
 			},
 			{
 				Query:    "select * from t01;",
@@ -317,12 +482,18 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 				Expected: []sql.Row{},
 			},
 			{
-				Query:    "select database();",
+				// The database name is always the requested name
+				Query:    "select database()",
 				Expected: []sql.Row{{"mydb/tag1"}},
 			},
 			{
+				// The branch is nil in the case of a non-branch revision DB
+				Query:    "select active_branch()",
+				Expected: []sql.Row{{nil}},
+			},
+			{
 				Query:    "show databases;",
-				Expected: []sql.Row{{"mydb"}, {"information_schema"}, {"mydb/tag1"}, {"mysql"}},
+				Expected: []sql.Row{{"mydb"}, {"mydb/tag1"}, {"information_schema"}, {"mysql"}},
 			},
 			{
 				Query:    "select * from t01;",
@@ -334,7 +505,7 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "call dolt_checkout('main');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'main'"}},
 			},
 			{
 				Query:    "select database();",
@@ -377,11 +548,16 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "show databases;",
-				Expected: []sql.Row{{"mydb"}, {"information_schema"}, {"mydb/branch1"}, {"mysql"}},
+				Expected: []sql.Row{{"mydb"}, {"mydb/branch1"}, {"information_schema"}, {"mysql"}},
 			},
 			{
-				Query:    "select database();",
+				// The database name is always the requested name
+				Query:    "select database()",
 				Expected: []sql.Row{{"mydb/branch1"}},
+			},
+			{
+				Query:    "select active_branch()",
+				Expected: []sql.Row{{"branch1"}},
 			},
 			{
 				Query:    "select * from t01",
@@ -389,9 +565,12 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "call dolt_checkout('main');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'main'"}},
 			},
 			{
+				// TODO: the behavior here is a bit odd: when we call dolt_checkout, we change the current database to the
+				//  base database name. But we should also consider the connection string: if you connect to a revision
+				//  database, that database should always be visible.
 				Query:    "show databases;",
 				Expected: []sql.Row{{"mydb"}, {"information_schema"}, {"mysql"}},
 			},
@@ -413,14 +592,14 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "show databases;",
-				Expected: []sql.Row{{"mydb"}, {"information_schema"}, {"mydb/branch1"}, {"mysql"}},
+				Expected: []sql.Row{{"mydb"}, {"mydb/branch1"}, {"information_schema"}, {"mysql"}},
 			},
 			{
+				// Create a table in the working set to verify the main db
 				Query:    "create table working_set_table(pk int primary key);",
 				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
-				// Create a table in the working set to verify the main db
 				Query:    "select table_name from dolt_diff where commit_hash='WORKING';",
 				Expected: []sql.Row{{"working_set_table"}},
 			},
@@ -434,7 +613,7 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "call dolt_checkout('branch1');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'branch1'"}},
 			},
 			{
 				Query:    "select table_name from dolt_diff where commit_hash='WORKING';",
@@ -455,7 +634,7 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "call dolt_checkout('-b', 'branch-to-delete');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'branch-to-delete'"}},
 			},
 			{
 				Query:    "select active_branch();",
@@ -479,11 +658,45 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "call dolt_checkout('-b', 'another-branch');",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'another-branch'"}},
 			},
 			{
 				Query:    "select active_branch();",
 				Expected: []sql.Row{{"another-branch"}},
+			},
+		},
+	},
+	{
+		Name: "database revision specs: can checkout a table",
+		SetUpScript: []string{
+			"call dolt_checkout('main')",
+			"create table t01 (pk int primary key, c1 int)",
+			"call dolt_add('t01');",
+			"call dolt_commit('-am', 'creating table t01 on branch1');",
+			"insert into t01 values (1, 1), (2, 2);",
+			"call dolt_branch('new-branch')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "show databases;",
+				Expected: []sql.Row{{"mydb"}, {"information_schema"}, {"mysql"}},
+			},
+			{
+				Query:    "use `mydb/main`;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from dolt_status",
+				Expected: []sql.Row{{"t01", false, "modified"}},
+			},
+			{
+				Query:    "call dolt_checkout('t01')",
+				Expected: []sql.Row{{0, ""}},
+			},
+			{
+				Query: "select * from dolt_status",
+				// Expected: []sql.Row{},
+				SkipResultsCheck: true, // TODO: https://github.com/dolthub/dolt/issues/5816
 			},
 		},
 	},
@@ -492,6 +705,127 @@ var DoltRevisionDbScripts = []queries.ScriptTest{
 // DoltScripts are script tests specific to Dolt (not the engine in general), e.g. by involving Dolt functions. Break
 // this slice into others with good names as it grows.
 var DoltScripts = []queries.ScriptTest{
+	{
+		Name: "dolt_hashof_table tests",
+		SetUpScript: []string{
+			"CREATE TABLE t1 (pk int primary key);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SHOW TABLES;",
+				Expected: []sql.Row{
+					{"t1"},
+				},
+			},
+			{
+				Query:    "SELECT dolt_hashof_table('t1');",
+				Expected: []sql.Row{{"0lvgnnqah2lj1p6ilvfg0ssaec1v0jgk"}},
+			},
+			{
+				Query:    "INSERT INTO t1 VALUES (1);",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1}}},
+			},
+			{
+				Query:    "SELECT dolt_hashof_table('t1');",
+				Expected: []sql.Row{{"a2vkt9d1mtuhd90opbcseo5gqjae7tv6"}},
+			},
+			{
+				Query:          "SELECT dolt_hashof_table('noexist');",
+				ExpectedErrStr: "table not found: noexist",
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/7384
+		Name: "multiple unresolved foreign keys can be created on the same table",
+		SetUpScript: []string{
+			"SET @@FOREIGN_KEY_CHECKS=0;",
+			"create table t1(pk int primary key);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "create table t2 (pk int primary key, c1 int, c2 int, " +
+					"FOREIGN KEY (`c1`) REFERENCES `t1` (`pk`) ON DELETE CASCADE ON UPDATE CASCADE, " +
+					"FOREIGN KEY (`c2`) REFERENCES `t1` (`pk`) ON DELETE CASCADE ON UPDATE CASCADE);",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+		},
+	},
+	{
+		Name: "test has_ancestor",
+		SetUpScript: []string{
+			"create table xy (x int primary key)",
+			"call dolt_commit('-Am', 'create')",
+			"set @main1 = hashof('HEAD');",
+			"insert into xy values (0)",
+			"call dolt_commit('-Am', 'add 0')",
+			"set @main2 = hashof('HEAD');",
+			"call dolt_branch('bone', @main1)",
+			"call dolt_checkout('bone')",
+			"insert into xy values (1)",
+			"call dolt_commit('-Am', 'add 1')",
+			"set @bone1 = hashof('HEAD');",
+			"insert into xy values (2)",
+			"call dolt_commit('-Am', 'add 2')",
+			"set @bone2 = hashof('HEAD');",
+			"call dolt_branch('btwo', @main1)",
+			"call dolt_checkout('btwo')",
+			"insert into xy values (3)",
+			"call dolt_commit('-Am', 'add 3')",
+			"set @btwo1 = hashof('HEAD');",
+			"call dolt_tag('tag_btwo1')",
+			"call dolt_checkout('main')",
+			"insert into xy values (4)",
+			"call dolt_commit('-Am', 'add 4')",
+			"set @main3 = hashof('HEAD');",
+			"call dolt_branch('onetwo', @bone2)",
+			"call dolt_checkout('onetwo')",
+			"call dolt_merge('btwo')",
+			"set @onetwo1 = hashof('HEAD');",
+			"call dolt_checkout('bone')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select has_ancestor('main', @main1), has_ancestor('main', @main2), has_ancestor('main', @bone1), has_ancestor('main', @bone2), has_ancestor('main', @btwo1), has_ancestor('main', @onetwo1), has_ancestor('main', 'HEAD')",
+				Expected: []sql.Row{{true, true, false, false, false, false, false}},
+			},
+			{
+				Query:    "select has_ancestor('bone', @main1), has_ancestor('bone', @main2), has_ancestor('bone', @bone1), has_ancestor('bone', @bone2), has_ancestor('bone', @btwo1), has_ancestor('bone', @onetwo1), has_ancestor('bone', 'HEAD')",
+				Expected: []sql.Row{{true, false, true, true, false, false, true}},
+			},
+			{
+				Query:    "select has_ancestor('btwo', @main1), has_ancestor('btwo', @main2), has_ancestor('btwo', @bone1), has_ancestor('btwo', @bone2), has_ancestor('btwo', @btwo1), has_ancestor('btwo', @onetwo1), has_ancestor('btwo', 'HEAD')",
+				Expected: []sql.Row{{true, false, false, false, true, false, false}},
+			},
+			{
+				Query:    "select has_ancestor('onetwo', @main1), has_ancestor('onetwo', @main2), has_ancestor('onetwo', @bone1), has_ancestor('onetwo', @bone2), has_ancestor('onetwo', @btwo1), has_ancestor('onetwo', @onetwo1), has_ancestor('onetwo', 'HEAD')",
+				Expected: []sql.Row{{true, false, true, true, true, true, true}},
+			},
+			{
+				Query:    "select has_ancestor(commit_hash, 'btwo') from dolt_log where commit_hash = @onetwo1",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select has_ancestor(commit_hash, 'btwo') from dolt_log as of 'onetwo' where commit_hash = @onetwo1",
+				Expected: []sql.Row{{true}},
+			},
+			{
+				Query:    "select has_ancestor('HEAD', 'tag_btwo1'), has_ancestor(@bone2, 'tag_btwo1'),has_ancestor(@onetwo1, 'tag_btwo1'), has_ancestor(@btwo1, 'tag_btwo1'), has_ancestor(@main2, 'tag_btwo1'), has_ancestor(@main1, 'tag_btwo1')",
+				Expected: []sql.Row{{false, false, true, true, false, false}},
+			},
+			{
+				Query:    "select has_ancestor('tag_btwo1', 'HEAD'), has_ancestor('tag_btwo1', @bone2), has_ancestor('tag_btwo1', @onetwo1), has_ancestor('tag_btwo1', @btwo1), has_ancestor('tag_btwo1', @main2), has_ancestor('tag_btwo1', @main1)",
+				Expected: []sql.Row{{false, false, false, true, false, true}},
+			},
+			{
+				Query: "use `mydb/onetwo`;",
+			},
+			{
+				Query:    "select has_ancestor(commit_hash, 'btwo') from dolt_log where commit_hash = @onetwo1",
+				Expected: []sql.Row{{true}},
+			},
+		},
+	},
 	{
 		Name: "test null filtering in secondary indexes (https://github.com/dolthub/dolt/issues/4199)",
 		SetUpScript: []string{
@@ -554,6 +888,51 @@ var DoltScripts = []queries.ScriptTest{
 						"  PRIMARY KEY (`pk`),\n" +
 						"  KEY ```i``` (`c1`)\n" +
 						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	},
+	{
+		Name: "test AS OF indexed queries (https://github.com/dolthub/dolt/issues/7488)",
+		SetUpScript: []string{
+			"create table indexedTable (pk int primary key, c0 int, c1 varchar(255), key c1_idx(c1));",
+			"insert into indexedTable (pk, c1) values (1, 'one');",
+			"call dolt_commit('-Am', 'adding table t with index');",
+			"SET @commit1 = hashof('HEAD');",
+
+			"update indexedTable set c1='two';",
+			"call dolt_commit('-am', 'updating one to two');",
+			"SET @commit2 = hashof('HEAD');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:           "SELECT c1 from indexedTable;",
+				Expected:        []sql.Row{{"two"}},
+				ExpectedIndexes: []string{},
+			},
+			{
+				Query:           "SELECT c1 from indexedTable where c1 > 'o';",
+				Expected:        []sql.Row{{"two"}},
+				ExpectedIndexes: []string{"c1_idx"},
+			},
+			{
+				Query:           "SELECT c1 from indexedTable as of @commit2;",
+				Expected:        []sql.Row{{"two"}},
+				ExpectedIndexes: []string{},
+			},
+			{
+				Query:           "SELECT c1 from indexedTable as of @commit2 where c1 > 'o';",
+				Expected:        []sql.Row{{"two"}},
+				ExpectedIndexes: []string{"c1_idx"},
+			},
+			{
+				Query:           "SELECT c1 from indexedTable as of @commit1;",
+				Expected:        []sql.Row{{"one"}},
+				ExpectedIndexes: []string{},
+			},
+			{
+				Query:           "SELECT c1 from indexedTable as of @commit1 where c1 > 'o';",
+				Expected:        []sql.Row{{"one"}},
+				ExpectedIndexes: []string{"c1_idx"},
 			},
 		},
 	},
@@ -683,29 +1062,29 @@ var DoltScripts = []queries.ScriptTest{
 			{
 				Query:    "select * from test as of 'HEAD~' where pk=?;",
 				Expected: []sql.Row{{0, 0}},
-				Bindings: map[string]sql.Expression{
-					"v1": expression.NewLiteral(0, types.Int8),
+				Bindings: map[string]*query.BindVariable{
+					"v1": sqltypes.Int8BindVariable(int8(0)),
 				},
 			},
 			{
 				Query:    "select * from test as of hashof('HEAD') where pk=?;",
 				Expected: []sql.Row{{1, 1, nil}},
-				Bindings: map[string]sql.Expression{
-					"v1": expression.NewLiteral(1, types.Int8),
+				Bindings: map[string]*query.BindVariable{
+					"v1": sqltypes.Int8BindVariable(int8(1)),
 				},
 			},
 			{
 				Query:    "select * from test as of @Commit1 where pk=?;",
 				Expected: []sql.Row{{0, 0}},
-				Bindings: map[string]sql.Expression{
-					"v1": expression.NewLiteral(0, types.Int8),
+				Bindings: map[string]*query.BindVariable{
+					"v1": sqltypes.Int8BindVariable(int8(0)),
 				},
 			},
 			{
 				Query:    "select * from test as of @Commit2 where pk=?;",
 				Expected: []sql.Row{{0, 0, nil}},
-				Bindings: map[string]sql.Expression{
-					"v1": expression.NewLiteral(0, types.Int8),
+				Bindings: map[string]*query.BindVariable{
+					"v1": sqltypes.Int8BindVariable(int8(0)),
 				},
 			},
 		},
@@ -716,10 +1095,9 @@ var DoltScripts = []queries.ScriptTest{
 			"CREATE TABLE t(pk varchar(20), val int)",
 			"ALTER TABLE t ADD PRIMARY KEY (pk, val)",
 			"INSERT INTO t VALUES ('zzz',4),('mult',1),('sub',2),('add',5)",
-			"CALL dadd('.');",
-			"CALL dcommit('-am', 'add rows');",
+			"CALL dolt_commit('-Am', 'add rows');",
 			"INSERT INTO t VALUES ('dolt',0),('alt',12),('del',8),('ctl',3)",
-			"CALL dcommit('-am', 'add more rows');",
+			"CALL dolt_commit('-am', 'add more rows');",
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
@@ -733,6 +1111,25 @@ var DoltScripts = []queries.ScriptTest{
 					{"mult", 1, "add rows"},
 					{"sub", 2, "add rows"},
 					{"zzz", 4, "add rows"},
+				},
+			},
+		},
+	},
+	{
+		Name: "blame: table and pk require identifier quoting",
+		SetUpScript: []string{
+			"create table `t-1` (`p-k` int primary key, col1 varchar(100));",
+			"insert into `t-1` values (1, 'one');",
+			"CALL dolt_commit('-Am', 'adding table t-1');",
+			"insert into `t-1` values (2, 'two');",
+			"CALL dolt_commit('-Am', 'adding another row to t-1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT `p-k`, message FROM `dolt_blame_t-1`;",
+				Expected: []sql.Row{
+					{1, "adding table t-1"},
+					{2, "adding another row to t-1"},
 				},
 			},
 		},
@@ -882,6 +1279,46 @@ func makeLargeInsert(sz int) string {
 
 // DoltUserPrivTests are tests for Dolt-specific functionality that includes privilege checking logic.
 var DoltUserPrivTests = []queries.UserPrivilegeTest{
+	{
+		Name: "dolt_purge_dropped_databases() privilege checking",
+		SetUpScript: []string{
+			"create database mydb2;",
+			"DROP DATABASE mydb2;",
+			"CREATE USER tester@localhost;",
+			"CREATE DATABASE other;",
+			"GRANT EXECUTE ON *.* TO tester@localhost;",
+		},
+		Assertions: []queries.UserPrivilegeTestAssertion{
+			{
+				// Users without SUPER privilege cannot execute dolt_purge_dropped_databases
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "call dolt_purge_dropped_databases;",
+				ExpectedErr: sql.ErrPrivilegeCheckFailed,
+			},
+			{
+				// Grant SUPER privileges to tester
+				User:     "root",
+				Host:     "localhost",
+				Query:    "GRANT SUPER ON *.* TO tester@localhost;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				// Now that tester has SUPER privileges, they can execute dolt_purge_dropped_databases
+				User:     "tester",
+				Host:     "localhost",
+				Query:    "call dolt_purge_dropped_databases;",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				// Since root has SUPER privileges, they can execute dolt_purge_dropped_databases
+				User:     "root",
+				Host:     "localhost",
+				Query:    "call dolt_purge_dropped_databases;",
+				Expected: []sql.Row{{0}},
+			},
+		},
+	},
 	{
 		Name: "table function privilege checking",
 		SetUpScript: []string{
@@ -1217,6 +1654,20 @@ var DoltUserPrivTests = []queries.UserPrivilegeTest{
 				ExpectedErr: sql.ErrDatabaseAccessDeniedForUser,
 			},
 			{
+				// After revoking access, dolt_schema_diff should fail against table 'test'
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "SELECT * FROM dolt_schema_diff('HEAD^','HEAD','test');",
+				ExpectedErr: sql.ErrDatabaseAccessDeniedForUser,
+			},
+			{
+				// After revoking access, dolt_schema_diff should fail against the entire db
+				User:        "tester",
+				Host:        "localhost",
+				Query:       "SELECT * FROM dolt_schema_diff('HEAD^','HEAD');",
+				ExpectedErr: sql.ErrDatabaseAccessDeniedForUser,
+			},
+			{
 				// Grant global access to *.*
 				User:     "root",
 				Host:     "localhost",
@@ -1350,6 +1801,10 @@ var HistorySystemTableScriptTests = []queries.ScriptTest{
 			{
 				Query:    "select n, de, fr from dolt_history_T1 where commit_hash = @Commit1;",
 				Expected: []sql.Row{{1, "Eins", nil}, {2, "Zwei", nil}, {3, "Drei", nil}},
+			},
+			{
+				Query:    "select de, fr from dolt_history_T1 where commit_hash = @Commit1;",
+				Expected: []sql.Row{{"Eins", nil}, {"Zwei", nil}, {"Drei", nil}},
 			},
 			{
 				Query:    "select n, de, fr from dolt_history_T1 where commit_hash = @Commit2;",
@@ -1594,27 +2049,49 @@ var HistorySystemTableScriptTests = []queries.ScriptTest{
 		Name: "primary key table: non-pk column type changes",
 		SetUpScript: []string{
 			"create table t (pk int primary key, c1 int, c2 varchar(20));",
-			"call dolt_add('.')",
+			"CALL DOLT_COMMIT('-Am', 'creating table t');",
+			"set @Commit1 = dolt_hashof('HEAD');",
+
 			"insert into t values (1, 2, '3'), (4, 5, '6');",
-			"set @Commit1 = '';",
-			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+			"CALL DOLT_COMMIT('-Am', 'inserting two rows');",
+			"set @Commit2 = dolt_hashof('HEAD');",
+
+			"CALL DOLT_COMMIT('--allow-empty', '-m', 'empty commit');",
+			"set @Commit3 = dolt_hashof('HEAD');",
+
 			"alter table t modify column c2 int;",
-			"set @Commit2 = '';",
-			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'changed type of c2');",
+			"CALL DOLT_COMMIT('-am', 'changed type of c2');",
+			"set @Commit4 = dolt_hashof('HEAD');",
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
 				Query:    "select count(*) from dolt_history_t;",
-				Expected: []sql.Row{{4}},
+				Expected: []sql.Row{{6}},
 			},
 			// Can't represent the old schema in the current one, so it gets nil valued
 			{
-				Query:    "select pk, c2 from dolt_history_t where commit_hash=@Commit1 order by pk;",
+				Query:    "select pk, c2 from dolt_history_t where commit_hash=@Commit2 order by pk;",
 				Expected: []sql.Row{{1, nil}, {4, nil}},
 			},
 			{
-				Query:    "select pk, c2 from dolt_history_t where commit_hash=@Commit2 order by pk;",
+				Query:    "select pk, c2 from dolt_history_t where commit_hash=@Commit4 order by pk;",
 				Expected: []sql.Row{{1, 3}, {4, 6}},
+			},
+			{
+				// When filtering on a column from the original table, we use the primary index here, but if column
+				// tags have changed in previous versions of the table, the index tags won't match up completely.
+				// https://github.com/dolthub/dolt/issues/6891
+				// NOTE: {4,5,nil} shows up as a row from the first commit, when c2 was a varchar type. The schema
+				//       for dolt_history_t uses the current table schema, and we can't extract an int from the older
+				//       version's tuple, so it shows up as a NULL and a SQL warning in the session. In the future,
+				//       we could consider using a different tuple descriptor based on the version of the row and
+				//       pull the data out and try to convert it to the new type.
+				Query:                 "select pk, c1, c2 from dolt_history_t where pk=4;",
+				Expected:              []sql.Row{{4, 5, 6}, {4, 5, nil}, {4, 5, nil}},
+				ExpectedWarning:       1246,
+				ExpectedWarningsCount: 1,
+				ExpectedWarningMessageSubstring: "Unable to convert field c2 in historical rows because " +
+					"its type (int) doesn't match current schema's type (varchar(20))",
 			},
 		},
 	},
@@ -1748,7 +2225,7 @@ var HistorySystemTableScriptTests = []queries.ScriptTest{
 			{
 				Query: "select c1 from dolt_history_t;",
 				Expected: []sql.Row{
-					{uint64(1)},
+					{"foo"},
 				},
 			},
 		},
@@ -1797,6 +2274,142 @@ var HistorySystemTableScriptTests = []queries.ScriptTest{
 			},
 		},
 	},
+	{
+		Name: "dolt_history table primary key with join",
+		SetUpScript: []string{
+			"create table xyz (x int, y int, z int, primary key(x, y));",
+			"call dolt_add('.');",
+			"call dolt_commit('-m', 'creating table');",
+			"insert into xyz values (0, 1, 100);",
+			"call dolt_commit('-am', 'add data');",
+			"insert into xyz values (2, 3, 200);",
+			"call dolt_commit('-am', 'add data');",
+			"insert into xyz values (4, 5, 300);",
+			"call dolt_commit('-am', 'add data');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+
+				Query: `
+SELECT
+  dolt_history_xyz.x as x,
+  dolt_history_xyz.y as y,
+  dolt_history_xyz.z as z,
+  dolt_commits.commit_hash as comm
+FROM
+  dolt_history_xyz
+  LEFT JOIN
+  dolt_commits
+  ON
+  dolt_history_xyz.commit_hash = dolt_commits.commit_hash
+ORDER BY
+  dolt_history_xyz.x,
+  dolt_history_xyz.y,
+  dolt_history_xyz.z;`,
+				Expected: []sql.Row{
+					{0, 1, 100, doltCommit},
+					{0, 1, 100, doltCommit},
+					{0, 1, 100, doltCommit},
+					{2, 3, 200, doltCommit},
+					{2, 3, 200, doltCommit},
+					{4, 5, 300, doltCommit},
+				},
+			},
+			{
+				Query: `
+SELECT
+  dolt_history_xyz.y as y,
+  dolt_history_xyz.z as z,
+  dolt_commits.commit_hash as comm
+FROM
+  dolt_history_xyz
+  LEFT JOIN
+  dolt_commits
+  ON
+  dolt_history_xyz.commit_hash = dolt_commits.commit_hash
+ORDER BY
+  dolt_history_xyz.y,
+  dolt_history_xyz.z;`,
+				Expected: []sql.Row{
+					{1, 100, doltCommit},
+					{1, 100, doltCommit},
+					{1, 100, doltCommit},
+					{3, 200, doltCommit},
+					{3, 200, doltCommit},
+					{5, 300, doltCommit},
+				},
+			},
+			{
+				Query: `
+SELECT
+  dolt_history_xyz.z as z,
+  dolt_commits.commit_hash as comm
+FROM
+  dolt_history_xyz
+  LEFT JOIN
+  dolt_commits
+  ON
+  dolt_history_xyz.commit_hash = dolt_commits.commit_hash
+ORDER BY
+  dolt_history_xyz.z;`,
+				Expected: []sql.Row{
+					{100, doltCommit},
+					{100, doltCommit},
+					{100, doltCommit},
+					{200, doltCommit},
+					{200, doltCommit},
+					{300, doltCommit},
+				},
+			},
+			{
+				Query: `
+SELECT z
+FROM xyz
+WHERE z IN (
+  SELECT z
+  FROM dolt_history_xyz
+  LEFT JOIN dolt_commits
+  ON dolt_history_xyz.commit_hash = dolt_commits.commit_hash
+);`,
+				Expected: []sql.Row{
+					{100},
+					{200},
+					{300},
+				},
+			},
+		},
+	},
+	{
+		Name:        "can sort by dolt_log.commit",
+		SetUpScript: []string{},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select 'something' from dolt_log order by commit_hash;",
+				Expected: []sql.Row{
+					{"something"},
+					{"something"},
+				},
+			},
+			{
+				Query:    "select 'something' from dolt_diff order by commit_hash;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query: "select 'something' from dolt_commits order by commit_hash;",
+				Expected: []sql.Row{
+					{"something"},
+					{"something"},
+				},
+			},
+			{
+				Query: "select 'something' from dolt_commit_ancestors order by commit_hash;",
+				Expected: []sql.Row{
+					{"something"},
+					{"something"},
+				},
+			},
+		},
+	},
 }
 
 // BrokenHistorySystemTableScriptTests contains tests that work for non-prepared, but don't work
@@ -1827,6 +2440,745 @@ var BrokenHistorySystemTableScriptTests = []queries.ScriptTest{
 	},
 }
 
+var DoltCheckoutScripts = []queries.ScriptTest{
+	{
+		Name: "dolt_checkout changes working set",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"call dolt_branch('b3');",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-Am', 'added values on main');",
+			"call dolt_checkout('b2');",
+			"insert into t values (2, 2);",
+			"call dolt_commit('-am', 'added values on b2');",
+			"call dolt_checkout('b3');",
+			"insert into t values (3, 3);",
+			"call dolt_commit('-am', 'added values on b3');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "call dolt_checkout('b2');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{2, 2}},
+			},
+			{
+				Query:            "call dolt_checkout('b3');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b3"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{3, 3}},
+			},
+			{
+				Query:            "call dolt_checkout('main');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+		},
+	},
+	{
+		Name: "dolt_checkout with new branch",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_checkout('-b', 'b2');",
+			"insert into t values (2, 2);",
+			"call dolt_commit('-am', 'added values on b2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:            "call dolt_checkout('main');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "call dolt_checkout('b2');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "select * from t order by 1;",
+				Expected: []sql.Row{{1, 1}, {2, 2}},
+			},
+		},
+	},
+	{
+		Name: "dolt_checkout with new branch forcefully",
+		SetUpScript: []string{
+			"create table t (s varchar(5) primary key);",
+			"insert into t values ('foo');",
+			"call dolt_commit('-Am', 'commit main~2');", // will be main~2
+			"insert into t values ('bar');",
+			"call dolt_commit('-Am', 'commit main~1');", // will be main~1
+			"insert into t values ('baz');",
+			"call dolt_commit('-Am', 'commit main');", // will be main~1
+			"call dolt_branch('testbr', 'main~1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:            "call dolt_checkout('-B', 'testbr', 'main~2');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"testbr"}},
+			},
+			{
+				Query:    "select * from t order by s;",
+				Expected: []sql.Row{{"foo"}},
+			},
+			{
+				Query:            "call dolt_checkout('main');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t order by s;",
+				Expected: []sql.Row{{"bar"}, {"baz"}, {"foo"}},
+			},
+			{
+				Query:            "call dolt_checkout('-B', 'testbr', 'main~1');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"testbr"}},
+			},
+			{
+				Query:    "select * from t order by s;",
+				Expected: []sql.Row{{"bar"}, {"foo"}},
+			},
+		},
+	},
+	{
+		Name: "dolt_checkout with new branch forcefully with dirty working set",
+		SetUpScript: []string{
+			"create table t (s varchar(5) primary key);",
+			"insert into t values ('foo');",
+			"call dolt_commit('-Am', 'commit main~2');", // will be main~2
+			"insert into t values ('bar');",
+			"call dolt_commit('-Am', 'commit main~1');", // will be main~1
+			"insert into t values ('baz');",
+			"call dolt_commit('-Am', 'commit main');", // will be main~1
+			"call dolt_checkout('-b', 'testbr', 'main~1');",
+			"insert into t values ('qux');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"testbr"}},
+			},
+			{
+				Query:    "select * from t order by s;",
+				Expected: []sql.Row{{"bar"}, {"foo"}, {"qux"}}, // Dirty working set
+			},
+			{
+				Query:            "call dolt_checkout('main');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select * from t order by s;",
+				Expected: []sql.Row{{"bar"}, {"baz"}, {"foo"}},
+			},
+			{
+				Query:            "call dolt_checkout('-B', 'testbr', 'main~1');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"testbr"}},
+			},
+			{
+				Query:    "select * from t order by s;",
+				Expected: []sql.Row{{"bar"}, {"foo"}}, // Dirty working set was forcefully overwritten
+			},
+		},
+	},
+	{
+		Name: "dolt_checkout mixed with USE statements",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"call dolt_branch('b3');",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-Am', 'added values on main');",
+			"call dolt_checkout('b2');",
+			"insert into t values (2, 2);",
+			"call dolt_commit('-am', 'added values on b2');",
+			"call dolt_checkout('b3');",
+			"insert into t values (3, 3);",
+			"call dolt_commit('-am', 'added values on b3');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "use `mydb/b2`;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{2, 2}},
+			},
+			{
+				Query:            "use `mydb/b3`;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b3"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{3, 3}},
+			},
+			{
+				Query:            "use `mydb/main`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "use `mydb`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "call dolt_checkout('b2');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:            "use `mydb/b3`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b3"}},
+			},
+			// Since b2 was the last branch checked out with dolt_checkout, it's what mydb resolves to
+			{
+				Query:            "use `mydb`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{2, 2}},
+			},
+		},
+	},
+	{
+		Name: "dolt_checkout and base name resolution",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"call dolt_branch('b3');",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-Am', 'added values on main');",
+			"call dolt_checkout('b2');",
+			"insert into t values (2, 2);",
+			"call dolt_commit('-am', 'added values on b2');",
+			"call dolt_checkout('b3');",
+			"insert into t values (3, 3);",
+			"call dolt_commit('-am', 'added values on b3');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "use `mydb/b2`;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{2, 2}},
+			},
+			{
+				Query:    "select * from mydb.t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "use `mydb/b3`;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b3"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{3, 3}},
+			},
+			{
+				Query:    "select * from mydb.t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:    "select * from `mydb/b2`.t;",
+				Expected: []sql.Row{{2, 2}},
+			},
+			{
+				Query:            "use `mydb/main`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:    "select * from mydb.t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:    "select * from `mydb/b3`.t;",
+				Expected: []sql.Row{{3, 3}},
+			},
+			{
+				Query:            "use `mydb`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:    "select * from `mydb/main`.t;",
+				Expected: []sql.Row{{1, 1}},
+			},
+			{
+				Query:            "call dolt_checkout('b2');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:            "use `mydb/b3`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b3"}},
+			},
+			// Since b2 was the last branch checked out with dolt_checkout, it's what mydb resolves to
+			{
+				Query:    "select * from `mydb`.t;",
+				Expected: []sql.Row{{2, 2}},
+			},
+			{
+				Query:            "use `mydb`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{2, 2}},
+			},
+		},
+	},
+	{
+		Name: "dolt_checkout and base name resolution for commit",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"call dolt_branch('b3');",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-Am', 'added values on main');",
+			"call dolt_checkout('b2');",
+			"insert into t values (2, 2);",
+			"call dolt_commit('-am', 'added values on b2');",
+			"call dolt_checkout('b3');",
+			"insert into t values (3, 3);",
+			"call dolt_commit('-am', 'added values on b3');",
+			"call dolt_checkout('b2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:            "call dolt_checkout('b2');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+
+			{
+				Query:            "use `mydb/main`",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "insert into t values (4, 4);",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1}}},
+			},
+			{
+				Query:    "select * from t order by 1;",
+				Expected: []sql.Row{{1, 1}, {4, 4}},
+			},
+			{
+				Query:    "select * from `mydb/main`.t order by 1;",
+				Expected: []sql.Row{{1, 1}, {4, 4}},
+			},
+			{
+				Query:    "select * from `mydb/b2`.t order by 1;",
+				Expected: []sql.Row{{2, 2}},
+			},
+		},
+	},
+	{
+		Name: "branch last checked out is deleted",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"call dolt_branch('b3');",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-Am', 'added values on main');",
+			"call dolt_checkout('b2');",
+			"insert into t values (2, 2);",
+			"call dolt_commit('-am', 'added values on b2');",
+			"call dolt_checkout('b3');",
+			"insert into t values (3, 3);",
+			"call dolt_commit('-am', 'added values on b3');",
+			"call dolt_checkout('b2');",
+			"use mydb/main",
+			"call dolt_branch('-df', 'b2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "insert into t values (4, 4);",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1}}},
+			},
+			{
+				Query:    "select * from t order by 1;",
+				Expected: []sql.Row{{1, 1}, {4, 4}},
+			},
+			{
+				Query:    "select * from `mydb/main`.t order by 1;",
+				Expected: []sql.Row{{1, 1}, {4, 4}},
+			},
+			{
+				Query:          "select * from `mydb/b2`.t order by 1;",
+				ExpectedErrStr: "database not found: mydb/b2",
+			},
+		},
+	},
+	{
+		Name: "Using non-existent refs",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"insert into t values (1, 1);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b1');",
+			"call dolt_tag('tag1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "use mydb/b1",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:          "use mydb/b2",
+				ExpectedErrStr: "database not found: mydb/b2",
+			},
+			{
+				Query:    "use mydb/tag1",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:          "use mydb/tag2",
+				ExpectedErrStr: "database not found: mydb/tag2",
+			},
+			{
+				Query:          "use mydb/h4jks5lomp9u41r6902knn0pfr7lsgth",
+				ExpectedErrStr: "database not found: mydb/h4jks5lomp9u41r6902knn0pfr7lsgth",
+			},
+			{
+				Query:          "select * from `mydb/b2`.t;",
+				ExpectedErrStr: "database not found: mydb/b2",
+			},
+			{
+				Query:          "select * from `mydb/tag2`.t",
+				ExpectedErrStr: "database not found: mydb/tag2",
+			},
+			{
+				Query:          "select * from `mydb/h4jks5lomp9u41r6902knn0pfr7lsgth`.t",
+				ExpectedErrStr: "database not found: mydb/h4jks5lomp9u41r6902knn0pfr7lsgth",
+			},
+		},
+	},
+}
+
+var DoltCheckoutReadOnlyScripts = []queries.ScriptTest{
+	{
+		Name: "dolt checkout -b returns an error for read-only databases",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "call dolt_checkout('-b', 'newBranch');",
+				ExpectedErrStr: "unable to create new branch in a read-only database",
+			},
+		},
+	},
+	{
+		Name: "dolt checkout -B returns an error for read-only databases",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "call dolt_checkout('-B', 'newBranch');",
+				ExpectedErrStr: "unable to create new branch in a read-only database",
+			},
+		},
+	},
+}
+
+var DoltInfoSchemaScripts = []queries.ScriptTest{
+	{
+		Name: "info_schema changes with dolt_checkout",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"call dolt_branch('b3');",
+			"call dolt_checkout('b2');",
+			"alter table t add column c int;",
+			"call dolt_commit('-am', 'added column c on branch b2');",
+			"call dolt_checkout('b3');",
+			"alter table t add column d int;",
+			"call dolt_commit('-am', 'added column d on branch b3');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}},
+			},
+			{
+				Query:            "call dolt_checkout('b2');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}, {"c"}},
+			},
+			{
+				Query:            "call dolt_checkout('b3');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b3"}},
+			},
+			{
+				Query:    "select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}, {"d"}},
+			},
+		},
+	},
+	{
+		Name: "info_schema does not change with USE",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"call dolt_branch('b3');",
+			"alter table `mydb/b2`.t add column c int;",
+			"alter table `mydb/b3`.t add column d int;",
+			"use mydb/main;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "/* main */ select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}},
+			},
+			{
+				Query:            "use mydb/b2;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "/* b2 */ select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}},
+			},
+			{
+				Query:    "select column_name from information_schema.columns where table_schema = 'mydb/b2' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}, {"c"}},
+			},
+			{
+				Query:            "use mydb/b3;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b3"}},
+			},
+			{
+				Query:    "/* b3 */ select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}},
+			},
+			{
+				Query:    "select column_name from information_schema.columns where table_schema = 'mydb/b3' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}, {"d"}},
+			},
+		},
+	},
+	{
+		Name: "info_schema when checked out branch was deleted",
+		SetUpScript: []string{
+			"create table t (a int primary key, b int);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('b2');",
+			"alter table `mydb/b2`.t add column c int;",
+			"call dolt_branch('b3');",
+			"call dolt_checkout('b3')",
+			"use mydb/main;",
+			"call dolt_branch('-df', 'b3')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"main"}},
+			},
+			{
+				Query:    "/* main */ select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}},
+			},
+			{
+				Query:            "use mydb/b2;",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"b2"}},
+			},
+			{
+				Query:    "/* b2 */ select column_name from information_schema.columns where table_schema = 'mydb' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}},
+			},
+			{
+				Query:    "select column_name from information_schema.columns where table_schema = 'mydb/b2' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{"a"}, {"b"}, {"c"}},
+			},
+			{
+				Query:    "select count(*) from information_schema.columns where table_schema = 'mydb/b3' and table_name = 't' order by 1;",
+				Expected: []sql.Row{{0}},
+			},
+		},
+	},
+}
+
 var DoltBranchScripts = []queries.ScriptTest{
 	{
 		Name: "Create branches from HEAD with dolt_branch procedure",
@@ -1847,6 +3199,18 @@ var DoltBranchScripts = []queries.ScriptTest{
 			{
 				Query:    "CALL DOLT_BRANCH('-f', 'myNewBranch1')",
 				Expected: []sql.Row{{0}},
+			},
+		},
+	},
+	{
+		Name: "Create branches from HEAD fails when using a non-branch revision",
+		SetUpScript: []string{
+			"use `mydb/main~`",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL DOLT_BRANCH('myNewBranch1')",
+				ExpectedErrStr: "fatal: Unexpected error creating branch 'myNewBranch1' : this operation is not supported while in a detached head state",
 			},
 		},
 	},
@@ -1873,6 +3237,10 @@ var DoltBranchScripts = []queries.ScriptTest{
 			{
 				Query:    "CALL DOLT_BRANCH('-m', 'myNewBranch2', 'myNewBranch3')",
 				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-m', 'myNewBranch3', 'HEAD')",
+				ExpectedErrStr: "not a valid user branch name",
 			},
 		},
 	},
@@ -1913,6 +3281,10 @@ var DoltBranchScripts = []queries.ScriptTest{
 			{
 				Query:    "CALL DOLT_BRANCH('-cf', 'myNewBranch1', 'myNewBranch2')",
 				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:          "CALL DOLT_BRANCH('-c', 'myNewBranch1', 'HEAD')",
+				ExpectedErrStr: "fatal: 'HEAD' is not a valid branch name.",
 			},
 		},
 	},
@@ -1955,7 +3327,7 @@ var DoltBranchScripts = []queries.ScriptTest{
 			{
 				// Trying to delete a branch with unpushed changes fails without force option
 				Query:          "CALL DOLT_BRANCH('-d', 'myNewBranchWithCommit')",
-				ExpectedErrStr: "branch is not fully merged",
+				ExpectedErrStr: "branch 'myNewBranchWithCommit' is not fully merged",
 			},
 			{
 				Query:    "CALL DOLT_BRANCH('-df', 'myNewBranchWithCommit')",
@@ -1974,27 +3346,76 @@ var DoltBranchScripts = []queries.ScriptTest{
 		Assertions: []queries.ScriptTestAssertion{
 			{
 				Query:    "show tables",
-				Expected: []sql.Row{{"a"}, {"myview"}},
+				Expected: []sql.Row{{"a"}},
 			},
 			{
 				Query:    "CALL DOLT_CHECKOUT('-b', 'newBranch', 'head~1')",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'newBranch'"}},
 			},
 			{
 				Query:    "show tables",
-				Expected: []sql.Row{{"myview"}},
+				Expected: []sql.Row{},
 			},
 			{
 				Query:    "CALL DOLT_CHECKOUT('-b', 'newBranch2', @commit1)",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'newBranch2'"}},
 			},
 			{
 				Query:    "show tables",
-				Expected: []sql.Row{{"a"}, {"myview"}},
+				Expected: []sql.Row{{"a"}},
 			},
 			{
 				Query:          "CALL DOLT_CHECKOUT('-b', 'otherBranch', 'unknownCommit')",
 				ExpectedErrStr: "fatal: 'unknownCommit' is not a commit and a branch 'otherBranch' cannot be created from it",
+			},
+		},
+	},
+	{
+		// https://github.com/dolthub/dolt/issues/6001
+		Name: "-- allows escaping arg parsing to create/delete branch names that look like flags",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select count(*) from dolt_branches where name='-b';",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "call dolt_branch('--', '-b');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "select count(*) from dolt_branches where name='-b';",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "call dolt_branch('-d', '-f', '--', '-b');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "select count(*) from dolt_branches where name='-b';",
+				Expected: []sql.Row{{0}},
+			},
+		},
+	},
+	{
+		Name: "Join same table at two commits",
+		SetUpScript: []string{
+			"create table t (i int);",
+			"insert into t values (1);",
+			"call dolt_add('t');",
+			"call dolt_commit('-m', 'add t');",
+			"call dolt_branch('b1');",
+			"insert into t values (2);",
+			"call dolt_add('t');",
+			"call dolt_commit('-m', 'insert into t');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from `mydb/b1`.t join t",
+				Expected: []sql.Row{{1, 1}, {1, 2}},
+			},
+			{
+				Query:    "select * from `mydb/b1`.t join `mydb/main`.t",
+				Expected: []sql.Row{{1, 1}, {1, 2}},
 			},
 		},
 	},
@@ -2116,10 +3537,6 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:       "SELECT * from dolt_log(@Commit1, @Commit2, 't');",
-				ExpectedErr: sql.ErrInvalidArgumentNumber,
-			},
-			{
 				Query:       "SELECT * from dolt_log(null);",
 				ExpectedErr: sql.ErrInvalidArgumentDetails,
 			},
@@ -2184,31 +3601,11 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 				ExpectedErr: sql.ErrInvalidArgumentDetails,
 			},
 			{
-				Query:       "SELECT * from dolt_log('^main', '--not', @Commit1);",
-				ExpectedErr: sql.ErrInvalidArgumentDetails,
-			},
-			{
 				Query:       "SELECT * from dolt_log('main', '--not', '^branch1');",
 				ExpectedErr: sql.ErrInvalidArgumentDetails,
 			},
 			{
 				Query:       "SELECT * from dolt_log('main', '--not', 'main..branch1');",
-				ExpectedErr: sql.ErrInvalidArgumentDetails,
-			},
-			{
-				Query:       "SELECT * from dolt_log('^main', @Commit2, '--not', @Commit1);",
-				ExpectedErr: sql.ErrInvalidArgumentDetails,
-			},
-			{
-				Query:       "SELECT * from dolt_log(@Commit1, @Commit2);",
-				ExpectedErr: sql.ErrInvalidArgumentDetails,
-			},
-			{
-				Query:       "SELECT * from dolt_log('^main', '^branch1');",
-				ExpectedErr: sql.ErrInvalidArgumentDetails,
-			},
-			{
-				Query:       "SELECT * from dolt_log('^main');",
 				ExpectedErr: sql.ErrInvalidArgumentDetails,
 			},
 			{
@@ -2297,36 +3694,67 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:    "SELECT count(*) from dolt_log();",
-				Expected: []sql.Row{{4}},
+				Query: "SELECT message from dolt_log();",
+				Expected: []sql.Row{
+					{"inserting into t"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
 			},
 			{
-				Query:    "SELECT count(*) from dolt_log('main');",
-				Expected: []sql.Row{{4}},
+				Query: "SELECT message from dolt_log('main');",
+				Expected: []sql.Row{
+					{"inserting into t"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
 			},
 			{
-				Query:    "SELECT count(*) from dolt_log(@Commit1);",
-				Expected: []sql.Row{{3}},
+				Query: "SELECT message from dolt_log(@Commit1);",
+				Expected: []sql.Row{
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
 			},
 			{
-				Query:    "SELECT count(*) from dolt_log(@Commit2);",
-				Expected: []sql.Row{{4}},
+				Query: "SELECT message from dolt_log(@Commit2);",
+				Expected: []sql.Row{
+					{"inserting into t"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
 			},
 			{
-				Query:    "SELECT count(*) from dolt_log(@Commit3);",
-				Expected: []sql.Row{{5}},
+				Query: "SELECT message from dolt_log(@Commit3);",
+				Expected: []sql.Row{
+					{"inserting into t again"},
+					{"inserting into t"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
 			},
 			{
-				Query:    "SELECT count(*) from dolt_log('new-branch');",
-				Expected: []sql.Row{{5}},
+				Query: "SELECT message from dolt_log('new-branch');",
+				Expected: []sql.Row{
+					{"inserting into t again"},
+					{"inserting into t"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
 			},
 			{
-				Query:    "SELECT count(*) from dolt_log('main^');",
-				Expected: []sql.Row{{3}},
+				Query: "SELECT message from dolt_log('main^');",
+				Expected: []sql.Row{
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
 			},
 			{
-				Query:    "SELECT count(*)	 from dolt_log('main') join dolt_diff(@Commit1, @Commit2, 't') where commit_hash = to_commit;",
-				Expected: []sql.Row{{2}},
+				Query: "SELECT message from dolt_log('main') join dolt_diff(@Commit1, @Commit2, 't') where commit_hash = to_commit;",
+				Expected: []sql.Row{
+					{"inserting into t"},
+					{"inserting into t"},
+				},
 			},
 		},
 	},
@@ -2433,6 +3861,14 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 				Query:    "SELECT count(*) from dolt_log(@Commit4, '--not', @Commit2);",
 				Expected: []sql.Row{{2}}, // 4, 3
 			},
+			{
+				Query:    "SELECT count(*) from dolt_log('^main', '^new-branch');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT count(*) from dolt_log('^main', '--not', 'new-branch');",
+				Expected: []sql.Row{{0}},
+			},
 		},
 	},
 	{
@@ -2457,15 +3893,14 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 			{
 				Query: "SELECT commit_hash = @Commit2, commit_hash = @Commit1, committer, email, message from dolt_log();",
 				Expected: []sql.Row{
-					{true, false, "billy bob", "bigbillieb@fake.horse", "inserting into t"},
-					{false, true, "billy bob", "bigbillieb@fake.horse", "creating table t"},
-					{false, false, "billy bob", "bigbillieb@fake.horse", "checkpoint enginetest database mydb"},
+					{true, false, "root", "root@localhost", "inserting into t"},
+					{false, true, "root", "root@localhost", "creating table t"},
 					{false, false, "billy bob", "bigbillieb@fake.horse", "Initialize data repository"},
 				},
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit2, committer, email, message from dolt_log('main') limit 1;",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "inserting into t"}},
+				Expected: []sql.Row{{true, "root", "root@localhost", "inserting into t"}},
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit3, committer, email, message from dolt_log('new-branch') limit 1;",
@@ -2473,7 +3908,7 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit1, committer, email, message from dolt_log(@Commit1) limit 1;",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "creating table t"}},
+				Expected: []sql.Row{{true, "root", "root@localhost", "creating table t"}},
 			},
 		},
 	},
@@ -2525,7 +3960,7 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 			{
 				Query: "SELECT commit_hash = @Commit5, commit_hash = @Commit4, commit_hash = @Commit3, committer, email, message from dolt_log('main...new-branch');",
 				Expected: []sql.Row{
-					{true, false, false, "billy bob", "bigbillieb@fake.horse", "inserting into t 5"},
+					{true, false, false, "root", "root@localhost", "inserting into t 5"},
 					{false, true, false, "John Doe", "johndoe@example.com", "inserting into t 4"},
 					{false, false, true, "John Doe", "johndoe@example.com", "inserting into t 3"},
 				},
@@ -2546,7 +3981,7 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit5, committer, email, message from dolt_log('^new-branch', 'main');",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "inserting into t 5"}},
+				Expected: []sql.Row{{true, "root", "root@localhost", "inserting into t 5"}},
 			},
 			{
 				Query:    "SELECT * from dolt_log('^main', 'main');",
@@ -2554,11 +3989,11 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit5, committer, email, message from dolt_log('^main~', 'main');",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "inserting into t 5"}},
+				Expected: []sql.Row{{true, "root", "root@localhost", "inserting into t 5"}},
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit5, committer, email, message from dolt_log( 'main', '--not', 'main~');",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "inserting into t 5"}},
+				Expected: []sql.Row{{true, "root", "root@localhost", "inserting into t 5"}},
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit3, committer, email, message from dolt_log('^main', @Commit3);",
@@ -2570,16 +4005,198 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit5, committer, email, message from dolt_log('^new-branch', @Commit5);",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "inserting into t 5"}},
+				Expected: []sql.Row{{true, "root", "root@localhost", "inserting into t 5"}},
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit5, committer, email, message from dolt_log(@Commit5, '--not', @Commit4);",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "inserting into t 5"}},
+				Expected: []sql.Row{{true, "root", "root@localhost", "inserting into t 5"}},
 			},
 		},
 	},
-	//TODO: figure out how we were returning a commit from the function
-	/*{
+	{
+		Name: "multiple revisions",
+		SetUpScript: []string{
+			"create table t (pk int primary key);",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'commit 1 MAIN [1M]')",
+			"call dolt_commit('--allow-empty', '-m', 'commit 2 MAIN [2M]')",
+			"call dolt_tag('tagM')",
+			"call dolt_checkout('-b', 'branchA')",
+			"call dolt_commit('--allow-empty', '-m', 'commit 1 BRANCHA [1A]')",
+			"call dolt_commit('--allow-empty', '-m', 'commit 2 BRANCHA [2A]')",
+			"call dolt_checkout('-b', 'branchB')",
+			"call dolt_commit('--allow-empty', '-m', 'commit 1 BRANCHB [1B]')",
+			"call dolt_checkout('branchA')",
+			"call dolt_commit('--allow-empty', '-m', 'commit 3 BRANCHA [3A]')",
+			"call dolt_checkout('main')",
+			"call dolt_commit('--allow-empty', '-m', 'commit 3 AFTER [3M]')",
+		},
+		/*
+
+			                         1B (branchB)
+			                        /
+			                  1A - 2A - 3A (branchA)
+			                 /
+			 (init) - 1M - 2M - 3M (main)
+					     (tagM)
+
+		*/
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select message from dolt_log('branchB', 'branchA');",
+				Expected: []sql.Row{
+					{"commit 3 BRANCHA [3A]"},
+					{"commit 1 BRANCHB [1B]"},
+					{"commit 2 BRANCHA [2A]"},
+					{"commit 1 BRANCHA [1A]"},
+					{"commit 2 MAIN [2M]"},
+					{"commit 1 MAIN [1M]"},
+					{"Initialize data repository"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('main', 'branchA');",
+				Expected: []sql.Row{
+					{"commit 3 BRANCHA [3A]"},
+					{"commit 2 BRANCHA [2A]"},
+					{"commit 3 AFTER [3M]"},
+					{"commit 1 BRANCHA [1A]"},
+					{"commit 2 MAIN [2M]"},
+					{"commit 1 MAIN [1M]"},
+					{"Initialize data repository"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('main', 'branchB', 'branchA');",
+				Expected: []sql.Row{
+					{"commit 3 BRANCHA [3A]"},
+					{"commit 1 BRANCHB [1B]"},
+					{"commit 2 BRANCHA [2A]"},
+					{"commit 3 AFTER [3M]"},
+					{"commit 1 BRANCHA [1A]"},
+					{"commit 2 MAIN [2M]"},
+					{"commit 1 MAIN [1M]"},
+					{"Initialize data repository"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('branchB', 'main', '^branchA');",
+				Expected: []sql.Row{
+					{"commit 1 BRANCHB [1B]"},
+					{"commit 3 AFTER [3M]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('branchB', 'main', '--not', 'branchA');",
+				Expected: []sql.Row{
+					{"commit 1 BRANCHB [1B]"},
+					{"commit 3 AFTER [3M]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('branchB', 'main', '^branchA', '^main');",
+				Expected: []sql.Row{
+					{"commit 1 BRANCHB [1B]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('tagM..branchB');",
+				Expected: []sql.Row{
+					{"commit 1 BRANCHB [1B]"},
+					{"commit 2 BRANCHA [2A]"},
+					{"commit 1 BRANCHA [1A]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('HEAD..branchB');",
+				Expected: []sql.Row{
+					{"commit 1 BRANCHB [1B]"},
+					{"commit 2 BRANCHA [2A]"},
+					{"commit 1 BRANCHA [1A]"},
+				},
+			},
+		},
+	},
+	{
+		Name: "table names given",
+		SetUpScript: []string{
+			"create table test (pk int PRIMARY KEY)",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'created table test [1M]')",
+			"create table test2 (pk int PRIMARY KEY)",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'created table test2 [2M]')",
+			"call dolt_checkout('-b', 'test-branch')",
+			"insert into test values (0)",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'inserted 0 into test [1TB]')",
+			"create table test3 (pk int PRIMARY KEY)",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'created table test3 [2TB]')",
+			"call dolt_checkout('main')",
+			"insert into test values (1)",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'inserted 1 into test [3M]')",
+			"call dolt_merge('test-branch', '-m', 'merged test-branch [4M]')",
+			"drop table test3",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'dropped table test3 [5M]')",
+			"insert into test values (2)",
+			"call dolt_add('.')",
+			"call dolt_commit('-m', 'inserted 2 into test [6M]')",
+		},
+		/*
+
+		                  1TB - 2TB     (test-branch)
+		                 /         \
+		 (init) - 1M - 2M  -  3M - 4M - 5M - 6M (main)
+
+		*/
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select message from dolt_log('--tables', 'test');",
+				Expected: []sql.Row{
+					{"inserted 2 into test [6M]"},
+					{"merged test-branch [4M]"},
+					{"inserted 1 into test [3M]"},
+					{"inserted 0 into test [1TB]"},
+					{"created table test [1M]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('--tables', 'test2');",
+				Expected: []sql.Row{
+					{"created table test2 [2M]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('--tables', 'test3')",
+				Expected: []sql.Row{
+					{"dropped table test3 [5M]"},
+					{"created table test3 [2TB]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('--tables', 'test,test2');",
+				Expected: []sql.Row{
+					{"inserted 2 into test [6M]"},
+					{"merged test-branch [4M]"},
+					{"inserted 1 into test [3M]"},
+					{"inserted 0 into test [1TB]"},
+					{"created table test2 [2M]"},
+					{"created table test [1M]"},
+				},
+			},
+			{
+				Query: "select message from dolt_log('test-branch', '--tables', 'test');",
+				Expected: []sql.Row{
+					{"inserted 0 into test [1TB]"},
+					{"created table test [1M]"},
+				},
+			},
+		},
+	},
+	{
 		Name: "min parents, merges, show parents, decorate",
 		SetUpScript: []string{
 			"create table t (pk int primary key, c1 int);",
@@ -2590,63 +4207,63 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 			"call dolt_checkout('-b', 'branch1')",
 			"insert into t values(0,0);",
 			"set @Commit2 = '';",
-		"call dolt_commit_hash_out(@Commit2, '-am', 'inserting 0,0');",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'inserting 0,0');",
 
 			"call dolt_checkout('main')",
 			"call dolt_checkout('-b', 'branch2')",
 			"insert into t values(1,1);",
 			"set @Commit3 = '';",
-		"call dolt_commit_hash_out(@Commit3, '-am', 'inserting 1,1');",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'inserting 1,1');",
 
 			"call dolt_checkout('main')",
-			"call dolt_merge('branch1')",               // fast-forward merge
-			"set @MergeCommit = dolt_merge('branch2')", // actual merge with commit
+			"call dolt_merge('branch1')", // fast-forward merge
+			"call dolt_merge('branch2')", // actual merge with commit
 			"call dolt_tag('v1')",
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:    "SELECT commit_hash = @MergeCommit, committer, email, message from dolt_log('--merges');",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "Merge branch 'branch2' into main"}},
+				Query:    "SELECT committer, email, message from dolt_log('--merges');",
+				Expected: []sql.Row{{"root", "root@localhost", "Merge branch 'branch2' into main"}},
 			},
 			{
-				Query:    "SELECT commit_hash = @MergeCommit, committer, email, message from dolt_log('--min-parents', '2');",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "Merge branch 'branch2' into main"}},
+				Query:    "SELECT committer, email, message from dolt_log('--min-parents', '2');",
+				Expected: []sql.Row{{"root", "root@localhost", "Merge branch 'branch2' into main"}},
 			},
 			{
-				Query:    "SELECT commit_hash = @MergeCommit, committer, email, message from dolt_log('main', '--min-parents', '2');",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "Merge branch 'branch2' into main"}},
+				Query:    "SELECT committer, email, message from dolt_log('main', '--min-parents', '2');",
+				Expected: []sql.Row{{"root", "root@localhost", "Merge branch 'branch2' into main"}},
 			},
 			{
 				Query:    "SELECT count(*) from dolt_log('main');",
-				Expected: []sql.Row{{6}},
+				Expected: []sql.Row{{5}},
 			},
 			{
 				Query:    "SELECT count(*) from dolt_log('main', '--min-parents', '1');", // Should show everything except first commit
-				Expected: []sql.Row{{5}},
+				Expected: []sql.Row{{4}},
 			},
 			{
 				Query:    "SELECT count(*) from dolt_log('main', '--min-parents', '1', '--merges');", // --merges overrides --min-parents
 				Expected: []sql.Row{{1}},
 			},
 			{
-				Query:    "SELECT commit_hash = @MergeCommit, committer, email, message from dolt_log('branch1..main', '--min-parents', '2');",
-				Expected: []sql.Row{{true, "billy bob", "bigbillieb@fake.horse", "Merge branch 'branch2' into main"}},
+				Query:    "SELECT committer, email, message from dolt_log('branch1..main', '--min-parents', '2');",
+				Expected: []sql.Row{{"root", "root@localhost", "Merge branch 'branch2' into main"}},
 			},
 			{
 				Query:    "SELECT count(*) from dolt_log('--min-parents', '5');",
 				Expected: []sql.Row{{0}},
 			},
 			{
-				Query:    "SELECT commit_hash = @MergeCommit, SUBSTRING_INDEX(parents, ', ', 1) = @Commit2, SUBSTRING_INDEX(parents, ', ', -1) = @Commit3 from dolt_log('main', '--parents', '--merges');",
-				Expected: []sql.Row{{true, true, true}}, // shows two parents for merge commit
+				Query:    "SELECT message, SUBSTRING_INDEX(parents, ', ', 1) = @Commit2, SUBSTRING_INDEX(parents, ', ', -1) = @Commit3 from dolt_log('main', '--parents', '--merges');",
+				Expected: []sql.Row{{"Merge branch 'branch2' into main", true, true}}, // shows two parents for merge commit
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit3, parents = @Commit1 from dolt_log('branch2', '--parents') LIMIT 1;", // shows one parent for non-merge commit
 				Expected: []sql.Row{{true, true}},
 			},
 			{
-				Query:    "SELECT commit_hash = @MergeCommit, SUBSTRING_INDEX(parents, ', ', 1) = @Commit2, SUBSTRING_INDEX(parents, ', ', -1) = @Commit3 from dolt_log('branch1..main', '--parents', '--merges') LIMIT 1;",
-				Expected: []sql.Row{{true, true, true}},
+				Query:    "SELECT message, SUBSTRING_INDEX(parents, ', ', 1) = @Commit2, SUBSTRING_INDEX(parents, ', ', -1) = @Commit3 from dolt_log('branch1..main', '--parents', '--merges') LIMIT 1;",
+				Expected: []sql.Row{{"Merge branch 'branch2' into main", true, true}},
 			},
 			{
 				Query:    "SELECT commit_hash = @Commit2, parents = @Commit1 from dolt_log('branch2..branch1', '--parents') LIMIT 1;",
@@ -2665,7 +4282,7 @@ var LogTableFunctionScriptTests = []queries.ScriptTest{
 				Expected: []sql.Row{{true, true, "HEAD -> branch1"}},
 			},
 		},
-	},*/
+	},
 }
 
 var LargeJsonObjectScriptTests = []queries.ScriptTest{
@@ -2775,19 +4392,19 @@ var DoltTagTestScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "CALL DOLT_CHECKOUT('-b','other','HEAD^')",
-				Expected: []sql.Row{{0}},
+				Expected: []sql.Row{{0, "Switched to branch 'other'"}},
 			},
 			{
 				Query:    "INSERT INTO test VALUES (8), (9)",
 				Expected: []sql.Row{{types.OkResult{RowsAffected: 2}}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('-am','made changes in other')",
-				SkipResultsCheck: true,
+				Query:    "CALL DOLT_COMMIT('-am','made changes in other')",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query:    "CALL DOLT_MERGE('v1')",
-				Expected: []sql.Row{{0, 0}},
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
 			},
 			{
 				Query:    "SELECT * FROM test",
@@ -2881,6 +4498,309 @@ var DoltRemoteTestScripts = []queries.ScriptTest{
 	},
 }
 
+var DoltUndropTestScripts = []queries.ScriptTest{
+	{
+		Name: "dolt-undrop",
+		SetUpScript: []string{
+			"create database one;",
+			"create database two;",
+			"use one;",
+			"create table t1(pk int primary key);",
+			"insert into t1 values(1);",
+			"call dolt_commit('-Am', 'creating table t1');",
+			"use two;",
+			"create table t2(pk int primary key);",
+			"insert into t2 values(2);",
+			"call dolt_commit('-Am', 'creating table t2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "show databases;",
+				Expected: []sql.Row{{"information_schema"}, {"mydb"}, {"mysql"}, {"one"}, {"two"}},
+			},
+			{
+				Query:    "drop database one;",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "show databases;",
+				Expected: []sql.Row{{"information_schema"}, {"mydb"}, {"mysql"}, {"two"}},
+			},
+			{
+				Query:    "call dolt_undrop('one');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "show databases;",
+				Expected: []sql.Row{{"information_schema"}, {"mydb"}, {"mysql"}, {"one"}, {"two"}},
+			},
+			{
+				Query:    "use one;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from one.t1;",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "select * from two.t2;",
+				Expected: []sql.Row{{2}},
+			},
+			{
+				Query:    "drop database one;",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:          "call dolt_undrop;",
+				ExpectedErrStr: "no database name specified. available databases that can be undropped: one",
+			},
+			{
+				Query:    "call dolt_purge_dropped_databases;",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "show databases;",
+				Expected: []sql.Row{{"information_schema"}, {"mydb"}, {"mysql"}, {"two"}},
+			},
+			{
+				Query:          "call dolt_undrop;",
+				ExpectedErrStr: "no database name specified. there are no databases currently available to be undropped",
+			},
+		},
+	},
+}
+
+var DoltReflogTestScripts = []queries.ScriptTest{
+	{
+		Name: "dolt_reflog: error cases",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "select * from dolt_reflog('foo', 'bar');",
+				ExpectedErrStr: "error: dolt_reflog has too many positional arguments. Expected at most 1, found 2: ['foo' 'bar']",
+			},
+			{
+				Query:          "select * from dolt_reflog(NULL);",
+				ExpectedErrStr: "argument (<nil>) is not a string value, but a <nil>",
+			},
+			{
+				Query:          "select * from dolt_reflog(-100);",
+				ExpectedErrStr: "argument (-100) is not a string value, but a int8",
+			},
+		},
+	},
+	{
+		Name: "dolt_reflog: basic cases with no arguments",
+		SetUpScript: []string{
+			"create table t1(pk int primary key);",
+			"call dolt_commit('-Am', 'creating table t1');",
+
+			"insert into t1 values(1);",
+			"call dolt_commit('-Am', 'inserting row 1');",
+			"call dolt_tag('tag1');",
+
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t1 values(2);",
+			"call dolt_commit('-Am', 'inserting row 2');",
+
+			"insert into t1 values(3);",
+			"call dolt_commit('-Am', 'inserting row 3');",
+			"call dolt_tag('-d', 'tag1');",
+			"call dolt_tag('tag1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select ref, commit_hash, commit_message from dolt_reflog();",
+				Expected: []sql.Row{
+					{"refs/tags/tag1", doltCommit, "inserting row 3"},
+					{"refs/heads/branch1", doltCommit, "inserting row 3"},
+					{"refs/heads/branch1", doltCommit, "inserting row 2"},
+					{"refs/heads/branch1", doltCommit, "inserting row 1"},
+					{"refs/tags/tag1", doltCommit, "inserting row 1"},
+					{"refs/heads/main", doltCommit, "inserting row 1"},
+					{"refs/heads/main", doltCommit, "creating table t1"},
+					{"refs/heads/main", doltCommit, "Initialize data repository"},
+				},
+			},
+		},
+	},
+	{
+		Name: "dolt_reflog: basic cases with a ref argument",
+		SetUpScript: []string{
+			"create table t1(pk int primary key);",
+			"call dolt_commit('-Am', 'creating table t1');",
+
+			"insert into t1 values(1);",
+			"call dolt_commit('-Am', 'inserting row 1');",
+			"call dolt_tag('tag1');",
+
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t1 values(2);",
+			"call dolt_commit('-Am', 'inserting row 2');",
+
+			"insert into t1 values(3);",
+			"call dolt_commit('-Am', 'inserting row 3');",
+			"call dolt_tag('-d', 'tag1');",
+			"call dolt_tag('tag1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_reflog('doesNotExist');",
+				Expected: []sql.Row{},
+			},
+			{
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('refs/heads/main')",
+				Expected: []sql.Row{
+					{"refs/heads/main", doltCommit, "inserting row 1"},
+					{"refs/heads/main", doltCommit, "creating table t1"},
+					{"refs/heads/main", doltCommit, "Initialize data repository"},
+				},
+			}, {
+				// ref is case-insensitive
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('reFS/Heads/MaIn')",
+				Expected: []sql.Row{
+					{"refs/heads/main", doltCommit, "inserting row 1"},
+					{"refs/heads/main", doltCommit, "creating table t1"},
+					{"refs/heads/main", doltCommit, "Initialize data repository"},
+				},
+			}, {
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('main')",
+				Expected: []sql.Row{
+					{"refs/heads/main", doltCommit, "inserting row 1"},
+					{"refs/heads/main", doltCommit, "creating table t1"},
+					{"refs/heads/main", doltCommit, "Initialize data repository"},
+				},
+			}, {
+				// ref is case-insensitive
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('MaIN')",
+				Expected: []sql.Row{
+					{"refs/heads/main", doltCommit, "inserting row 1"},
+					{"refs/heads/main", doltCommit, "creating table t1"},
+					{"refs/heads/main", doltCommit, "Initialize data repository"},
+				},
+			}, {
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('refs/heads/branch1')",
+				Expected: []sql.Row{
+					{"refs/heads/branch1", doltCommit, "inserting row 3"},
+					{"refs/heads/branch1", doltCommit, "inserting row 2"},
+					{"refs/heads/branch1", doltCommit, "inserting row 1"},
+				},
+			}, {
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('branch1')",
+				Expected: []sql.Row{
+					{"refs/heads/branch1", doltCommit, "inserting row 3"},
+					{"refs/heads/branch1", doltCommit, "inserting row 2"},
+					{"refs/heads/branch1", doltCommit, "inserting row 1"},
+				},
+			}, {
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('refs/tags/tag1')",
+				Expected: []sql.Row{
+					{"refs/tags/tag1", doltCommit, "inserting row 3"},
+					{"refs/tags/tag1", doltCommit, "inserting row 1"},
+				},
+			}, {
+				// ref is case-insensitive
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('Refs/TAGs/taG1')",
+				Expected: []sql.Row{
+					{"refs/tags/tag1", doltCommit, "inserting row 3"},
+					{"refs/tags/tag1", doltCommit, "inserting row 1"},
+				},
+			}, {
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('tag1')",
+				Expected: []sql.Row{
+					{"refs/tags/tag1", doltCommit, "inserting row 3"},
+					{"refs/tags/tag1", doltCommit, "inserting row 1"},
+				},
+			}, {
+				// ref is case-insensitive
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('tAG1')",
+				Expected: []sql.Row{
+					{"refs/tags/tag1", doltCommit, "inserting row 3"},
+					{"refs/tags/tag1", doltCommit, "inserting row 1"},
+				},
+			}, {
+				// checkout main, so we can delete branch1
+				Query:    "call dolt_checkout('main');",
+				Expected: []sql.Row{{0, "Switched to branch 'main'"}},
+			}, {
+				// delete branch branch1 and make sure we can still query it in reflog
+				Query:    "call dolt_branch('-D', 'branch1')",
+				Expected: []sql.Row{{0}},
+			}, {
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('branch1')",
+				Expected: []sql.Row{
+					{"refs/heads/branch1", doltCommit, "inserting row 3"},
+					{"refs/heads/branch1", doltCommit, "inserting row 2"},
+					{"refs/heads/branch1", doltCommit, "inserting row 1"},
+				},
+			}, {
+				// delete tag tag1 and make sure we can still query it in reflog
+				Query:    "call dolt_tag('-d', 'tag1')",
+				Expected: []sql.Row{{0}},
+			}, {
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('tag1')",
+				Expected: []sql.Row{
+					{"refs/tags/tag1", doltCommit, "inserting row 3"},
+					{"refs/tags/tag1", doltCommit, "inserting row 1"},
+				},
+			},
+		},
+	},
+	{
+		Name: "dolt_reflog: garbage collection with no newgen data",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('main')",
+				Expected: []sql.Row{
+					{"refs/heads/main", doltCommit, "Initialize data repository"},
+				},
+			},
+			{
+				Query:    "call dolt_gc();",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				// Calling dolt_gc() invalidates the session, so we have to ask this assertion to create a new session
+				NewSession: true,
+				Query:      "select ref, commit_hash, commit_message from dolt_reflog('main')",
+				Expected:   []sql.Row{},
+			},
+		},
+	},
+	{
+		Name: "dolt_reflog: garbage collection with newgen data",
+		SetUpScript: []string{
+			"create table t1(pk int primary key);",
+			"call dolt_commit('-Am', 'creating table t1');",
+			"insert into t1 values(1);",
+			"call dolt_commit('-Am', 'inserting row 1');",
+			"call dolt_tag('tag1');",
+			"insert into t1 values(2);",
+			"call dolt_commit('-Am', 'inserting row 2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select ref, commit_hash, commit_message from dolt_reflog('main')",
+				Expected: []sql.Row{
+					{"refs/heads/main", doltCommit, "inserting row 2"},
+					{"refs/heads/main", doltCommit, "inserting row 1"},
+					{"refs/heads/main", doltCommit, "creating table t1"},
+					{"refs/heads/main", doltCommit, "Initialize data repository"},
+				},
+			},
+			{
+				Query:    "call dolt_gc();",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				// Calling dolt_gc() invalidates the session, so we have to force this test to create a new session
+				NewSession: true,
+				Query:      "select ref, commit_hash, commit_message from dolt_reflog('main')",
+				Expected:   []sql.Row{},
+			},
+		},
+	},
+}
+
 // DoltAutoIncrementTests is tests of dolt's global auto increment logic
 var DoltAutoIncrementTests = []queries.ScriptTest{
 	{
@@ -2898,8 +4818,8 @@ var DoltAutoIncrementTests = []queries.ScriptTest{
 				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 1}}},
 			},
 			{
-				Query:            "call dolt_commit('-am', 'two values on main')",
-				SkipResultsCheck: true,
+				Query:    "call dolt_commit('-am', 'two values on main')",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query:            "call dolt_checkout('branch1')",
@@ -2917,8 +4837,8 @@ var DoltAutoIncrementTests = []queries.ScriptTest{
 				},
 			},
 			{
-				Query:            "call dolt_commit('-am', 'two values on branch1')",
-				SkipResultsCheck: true,
+				Query:    "call dolt_commit('-am', 'two values on branch1')",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query:            "call dolt_checkout('branch2')",
@@ -3021,13 +4941,280 @@ var DoltAutoIncrementTests = []queries.ScriptTest{
 			},
 		},
 	},
-}
-
-var BrokenAutoIncrementTests = []queries.ScriptTest{
 	{
-		// truncate table doesn't reset the persisted auto increment counter of tables on other branches, which leads to
-		// the value not resetting to 1 after a truncate if the table exists on other branches, even if truncated on every
-		// branch
+		Name: "delete all rows in table",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"insert into t (b) values (1), (2)",
+			"call dolt_commit('-am', 'two values on main')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "delete from t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:            "alter table t auto_increment = 1",
+				SkipResultsCheck: true,
+			},
+			{
+				// empty tables, start at 1
+				Query:    "insert into t (b) values (7), (8)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 1}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{1, 7},
+					{2, 8},
+				},
+			},
+		},
+	},
+	{
+		Name: "set auto-increment below current max value",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"insert into t (b) values (1), (2), (3), (4)",
+			"call dolt_commit('-am', 'two values on main')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:            "alter table t auto_increment = 2",
+				SkipResultsCheck: true,
+			},
+			{
+				// previous update was ignored
+				Query:    "insert into t (b) values (5), (6)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 5}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{1, 1},
+					{2, 2},
+					{3, 3},
+					{4, 4},
+					{5, 5},
+					{6, 6},
+				},
+			},
+			{
+				Query:    "insert into t (a, b) values (100, 100)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1, InsertID: 100}}},
+			},
+			{
+				Query:            "alter table t auto_increment = 50",
+				SkipResultsCheck: true,
+			},
+			{
+				// previous update was ignored, value still below max on that table
+				Query:    "insert into t (b) values (101)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 1, InsertID: 101}}},
+			},
+			{
+				Query:    "select * from t where a >= 100 order by a",
+				Expected: []sql.Row{{100, 100}, {101, 101}},
+			},
+		},
+	},
+	{
+		Name: "set auto-increment above current max value",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"insert into t (b) values (1), (2), (3), (4)",
+			"call dolt_commit('-am', 'two values on main')",
+			"call dolt_branch('branch1')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:            "alter table t auto_increment = 20",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "insert into `mydb/branch1`.t (b) values (5), (6)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 20}}},
+			},
+			{
+				Query:    "insert into t (b) values (5), (6)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 22}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{1, 1},
+					{2, 2},
+					{3, 3},
+					{4, 4},
+					{22, 5},
+					{23, 6},
+				},
+			},
+		},
+	},
+	{
+		Name: "delete all rows in table in all branches",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"call dolt_branch('branch1')",
+			"call dolt_branch('branch2')",
+			"insert into t (b) values (1), (2)",
+			"call dolt_commit('-am', 'two values on main')",
+			"call dolt_checkout('branch1')",
+			"insert into t (b) values (3), (4)",
+			"call dolt_commit('-am', 'two values on branch1')",
+			"call dolt_checkout('branch2')",
+			"insert into t (b) values (5), (6)",
+			"call dolt_checkout('main')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "delete from t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "delete from `mydb/branch1`.t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "delete from `mydb/branch2`.t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:            "alter table `mydb/branch1`.t auto_increment = 1",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:            "alter table `mydb/branch2`.t auto_increment = 1",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:            "alter table t auto_increment = 1",
+				SkipResultsCheck: true,
+			},
+			{
+				// empty tables, start at 1
+				Query:    "insert into t (b) values (7), (8)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 1}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{1, 7},
+					{2, 8},
+				},
+			},
+		},
+	},
+	{
+		Name: "delete all rows in table in all but one branch",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"call dolt_branch('branch1')",
+			"call dolt_branch('branch2')",
+			"insert into t (b) values (1), (2)",
+			"call dolt_commit('-am', 'two values on main')",
+			"call dolt_checkout('branch1')",
+			"insert into t (b) values (3), (4)",
+			"call dolt_commit('-am', 'two values on branch1')",
+			"call dolt_checkout('branch2')",
+			"insert into t (b) values (5), (6)",
+			"call dolt_checkout('main')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "delete from t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "delete from `mydb/branch1`.t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "delete from `mydb/branch2`.t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:            "alter table t auto_increment = 1",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:            "alter table `mydb/branch2`.t auto_increment = 1",
+				SkipResultsCheck: true,
+			},
+			{
+				// empty tables, start at 5 (highest remaining value, update above ignored)
+				Query:    "insert into t (b) values (5), (6)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 5}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{5, 5},
+					{6, 6},
+				},
+			},
+		},
+	},
+	{
+		Name: "truncate table in all branches",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int)",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'empty table')",
+			"call dolt_branch('branch1')",
+			"call dolt_branch('branch2')",
+			"insert into t (b) values (1), (2)",
+			"call dolt_commit('-am', 'two values on main')",
+			"call dolt_checkout('branch1')",
+			"insert into t (b) values (3), (4)",
+			"call dolt_commit('-am', 'two values on branch1')",
+			"call dolt_checkout('branch2')",
+			"insert into t (b) values (5), (6)",
+			"call dolt_checkout('main')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "truncate t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "truncate `mydb/branch1`.t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:    "truncate `mydb/branch2`.t",
+				Expected: []sql.Row{{types.NewOkResult(2)}},
+			},
+			{
+				Query:            "alter table t auto_increment = 1",
+				SkipResultsCheck: true,
+			},
+			{
+				// empty tables, start at 1
+				Query:    "insert into t (b) values (7), (8)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 1}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{1, 7},
+					{2, 8},
+				},
+			},
+		},
+	},
+	{
 		Name: "truncate table",
 		SetUpScript: []string{
 			"create table t (a int primary key auto_increment, b int)",
@@ -3107,6 +5294,666 @@ var BrokenAutoIncrementTests = []queries.ScriptTest{
 			},
 		},
 	},
+	{
+		// Dropping the primary key constraint from a table implicitly truncates the table, which resets the
+		// auto_increment value for the table to 0. These tests assert that the correct auto_increment value is
+		// restored after the drop pk operation.
+		Name: "drop auto_increment primary key",
+		SetUpScript: []string{
+			"create table t (a int primary key auto_increment, b int, key (a))",
+			"call dolt_commit('-Am', 'empty table')",
+			"call dolt_branch('branch1')",
+			"call dolt_branch('branch2')",
+			"insert into t (b) values (1), (2)",
+			"call dolt_commit('-am', 'two values on main')",
+			"call dolt_checkout('branch1')",
+			"insert into t (b) values (3), (4)",
+			"call dolt_commit('-am', 'two values on branch1')",
+			"call dolt_checkout('branch2')",
+			"insert into t (b) values (5), (6)",
+			"call dolt_checkout('main')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "alter table t drop primary key",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				// highest value in any branch is 6
+				Query:    "insert into t (b) values (7), (8)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 7}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{1, 1},
+					{2, 2},
+					{7, 7},
+					{8, 8},
+				},
+			},
+			{
+				Query:            "call dolt_checkout('branch2')",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "insert into t (b) values (9), (10)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 9}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{5, 5},
+					{6, 6},
+					{9, 9},
+					{10, 10},
+				},
+			},
+			{
+				Query:    "alter table t drop primary key",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "insert into t (b) values (11), (12)",
+				Expected: []sql.Row{{types.OkResult{RowsAffected: 2, InsertID: 11}}},
+			},
+			{
+				Query: "select * from t order by a",
+				Expected: []sql.Row{
+					{5, 5},
+					{6, 6},
+					{9, 9},
+					{10, 10},
+					{11, 11},
+					{12, 12},
+				},
+			},
+		},
+	},
+}
+
+var DoltCherryPickTests = []queries.ScriptTest{
+	{
+		Name: "error cases: basic validation",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL Dolt_Cherry_Pick('HEAD~100');",
+				ExpectedErrStr: "invalid ancestor spec",
+			},
+			{
+				Query:          "CALL Dolt_Cherry_Pick('abcdaaaaaaaaaaaaaaaaaaaaaaaaaaaa');",
+				ExpectedErrStr: "target commit not found",
+			},
+			{
+				Query:          "CALL Dolt_Cherry_Pick('--abort');",
+				ExpectedErrStr: "error: There is no cherry-pick merge to abort",
+			},
+		},
+	},
+	{
+		Name: "error cases: merge commits cannot be cherry-picked",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL dolt_merge('--no-ff', 'branch1');",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+			{
+				Query:          "CALL dolt_cherry_pick('HEAD');",
+				ExpectedErrStr: "cherry-picking a merge commit is not supported",
+			},
+		},
+	},
+	{
+		Name: "error cases: error with staged or unstaged changes ",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+			"INSERT INTO t VALUES (100, 'onehundy');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL Dolt_Cherry_Pick(@commit1);",
+				ExpectedErrStr: "cannot cherry-pick with uncommitted changes",
+			},
+			{
+				Query:    "call dolt_add('t');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:          "CALL Dolt_Cherry_Pick(@commit1);",
+				ExpectedErrStr: "cannot cherry-pick with uncommitted changes",
+			},
+		},
+	},
+	{
+		Name: "error cases: different primary keys",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"ALTER TABLE t DROP PRIMARY KEY, ADD PRIMARY KEY (pk, v);",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL Dolt_Cherry_Pick(@commit1);",
+				ExpectedErrStr: "error: cannot merge because table t has different primary keys",
+			},
+		},
+	},
+	{
+		Name: "basic case",
+		SetUpScript: []string{
+			"create table t (pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-am', 'adding row 1');",
+			"set @commit1 = hashof('HEAD');",
+			"insert into t values (2, \"two\");",
+			"call dolt_commit('-am', 'adding row 2');",
+			"set @commit2 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * FROM t;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "call dolt_cherry_pick(@commit2);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SELECT * FROM t;",
+				Expected: []sql.Row{{2, "two"}},
+			},
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SELECT * FROM t order by pk;",
+				Expected: []sql.Row{{1, "one"}, {2, "two"}},
+			},
+			{
+				// Assert that our new commit only has one parent (i.e. not a merge commit)
+				Query:    "select count(*) from dolt_commit_ancestors where commit_hash = hashof('HEAD');",
+				Expected: []sql.Row{{1}},
+			},
+		},
+	},
+	{
+		Name: "keyless table",
+		SetUpScript: []string{
+			"call dolt_checkout('main');",
+			"CREATE TABLE keyless (id int, name varchar(10));",
+			"call dolt_commit('-Am', 'create table keyless on main');",
+			"call dolt_checkout('-b', 'branch1');",
+			"INSERT INTO keyless VALUES (1,'1'), (2,'3');",
+			"call dolt_commit('-am', 'insert rows into keyless table on branch1');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * FROM keyless;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "CALL DOLT_CHERRY_PICK('branch1');",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SELECT * FROM keyless;",
+				Expected: []sql.Row{{1, "1"}, {2, "3"}},
+			},
+		},
+	},
+	{
+		Name: "schema change: CREATE TABLE",
+		SetUpScript: []string{
+			"call dolt_checkout('-b', 'branch1');",
+			"CREATE TABLE table_a (pk BIGINT PRIMARY KEY, v varchar(10));",
+			"INSERT INTO table_a VALUES (11, 'aa'), (22, 'ab');",
+			"call dolt_commit('-Am', 'create table table_a');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				// Assert that our new commit only has one parent (i.e. not a merge commit)
+				Query:    "select count(*) from dolt_commit_ancestors where commit_hash = hashof('HEAD');",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{{"table_a"}},
+			},
+			{
+				Query:    "SELECT * FROM table_a;",
+				Expected: []sql.Row{{11, "aa"}, {22, "ab"}},
+			},
+		},
+	},
+	{
+		Name: "schema change: DROP TABLE",
+		SetUpScript: []string{
+			"CREATE TABLE dropme (pk BIGINT PRIMARY KEY, v varchar(10));",
+			"INSERT INTO dropme VALUES (11, 'aa'), (22, 'ab');",
+			"call dolt_commit('-Am', 'create table dropme');",
+			"call dolt_checkout('-b', 'branch1');",
+			"drop table dropme;",
+			"call dolt_commit('-Am', 'drop table dropme');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{{"dropme"}},
+			},
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{},
+			},
+		},
+	},
+	{
+		Name: "schema change: ALTER TABLE ADD COLUMN",
+		SetUpScript: []string{
+			"create table test(pk int primary key);",
+			"call dolt_commit('-Am', 'create table test on main');",
+			"call dolt_checkout('-b', 'branch1');",
+			"ALTER TABLE test ADD COLUMN v VARCHAR(100);",
+			"call dolt_commit('-am', 'add column v to test on branch1');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SHOW CREATE TABLE test;",
+				Expected: []sql.Row{{"test", "CREATE TABLE `test` (\n  `pk` int NOT NULL,\n  `v` varchar(100),\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	},
+	{
+		Name: "schema change: ALTER TABLE DROP COLUMN",
+		SetUpScript: []string{
+			"create table test(pk int primary key, v varchar(100));",
+			"call dolt_commit('-Am', 'create table test on main');",
+			"call dolt_checkout('-b', 'branch1');",
+			"ALTER TABLE test DROP COLUMN v;",
+			"call dolt_commit('-am', 'drop column v from test on branch1');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SHOW CREATE TABLE test;",
+				Expected: []sql.Row{{"test", "CREATE TABLE `test` (\n  `pk` int NOT NULL,\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	},
+	{
+		Name: "schema change: ALTER TABLE RENAME COLUMN",
+		SetUpScript: []string{
+			"create table test(pk int primary key, v1 varchar(100));",
+			"call dolt_commit('-Am', 'create table test on main');",
+			"call dolt_checkout('-b', 'branch1');",
+			"ALTER TABLE test RENAME COLUMN v1 to v2;",
+			"call dolt_commit('-am', 'rename column v1 to v2 in test on branch1');",
+			"set @commit1 = hashof('HEAD');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(@commit1);",
+				Expected: []sql.Row{{doltCommit, 0, 0, 0}},
+			},
+			{
+				Query:    "SHOW CREATE TABLE test;",
+				Expected: []sql.Row{{"test", "CREATE TABLE `test` (\n  `pk` int NOT NULL,\n  `v2` varchar(100),\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin"}},
+			},
+		},
+	},
+	{
+		Name: "abort (@@autocommit=0)",
+		SetUpScript: []string{
+			"SET @@autocommit=0;",
+			"create table t (pk int primary key, v varchar(100));",
+			"insert into t values (1, 'one');",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"update t set v=\"uno\" where pk=1;",
+			"call dolt_commit('-Am', 'updating row 1 -> uno');",
+			"alter table t drop column v;",
+			"call dolt_commit('-am', 'drop column v');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(hashof('branch1'));",
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				Query: "select base_pk, base_v, our_pk, our_diff_type, their_pk, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{
+					{1, "uno", 1, "modified", 1, "modified"},
+				},
+			},
+			{
+				Query:    "call dolt_cherry_pick('--abort');",
+				Expected: []sql.Row{{"", 0, 0, 0}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+		},
+	},
+	{
+		Name: "abort (@@autocommit=1)",
+		SetUpScript: []string{
+			"SET @@autocommit=1;",
+			"SET @@dolt_allow_commit_conflicts=1;",
+			"create table t (pk int primary key, v varchar(100));",
+			"insert into t values (1, 'one');",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"update t set v=\"uno\" where pk=1;",
+			"call dolt_commit('-Am', 'updating row 1 -> uno');",
+			"alter table t drop column v;",
+			"call dolt_commit('-am', 'drop column v');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(hashof('branch1'));",
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				Query: "select base_pk, base_v, our_pk, our_diff_type, their_pk, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{
+					{1, "uno", 1, "modified", 1, "modified"},
+				},
+			},
+			{
+				Query:    "call dolt_cherry_pick('--abort');",
+				Expected: []sql.Row{{"", 0, 0, 0}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+		},
+	},
+	{
+		Name: "conflict resolution (@@autocommit=0)",
+		SetUpScript: []string{
+			"SET @@autocommit=0;",
+			"create table t (pk int primary key, v varchar(100));",
+			"insert into t values (1, 'one');",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"update t set v=\"uno\" where pk=1;",
+			"call dolt_commit('-Am', 'updating row 1 -> uno');",
+			"alter table t drop column v;",
+			"call dolt_commit('-am', 'drop column v');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(hashof('branch1'));",
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				Query:    "select * from dolt_status",
+				Expected: []sql.Row{{"t", false, "modified"}, {"t", false, "conflict"}},
+			},
+			{
+				Query: "select base_pk, base_v, our_pk, our_diff_type, their_pk, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{
+					{1, "uno", 1, "modified", 1, "modified"},
+				},
+			},
+			{
+				Query:    "call dolt_conflicts_resolve('--ours', 't');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "select * from dolt_status",
+				Expected: []sql.Row{{"t", false, "modified"}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				Query:    "call dolt_commit('-am', 'committing cherry-pick');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				// Assert that our new commit only has one parent (i.e. not a merge commit)
+				Query:    "select count(*) from dolt_commit_ancestors where commit_hash = hashof('HEAD');",
+				Expected: []sql.Row{{1}},
+			},
+		},
+	},
+	{
+		Name: "conflict resolution (@@autocommit=1)",
+		SetUpScript: []string{
+			"set @@autocommit=1;",
+			"SET @@dolt_allow_commit_conflicts=1;",
+			"create table t (pk int primary key, c1 varchar(100));",
+			"call dolt_commit('-Am', 'creating table t');",
+			"insert into t values (1, \"one\");",
+			"call dolt_commit('-Am', 'inserting row 1');",
+			"SET @commit1 = hashof('HEAD');",
+			"update t set c1=\"uno\" where pk=1;",
+			"call dolt_commit('-Am', 'updating row 1 -> uno');",
+			"update t set c1=\"ein\" where pk=1;",
+			"call dolt_commit('-Am', 'updating row 1 -> ein');",
+			"SET @commit2 = hashof('HEAD');",
+			"call dolt_reset('--hard', @commit1);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * from dolt_status;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "SELECT * from t;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query:    `CALL dolt_cherry_pick(@commit2);`,
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				Query:    `SELECT * FROM dolt_conflicts;`,
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				Query:    `commit;`,
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    `SELECT * FROM dolt_conflicts;`,
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				Query:    `SELECT base_pk, base_c1, our_pk, our_c1, their_diff_type, their_pk, their_c1 FROM dolt_conflicts_t;`,
+				Expected: []sql.Row{{1, "uno", 1, "one", "modified", 1, "ein"}},
+			},
+			{
+				Query:    `SELECT * FROM t;`,
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				Query:    `call dolt_conflicts_resolve('--theirs', 't');`,
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    `SELECT * FROM t;`,
+				Expected: []sql.Row{{1, "ein"}},
+			},
+			{
+				Query:    "call dolt_commit('-am', 'committing cherry-pick');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				// Assert that our new commit only has one parent (i.e. not a merge commit)
+				Query:    "select count(*) from dolt_commit_ancestors where commit_hash = hashof('HEAD');",
+				Expected: []sql.Row{{1}},
+			},
+		},
+	},
+	{
+		Name: "abort (@@autocommit=1) with ignored table",
+		SetUpScript: []string{
+			"INSERT INTO dolt_ignore VALUES ('generated_*', 1);",
+			"CREATE TABLE generated_foo (pk int PRIMARY KEY);",
+			"CREATE TABLE generated_bar (pk int PRIMARY KEY);",
+			"insert into generated_foo values (1);",
+			"insert into generated_bar values (1);",
+			"SET @@autocommit=1;",
+			"SET @@dolt_allow_commit_conflicts=1;",
+			"create table t (pk int primary key, v varchar(100));",
+			"insert into t values (1, 'one');",
+			"call dolt_add('--force', 'generated_bar');",
+			"call dolt_commit('-Am', 'create table t');",
+			"call dolt_checkout('-b', 'branch1');",
+			"update t set v=\"uno\" where pk=1;",
+			"call dolt_commit('-Am', 'updating row 1 -> uno');",
+			"alter table t drop column v;",
+			"call dolt_commit('-am', 'drop column v');",
+			"call dolt_checkout('main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_cherry_pick(hashof('branch1'));",
+				Expected: []sql.Row{{"", 1, 0, 0}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				Query: "select base_pk, base_v, our_pk, our_diff_type, their_pk, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{
+					{1, "uno", 1, "modified", 1, "modified"},
+				},
+			},
+			{
+				Query: "insert into generated_foo values (2);",
+			},
+			/*
+				// TODO: https://github.com/dolthub/dolt/issues/7411
+				// see below
+				{
+					Query: "insert into generated_bar values (2);",
+				},
+			*/
+			{
+				Query:    "call dolt_cherry_pick('--abort');",
+				Expected: []sql.Row{{"", 0, 0, 0}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{1, "one"}},
+			},
+			{
+				// An ignored table should still be present (and unstaged) after aborting the merge.
+				Query:    "select * from dolt_status;",
+				Expected: []sql.Row{{"generated_foo", false, "new table"}},
+			},
+			{
+				// Changes made to the table during the merge should not be reverted.
+				Query:    "select * from generated_foo;",
+				Expected: []sql.Row{{1}, {2}},
+			},
+			/*{
+				// TODO: https://github.com/dolthub/dolt/issues/7411
+				// The table that was force-added should be treated like any other table
+				// and reverted to its state before the merge began.
+				Query:    "select * from generated_bar;",
+				Expected: []sql.Row{{1}},
+			},*/
+		},
+	},
 }
 
 var DoltCommitTests = []queries.ScriptTest{
@@ -3130,8 +5977,8 @@ var DoltCommitTests = []queries.ScriptTest{
 				Expected: []sql.Row{{types.NewOkResult(1)}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('-ALL', '-m', 'update table terminator');",
-				SkipResultsCheck: true,
+				Query:    "CALL DOLT_COMMIT('-ALL', '-m', 'update table terminator');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			// check last commit
 			{
@@ -3140,10 +5987,14 @@ var DoltCommitTests = []queries.ScriptTest{
 			},
 			// amend last commit
 			{
-				Query:            "CALL DOLT_COMMIT('-amend', '-m', 'update table t');",
-				SkipResultsCheck: true,
+				Query:    "CALL DOLT_COMMIT('-amend', '-m', 'update table t');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			// check amended commit
+			{
+				Query:    "SELECT * from t;",
+				Expected: []sql.Row{},
+			},
 			{
 				Query:    "select message from dolt_log limit 1",
 				Expected: []sql.Row{{"update table t"}},
@@ -3162,8 +6013,8 @@ var DoltCommitTests = []queries.ScriptTest{
 				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('-Am', 'drop table t');",
-				SkipResultsCheck: true,
+				Query:    "CALL DOLT_COMMIT('-Am', 'drop table t');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query:    "CALL DOLT_RESET('--hard');",
@@ -3179,13 +6030,13 @@ var DoltCommitTests = []queries.ScriptTest{
 				Expected: []sql.Row{{types.NewOkResult(0)}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('-Am', 'add table 21');",
-				SkipResultsCheck: true,
+				Query:    "CALL DOLT_COMMIT('-Am', 'add table 21');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			// amend last commit
 			{
-				Query:            "CALL DOLT_COMMIT('-amend', '-m', 'add table 2');",
-				SkipResultsCheck: true,
+				Query:    "CALL DOLT_COMMIT('-amend', '-m', 'add table 2');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			// check amended commit
 			{
@@ -3243,12 +6094,12 @@ var DoltCommitTests = []queries.ScriptTest{
 				},
 			},
 			{
-				Query:    "SELECT to_id, from_id, diff_type FROM dolt_diff_test;",
+				Query:    "SELECT to_id, from_id, diff_type FROM dolt_diff_tEST;",
 				Expected: []sql.Row{{2, nil, "added"}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('--amend', '-m', 'amended commit message');",
-				SkipResultsCheck: true, // commit hash is being returned, skip check
+				Query:    "CALL DOLT_COMMIT('--amend', '-m', 'amended commit message');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query: "SELECT  message FROM dolt_log;",
@@ -3316,8 +6167,8 @@ var DoltCommitTests = []queries.ScriptTest{
 				Expected: []sql.Row{{0}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('--amend');",
-				SkipResultsCheck: true, // commit hash is being returned, skip check
+				Query:    "CALL DOLT_COMMIT('--amend');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query: "SELECT message FROM dolt_log;",
@@ -3354,8 +6205,8 @@ var DoltCommitTests = []queries.ScriptTest{
 				Expected: []sql.Row{{0}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('--amend', '-m', 'amended commit with added changes');",
-				SkipResultsCheck: true, // commit hash is being returned, skip check
+				Query:    "CALL DOLT_COMMIT('--amend', '-m', 'amended commit with added changes');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query:    "SELECT COUNT(*) FROM dolt_status;",
@@ -3420,8 +6271,8 @@ var DoltCommitTests = []queries.ScriptTest{
 				Expected: []sql.Row{{0}},
 			},
 			{
-				Query:            "CALL DOLT_COMMIT('--amend', '-m', 'amended commit with removed changes');",
-				SkipResultsCheck: true, // commit hash is being returned, skip check
+				Query:    "CALL DOLT_COMMIT('--amend', '-m', 'amended commit with removed changes');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query:    "SELECT * FROM test;",
@@ -3479,8 +6330,8 @@ var DoltCommitTests = []queries.ScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:            "CALL DOLT_COMMIT('--amend', '-m', 'new merge');",
-				SkipResultsCheck: true, // commit hash is being returned, skip check
+				Query:    "CALL DOLT_COMMIT('--amend', '-m', 'new merge');",
+				Expected: []sql.Row{{doltCommit}},
 			},
 			{
 				Query: "SELECT message FROM dolt_log;",
@@ -3522,7 +6373,7 @@ var DoltIndexPrefixScripts = []queries.ScriptTest{
 		Assertions: []queries.ScriptTestAssertion{
 			{
 				Query:    "show create table t",
-				Expected: []sql.Row{{"t", "CREATE TABLE `t` (\n  `i` int NOT NULL,\n  `v1` varchar(10) COLLATE utf8mb4_0900_ai_ci,\n  `v2` varchar(10) COLLATE utf8mb4_0900_ai_ci,\n  PRIMARY KEY (`i`),\n  UNIQUE KEY `v1v2` (`v1`(3),`v2`(5))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+				Expected: []sql.Row{{"t", "CREATE TABLE `t` (\n  `i` int NOT NULL,\n  `v1` varchar(10),\n  `v2` varchar(10),\n  PRIMARY KEY (`i`),\n  UNIQUE KEY `v1v2` (`v1`(3),`v2`(5))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
 			},
 			{
 				Query:    "insert into t values (0, 'a', 'a'), (1, 'ab','ab'), (2, 'abc', 'abc'), (3, 'abcde', 'abcde')",
@@ -4028,6 +6879,38 @@ END`,
 			{
 				Query:    "CALL `mydb/other`.p1() AS OF 'HEAD~1';",
 				Expected: []sql.Row{{20}},
+			},
+		},
+	},
+}
+
+var DoltSystemVariables = []queries.ScriptTest{
+	{
+		Name: "DOLT_SHOW_SYSTEM_TABLES",
+		SetUpScript: []string{
+			"CREATE TABLE test (pk int PRIMARY KEY);",
+			"SET @@DOLT_SHOW_SYSTEM_TABLES=1",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SHOW TABLES;",
+				Expected: []sql.Row{
+					{"dolt_branches"},
+					{"dolt_commit_ancestors"},
+					{"dolt_commit_diff_test"},
+					{"dolt_commits"},
+					{"dolt_conflicts"},
+					{"dolt_conflicts_test"},
+					{"dolt_constraint_violations"},
+					{"dolt_constraint_violations_test"},
+					{"dolt_diff_test"},
+					{"dolt_history_test"},
+					{"dolt_log"},
+					{"dolt_remote_branches"},
+					{"dolt_remotes"},
+					{"dolt_status"},
+					{"test"},
+				},
 			},
 		},
 	},

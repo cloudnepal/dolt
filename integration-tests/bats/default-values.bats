@@ -320,7 +320,7 @@ teardown() {
     [[ "${#lines[@]}" = "3" ]] || false
     run dolt schema show
     [ "$status" -eq "0" ]
-    [[ "$output" =~ "\`v1\` bigint DEFAULT (pk)" ]] || false
+    [[ "$output" =~ "\`v1\` bigint DEFAULT (\`pk\`)" ]] || false
 }
 
 @test "default-values: Column referenced with name change" {
@@ -339,7 +339,7 @@ teardown() {
     [[ "${#lines[@]}" = "4" ]] || false
     run dolt schema show
     [ "$status" -eq "0" ]
-    [[ "$output" =~ "\`v2\` bigint DEFAULT ((v1y + 1))" ]] || false
+    [[ "$output" =~ "\`v2\` bigint DEFAULT ((\`v1y\` + 1))" ]] || false
 }
 
 @test "default-values: Invalid literal for column type" {
@@ -368,10 +368,10 @@ teardown() {
 }
 
 @test "default-values: TEXT literals" {
-    run dolt sql -q "CREATE TABLE test(pk BIGINT PRIMARY KEY, v1 TEXT DEFAULT 'hi')"
-    [ "$status" -eq "1" ]
-    run dolt sql -q "CREATE TABLE test(pk BIGINT PRIMARY KEY, v1 LONGTEXT DEFAULT 'hi')"
-    [ "$status" -eq "1" ]
+    # MySQL doesn't allow literals for TEXT/BLOB/JSON fields, but MariaDB does, so we allow it, too
+    # For more context, see: https://github.com/dolthub/dolt/issues/7033
+    dolt sql -q "CREATE TABLE test1(pk BIGINT PRIMARY KEY, v1 TEXT DEFAULT 'hi')"
+    dolt sql -q "CREATE TABLE test2(pk BIGINT PRIMARY KEY, v1 LONGTEXT DEFAULT 'hi')"
 }
 
 @test "default-values: Other types using NOW/CURRENT_TIMESTAMP literal" {
@@ -486,7 +486,9 @@ DELIM
     run dolt table import -u test bad-update.csv
     [ "$status" -eq "1" ]
     [[ "$output" =~ "bad row" ]] || false
-    [[ "$output" =~ "[5,<nil>,5]" ]] || false
+    [[ "$output" =~ "pk: 5" ]] || false
+    [[ "$output" =~ "v1: <nil>" ]] || false
+    [[ "$output" =~ "v2: 5" ]] || false
     [[ "$output" =~ "column name 'v1' is non-nullable but attempted to set a value of null" ]] || false
 }
 
@@ -537,8 +539,8 @@ DELIM
     dolt sql -q "CREATE TABLE test(pk BIGINT PRIMARY KEY, v1 SMALLINT DEFAULT (GREATEST(pk, 2)))"
     run dolt sql -q "SELECT column_name, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'test'"
     [ "$status" -eq "0" ]
-    [[ "$output" =~ "| pk          | NO          | NULL           |" ]] || false
-    [[ "$output" =~ "| v1          | YES         | greatest(pk,2) |" ]] || false
+    [[ "$output" =~ "| pk          | NO          | NULL             |" ]] || false
+    [[ "$output" =~ "| v1          | YES         | greatest(\`pk\`,2) |" ]] || false
 }
 
 @test "default-values: Additional test with function defaults" {
@@ -565,5 +567,5 @@ DELIM
     [[ "$output" =~ "COLUMN_NAME,COLUMN_DEFAULT" ]] || false
     [[ "$output" =~ "pk," ]] || false
     [[ "$output" =~ "col2,(rand() + rand())" ]] || false
-    [[ "$output" =~ "col3,CASE pk WHEN 1 THEN false ELSE true END" ]] || false
+    [[ "$output" =~ "col3,CASE \`pk\` WHEN 1 THEN false ELSE true END" ]] || false
 }

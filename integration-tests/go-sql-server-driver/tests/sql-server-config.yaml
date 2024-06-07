@@ -86,7 +86,7 @@ tests:
         rows: [["main"]]
     - query: "select @@dolt_replicate_heads"
       result:
-        columns: ["@@SESSION.dolt_replicate_heads"]
+        columns: ["@@dolt_replicate_heads"]
         rows: [["main"]]
 - name: dolt_replicate_all_heads is global variable
   repos:
@@ -114,7 +114,7 @@ tests:
         rows: [["1"]]
     - query: "select @@dolt_replicate_all_heads"
       result:
-        columns: ["@@SESSION.dolt_replicate_all_heads"]
+        columns: ["@@dolt_replicate_all_heads"]
         rows: [["1"]]
 - name: dolt_transaction_commit is global variable
   repos:
@@ -142,7 +142,7 @@ tests:
         rows: [["1"]]
     - query: "select @@dolt_transaction_commit"
       result:
-        columns: ["@@SESSION.dolt_transaction_commit"]
+        columns: ["@@dolt_transaction_commit"]
         rows: [["1"]]
     - query: "select count(*) from dolt_log"
       result:
@@ -275,3 +275,105 @@ tests:
       result:
         columns: ["@@GLOBAL.max_connections"]
         rows: [["555"]]
+- name: "@@global.dolt_log_level behavior"
+  repos:
+  - name: repo1
+    server:
+      args: ["-l", "warning"]
+      log_matches:
+      - "Starting query"
+  connections:
+  - on: repo1
+    queries:
+    - query: "select @@GLOBAL.dolt_log_level"
+      result:
+        columns: ["@@GLOBAL.dolt_log_level"]
+        rows: [["warning"]]
+    - exec: "set @@GLOBAL.dolt_log_level = 'trace'"
+    - query: "select 2+2 from dual"
+      result:
+        columns: ["2+2"]
+        rows: [["4"]]
+    - query: "select @@GLOBAL.dolt_log_level"
+      result:
+        columns: ["@@GLOBAL.dolt_log_level"]
+        rows: [["trace"]]
+    restart_server:
+      args: ["-l", "info"]
+  - on: repo1
+    queries:
+    - query: "select @@GLOBAL.dolt_log_level"
+      result:
+        columns: ["@@GLOBAL.dolt_log_level"]
+        rows: [["info"]]
+- name: system variables in config.yaml can be read in show variables
+  repos:
+  - name: repo1
+    with_files:
+      - name: "config.yaml"
+        contents: |
+          system_variables:
+            secure_file_priv: "/dev/null"
+            max_connections: 1000
+    server:
+      args: ["-l", "trace", "--config", "config.yaml"]
+  connections:
+  - on: repo1
+    queries:
+    - query: "select @@GLOBAL.secure_file_priv, @@GLOBAL.max_connections"
+      result:
+        columns: ["@@GLOBAL.secure_file_priv", "@@GLOBAL.max_connections"]
+        rows: [["/dev/null", "1000"]]
+- name: secure_file_priv set to /dev/null prevents loading files
+  repos:
+  - name: repo1
+    with_files:
+      - name: "config.yaml"
+        contents: |
+          system_variables:
+            secure_file_priv: "/dev/null"
+    server:
+      args: ["-l", "trace", "--config", "config.yaml"]
+  connections:
+  - on: repo1
+    queries:
+    - query: "select LOAD_FILE('config.yaml')"
+      result:
+        columns: ["LOAD_FILE('config.yaml')"]
+        rows: [["NULL"]]
+    - query: "select LOAD_FILE('/etc/passwd')"
+      result:
+        columns: ["LOAD_FILE('/etc/passwd')"]
+        rows: [["NULL"]]
+    - exec: "create table loaded (contents text)"
+    - exec: "load data infile \"config.yaml\" into table loaded"
+      error_match: "LOAD DATA is unable to open file: The MySQL server is running with the --secure-file-priv option so it cannot execute this statement"
+    - exec: "load data infile \"/config.yaml\" into table loaded"
+      error_match: "LOAD DATA is unable to open file: The MySQL server is running with the --secure-file-priv option so it cannot execute this statement"
+- name: secure_file_priv set to empty strings allows loading files
+  repos:
+  - name: repo1
+    with_files:
+      - name: "config.yaml"
+        contents: |
+          system_variables:
+            secure_file_priv: ""
+    server:
+      args: ["-l", "trace", "--config", "config.yaml"]
+  connections:
+  - on: repo1
+    queries:
+    - query: "select LOAD_FILE('config.yaml')"
+      result:
+        columns: ["LOAD_FILE('config.yaml')"]
+        rows: [["system_variables:\n  secure_file_priv: \"\"\n"]]
+    - query: "select LOAD_FILE('./.dolt/../config.yaml')"
+      result:
+        columns: ["LOAD_FILE('./.dolt/../config.yaml')"]
+        rows: [["system_variables:\n  secure_file_priv: \"\"\n"]]
+    - exec: "create table loaded (contents text)"
+    - exec: "load data infile \"config.yaml\" into table loaded lines terminated by \"\\0\""
+    - query: "select contents from loaded"
+      result:
+        columns: ["contents"]
+        rows: [["system_variables:\n  secure_file_priv: \"\"\n"]]

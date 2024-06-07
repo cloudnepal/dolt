@@ -776,3 +776,77 @@ SQL
     [[ "$output" =~ "5,5" ]] || false
     [[ "$output" =~ "6,6" ]] || false    
 }
+
+@test "auto_increment: newly cloned database" {
+    dolt sql  <<SQL
+call dolt_add('.');
+call dolt_commit('-am', 'empty table');
+call dolt_branch('branch1');
+call dolt_branch('branch2');
+
+insert into test (c0) values (1), (2);
+call dolt_commit('-am', 'main values');
+
+call dolt_checkout('branch1');
+insert into test (c0) values (3), (4);
+call dolt_commit('-am', 'branch1 values');
+
+call dolt_checkout('branch2');
+insert into test (c0) values (5), (6);
+call dolt_commit('-am', 'branch2 values');
+SQL
+
+    dolt remote add remote1 file://./remote1
+    dolt push remote1 main
+    dolt push remote1 branch1
+    dolt push remote1 branch2
+
+    dolt clone file://./remote1 clone
+    cd clone
+
+    # The clone should find the values on the remote branches that haven't been
+    # checked out locally
+    dolt sql  <<SQL    
+insert into test (c0) values (7), (8);
+SQL
+
+    run dolt sql -q 'select * from test' -r csv
+    [ $status -eq 0 ]
+    [[ "$output" =~ "7,7" ]] || false
+    [[ "$output" =~ "8,8" ]] || false
+}
+
+@test "auto_increment: manually set auto increment to original value" {
+    dolt sql  <<SQL
+drop table test;
+create table test (id int auto_increment primary key);
+insert into test values ();
+insert into test values ();
+SQL
+
+    run dolt sql -q "select * from test order by 1" -r csv
+    [ $status -eq 0 ]
+    [[ "$output" =~ "2" ]] || false
+
+    dolt sql -q "delete from test"
+    dolt sql  <<SQL
+alter table test auto_increment=1;
+insert into test values ();
+insert into test values ();
+SQL
+
+    run dolt sql -q "select * from test order by 1" -r csv
+    [ $status -eq 0 ]
+    [[ "$output" =~ "2" ]] || false
+
+    dolt sql  <<SQL
+alter table test auto_increment=1;
+insert into test values ();
+insert into test values ();
+SQL
+
+    # auto_increment update ignored because it's lower than current table max
+    run dolt sql -q "select * from test where id > 2 order by 1" -r csv
+    [ $status -eq 0 ]
+    [[ "$output" =~ "4" ]] || false
+}

@@ -41,6 +41,8 @@ type Server struct {
 	grpcSrv *grpc.Server
 	httpSrv http.Server
 
+	grpcHttpReqsWG sync.WaitGroup
+
 	tlsConfig *tls.Config
 }
 
@@ -60,6 +62,8 @@ type ServerArgs struct {
 	DBCache  DBCache
 	ReadOnly bool
 	Options  []grpc.ServerOption
+
+	ConcurrencyControl remotesapi.PushConcurrencyControl
 
 	HttpInterceptor func(http.Handler) http.Handler
 
@@ -91,7 +95,7 @@ func NewServer(args ServerArgs) (*Server, error) {
 	s.wg.Add(2)
 	s.grpcListenAddr = args.GrpcListenAddr
 	s.grpcSrv = grpc.NewServer(append([]grpc.ServerOption{grpc.MaxRecvMsgSize(128 * 1024 * 1024)}, args.Options...)...)
-	var chnkSt remotesapi.ChunkStoreServiceServer = NewHttpFSBackedChunkStore(args.Logger, args.HttpHost, args.DBCache, args.FS, scheme, sealer)
+	var chnkSt remotesapi.ChunkStoreServiceServer = NewHttpFSBackedChunkStore(args.Logger, args.HttpHost, args.DBCache, args.FS, scheme, args.ConcurrencyControl, sealer)
 	if args.ReadOnly {
 		chnkSt = ReadOnlyChunkStore{chnkSt}
 	}
@@ -102,7 +106,7 @@ func NewServer(args ServerArgs) (*Server, error) {
 		handler = args.HttpInterceptor(handler)
 	}
 	if args.HttpListenAddr == args.GrpcListenAddr {
-		handler = grpcMultiplexHandler(s.grpcSrv, handler)
+		handler = s.grpcMultiplexHandler(s.grpcSrv, handler)
 	} else {
 		s.wg.Add(2)
 	}
@@ -116,10 +120,12 @@ func NewServer(args ServerArgs) (*Server, error) {
 	return s, nil
 }
 
-func grpcMultiplexHandler(grpcSrv *grpc.Server, handler http.Handler) http.Handler {
+func (s *Server) grpcMultiplexHandler(grpcSrv *grpc.Server, handler http.Handler) http.Handler {
 	h2s := &http2.Server{}
 	newHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+			s.grpcHttpReqsWG.Add(1)
+			defer s.grpcHttpReqsWG.Done()
 			grpcSrv.ServeHTTP(w, r)
 		} else {
 			handler.ServeHTTP(w, r)
@@ -131,6 +137,22 @@ func grpcMultiplexHandler(grpcSrv *grpc.Server, handler http.Handler) http.Handl
 type Listeners struct {
 	http net.Listener
 	grpc net.Listener
+}
+
+func (l Listeners) Close() error {
+	if l.http != nil {
+		err := l.http.Close()
+		if err != nil {
+			if l.grpc != nil {
+				l.grpc.Close()
+			}
+			return err
+		}
+	}
+	if l.grpc != nil {
+		return l.grpc.Close()
+	}
+	return nil
 }
 
 func (s *Server) Listeners() (Listeners, error) {
@@ -160,6 +182,12 @@ func (s *Server) Listeners() (Listeners, error) {
 	return Listeners{http: httpListener, grpc: grpcListener}, nil
 }
 
+// Can be used to register more services on the server.
+// Should only be accessed before `Serve` is called.
+func (s *Server) GrpcServer() *grpc.Server {
+	return s.grpcSrv
+}
+
 func (s *Server) Serve(listeners Listeners) {
 	if listeners.grpc != nil {
 		go func() {
@@ -171,7 +199,9 @@ func (s *Server) Serve(listeners Listeners) {
 		go func() {
 			defer s.wg.Done()
 			<-s.stopChan
+			logrus.Traceln("Calling grpcSrv.GracefulStop")
 			s.grpcSrv.GracefulStop()
+			logrus.Traceln("Finished calling grpcSrv.GracefulStop")
 		}()
 	}
 
@@ -184,7 +214,21 @@ func (s *Server) Serve(listeners Listeners) {
 	go func() {
 		defer s.wg.Done()
 		<-s.stopChan
+		logrus.Traceln("Calling httpSrv.Shutdown")
 		s.httpSrv.Shutdown(context.Background())
+		logrus.Traceln("Finished calling httpSrv.Shutdown")
+
+		// If we are multiplexing HTTP and gRPC requests on the same
+		// listener, we need to stop the gRPC server here as well. We
+		// cannot stop it gracefully, but if we stop it forcefully
+		// here, we guarantee all the handler threads are cleaned up
+		// before we return.
+		if listeners.grpc == nil {
+			logrus.Traceln("Calling grpcSrv.Stop")
+			s.grpcSrv.Stop()
+			s.grpcHttpReqsWG.Wait()
+			logrus.Traceln("Finished calling grpcSrv.Stop")
+		}
 	}()
 
 	s.wg.Wait()

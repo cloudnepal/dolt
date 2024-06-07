@@ -77,7 +77,14 @@ type Schema interface {
 	GetMapDescriptors() (keyDesc, valueDesc val.TupleDesc)
 
 	// GetKeyDescriptor returns the key tuple descriptor for this schema.
+	// If a column has a type that can't appear in a key (such as "address" columns),
+	// that column will get converted to equivalent types that can. (Example: text -> varchar)
 	GetKeyDescriptor() val.TupleDesc
+
+	// GetKeyDescriptorWithNoConversion returns the a descriptor for the columns used in the key.
+	// Unlike `GetKeyDescriptor`, it doesn't attempt to convert columns if they can't appear in a key,
+	// and returns them as they are.
+	GetKeyDescriptorWithNoConversion() val.TupleDesc
 
 	// GetValueDescriptor returns the value tuple descriptor for this schema.
 	GetValueDescriptor() val.TupleDesc
@@ -87,6 +94,15 @@ type Schema interface {
 
 	// SetCollation sets the table's collation.
 	SetCollation(collation Collation)
+
+	// GetComment returns the table's comment.
+	GetComment() string
+
+	// SetComment sets the table's comment.
+	SetComment(comment string)
+
+	// Copy returns a copy of this Schema that can be safely modified independently.
+	Copy() Schema
 }
 
 // ColumnOrder is used in ALTER TABLE statements to change the order of inserted / modified columns.
@@ -126,6 +142,10 @@ func IsKeyless(sch Schema) bool {
 		sch.GetAllCols().Size() != 0
 }
 
+func IsVirtual(sch Schema) bool {
+	return sch != nil && len(sch.GetAllCols().virtualColumns) > 0
+}
+
 func HasAutoIncrement(sch Schema) (ok bool) {
 	_ = sch.GetAllCols().Iter(func(tag uint64, col Column) (stop bool, err error) {
 		if col.AutoIncrement {
@@ -135,6 +155,22 @@ func HasAutoIncrement(sch Schema) (ok bool) {
 		return
 	})
 	return
+}
+
+// GetAutoIncrementColumn returns the auto increment column if one exists, with an existence boolean
+func GetAutoIncrementColumn(sch Schema) (col Column, ok bool) {
+	var aiCol Column
+	var found bool
+	_ = sch.GetAllCols().Iter(func(tag uint64, col Column) (stop bool, err error) {
+		if col.AutoIncrement {
+			aiCol = col
+			found = true
+			stop = true
+		}
+		return
+	})
+
+	return aiCol, found
 }
 
 // SchemasAreEqual tests equality of two schemas.
@@ -282,8 +318,8 @@ func MapSchemaBasedOnTagAndName(inSch, outSch Schema) ([]int, []int, error) {
 
 	err := inSch.GetPKCols().Iter(func(tag uint64, col Column) (stop bool, err error) {
 		i := inSch.GetPKCols().TagToIdx[tag]
-		if col, ok := outSch.GetPKCols().GetByTag(tag); ok {
-			j := outSch.GetPKCols().TagToIdx[col.Tag]
+		if foundCol, ok := outSch.GetPKCols().GetByTag(tag); ok {
+			j := outSch.GetPKCols().TagToIdx[foundCol.Tag]
 			keyMapping[i] = j
 		} else {
 			return true, fmt.Errorf("could not map primary key column %s", col.Name)

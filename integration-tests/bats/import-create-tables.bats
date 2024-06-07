@@ -60,25 +60,48 @@ teardown() {
     teardown_common
 }
 
-@test "import-create-tables: correctly ignores byte order mark (BOM)" {
-    printf '\xEF\xBB\xBF' > bom.csv
-    cat <<DELIM >> bom.csv
-c1,c2
-1,2
-DELIM
-
-    run dolt table import -c bom bom.csv
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "Rows Processed: 1, Additions: 1, Modifications: 0, Had No Effect: 0" ]] || false
-    [[ "$output" =~ "Import completed successfully." ]] || false
-
-    run dolt sql -q "select c1 from bom"
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "1" ]] || false
-}
-
 @test "import-create-tables: create a table with json import" {
     run dolt table import -c -s `batshelper employees-sch.sql` employees `batshelper employees-tbl.json`
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+    run dolt ls
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "employees" ]] || false
+    run dolt sql -q "select * from employees"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "tim" ]] || false
+    [ "${#lines[@]}" -eq 7 ]
+}
+
+@test "import-create-tables: create a table with json import, utf8 with bom" {
+    run dolt table import -c -s `batshelper employees-sch.sql` employees `batshelper employees-tbl.utf8bom.json`
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+    run dolt ls
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "employees" ]] || false
+    run dolt sql -q "select * from employees"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "tim" ]] || false
+    [ "${#lines[@]}" -eq 7 ]
+}
+
+@test "import-create-tables: create a table with json import, utf16le with bom" {
+    run dolt table import -c -s `batshelper employees-sch.sql` employees `batshelper employees-tbl.utf16lebom.json`
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+    run dolt ls
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "employees" ]] || false
+    run dolt sql -q "select * from employees"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "tim" ]] || false
+    [ "${#lines[@]}" -eq 7 ]
+}
+
+@test "import-create-tables: create a table with json import, utf16be with bom" {
+    run dolt table import -c -s `batshelper employees-sch.sql` employees `batshelper employees-tbl.utf16bebom.json`
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Import completed successfully." ]] || false
     run dolt ls
@@ -130,7 +153,7 @@ DELIM
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Import completed successfully." ]] || false
     # Sanity Check
-    ! [[ "$output" =~ "Warning: There are fewer columns in the import file's schema than the table's schema" ]] || false
+    ! [[ "$output" =~ "Warning: The import file's schema does not match the table's schema" ]] || false
 
     run dolt sql -q "select * from test"
     [ "$status" -eq 0 ]
@@ -180,9 +203,12 @@ DELIM
     run dolt table import -c --pk=id fktest 1pk5col-ints.csv
     [ "$status" -eq 1 ]
     [[ "$output" =~ "fktest already exists. Use -f to overwrite." ]] || false
-    run dolt table import -c --pk=pk test 1pk5col-ints.csv -f
-    [ "$status" -eq 1 ]
-    [[ "$output" =~ 'it is referenced in foreign key' ]] || false
+    run dolt table import -c -f --pk=pk fktest other.csv
+    [ "$status" -eq 0 ]
+
+    run dolt schema show
+    [ "$status" -eq 0 ]
+    [[ ! "$output" =~ "FOREIGN KEY" ]] || false
 }
 
 @test "import-create-tables: try to create a table with a bad csv" {
@@ -210,9 +236,6 @@ CSV
 }
 
 @test "import-create-tables: try to create a table with dolt table import with invalid name" {
-    run dolt table import -c --pk=pk 123 1pk5col-ints.csv
-    [ "$status" -eq 1 ]
-    [[ "$output" =~ "not a valid table name" ]] || false
     run dolt table import -c --pk=pk dolt_docs 1pk5col-ints.csv
     [ "$status" -eq 1 ]
     [[ "$output" =~ "not a valid table name" ]] || false
@@ -227,7 +250,7 @@ CSV
     [[ "$output" =~ "reserved" ]] || false
 }
 
-@test "import-create-tables: try to table import with nonexistant --pk arg" {
+@test "import-create-tables: try to table import with nonexistent --pk arg" {
     run dolt table import -c -pk="batmansparents" test 1pk5col-ints.csv
     [ "$status" -eq 1 ]
     [[ "$output" =~ "Error determining the output schema." ]] || false
@@ -235,7 +258,7 @@ CSV
     [[ "$output" =~ "column 'batmansparents' not found" ]] || false
 }
 
-@test "import-create-tables: try to table import with one valid and one nonexistant --pk arg" {
+@test "import-create-tables: try to table import with one valid and one nonexistent --pk arg" {
     run dolt table import -c -pk="pk,batmansparents" test 1pk5col-ints.csv
     [ "$status" -eq 1 ]
     [[ "$output" =~ "Error determining the output schema." ]] || false
@@ -549,10 +572,10 @@ pk1,pk2,v1
 DELIM
     run dolt table import -c --pk=pk test null-pk-1.csv
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "pk" ]]
+    [[ "$output" =~ "pk" ]] || false
     run dolt table import -c --pk=pk1,pk2 test null-pk-2.csv
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "pk2" ]]
+    [[ "$output" =~ "pk2" ]] || false
 }
 
 @test "import-create-tables: table import -c infers types from data" {
@@ -564,15 +587,15 @@ DELIM
     [ "$status" -eq 0 ]
     run dolt schema show test
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "CREATE TABLE \`test\`" ]]
-    [[ "$output" =~ "\`pk\` int" ]]
-    [[ "$output" =~ "\`str\` varchar(16383)" ]]
-    [[ "$output" =~ "\`int\` int" ]]
-    [[ "$output" =~ "\`bool\` tinyint" ]]
-    [[ "$output" =~ "\`float\` float" ]]
-    [[ "$output" =~ "\`date\` date" ]]
-    [[ "$output" =~ "\`time\` time" ]]
-    [[ "$output" =~ "\`datetime\` datetime" ]]
+    [[ "$output" =~ "CREATE TABLE \`test\`" ]] || false
+    [[ "$output" =~ "\`pk\` int" ]] || false
+    [[ "$output" =~ "\`str\` varchar(1023)" ]] || false
+    [[ "$output" =~ "\`int\` int" ]] || false
+    [[ "$output" =~ "\`bool\` tinyint" ]] || false
+    [[ "$output" =~ "\`float\` float" ]] || false
+    [[ "$output" =~ "\`date\` date" ]] || false
+    [[ "$output" =~ "\`time\` time" ]] || false
+    [[ "$output" =~ "\`datetime\` datetime" ]] || false
 }
 
 @test "import-create-tables: table import -c collects garbage" {
@@ -584,7 +607,6 @@ DELIM
 
     # assert that we already collected garbage
     BEFORE=$(du -c .dolt/noms/ | grep total | sed 's/[^0-9]*//g')
-    skip_nbf_dolt "dolt gc not implemented"
     dolt gc
     AFTER=$(du -c .dolt/noms/ | grep total | sed 's/[^0-9]*//g')
 
@@ -697,7 +719,7 @@ DELIM
 
     run dolt table import -s schema.sql -c subset data.csv
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "Warning: There are fewer columns in the import file's schema than the table's schema" ]] || false
+    [[ "$output" =~ "Warning: The import file's schema does not match the table's schema" ]] || false
 
     # schema argument subsets the data and adds empty column
     run dolt sql -r csv -q "select * from subset ORDER BY pk"
@@ -794,4 +816,96 @@ DELIM
     [[ "$output" =~ "Lines skipped: 2" ]] || false
     [[ "$output" =~ "Import completed successfully." ]] || false
 
+}
+
+@test "import-create-tables: created table with force option can be added and committed as modified" {
+    run dolt table import -c --pk=id test `batshelper jails.csv`
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+    run dolt add test
+    [ "$status" -eq 0 ]
+    run dolt commit -m 'added table test'
+    [ "$status" -eq 0 ]
+    run dolt table import -c -f --pk=state test `batshelper states.csv`
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+    run dolt add test
+    [ "$status" -eq 0 ]
+    run dolt commit -m 'modified table test'
+    [ "$status" -eq 0 ]
+    run dolt status
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "On branch main" ]
+    [ "${lines[1]}" = "nothing to commit, working tree clean" ]
+}
+
+@test "import-create-tables: import null foreign key value does not violate constraint" {
+    cat <<DELIM > test.csv
+id, state_id, data
+1,,poop
+DELIM
+
+    dolt sql <<SQL
+CREATE TABLE states (
+  id int NOT NULL,
+  abbr char(2),
+  PRIMARY KEY (id)
+);
+CREATE TABLE data (
+  id int NOT NULL,
+  state_id int,
+  data varchar(500),
+  PRIMARY KEY (id),
+  KEY state_id (state_id),
+  CONSTRAINT d4jibcjf FOREIGN KEY (state_id) REFERENCES states (id)
+);
+SQL
+
+    run dolt sql -q "insert into data values (0, NULL, 'poop')"
+    [ "$status" -eq 0 ]
+    run dolt sql -q "select * from data"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "| 0  | NULL     | poop |" ]] || false
+
+    run dolt table import -u data test.csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+    run dolt sql -q "select * from data"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "| 0  | NULL     | poop |" ]] || false
+    [[ "$output" =~ "| 1  | NULL     | poop |" ]] || false
+}
+
+@test "import-create-tables: --all-text imports all columns as text" {
+    cat <<DELIM >test.csv
+id, state, data
+1,WA,"{""a"":1,""b"":""value""}"
+DELIM
+
+    run dolt table import -c --all-text --pk=id test test.csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+
+    run dolt sql -q "describe test"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "| id    | varchar(1023) |" ]] || false
+    [[ "$output" =~ "| state | text          |" ]] || false
+    [[ "$output" =~ "| data  | text          |" ]] || false
+
+    # pk defaults to first column if not explicitly defined
+    run dolt table import -c --all-text test2 test.csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Import completed successfully." ]] || false
+
+    run dolt sql -q "describe test2"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "| id    | varchar(1023) |" ]] || false
+    [[ "$output" =~ "| state | text          |" ]] || false
+    [[ "$output" =~ "| data  | text          |" ]] || false
+}
+
+@test "import-create-tables: --all-text and --schema are mutually exclusive" {
+    run dolt table import -c -s `batshelper employees-sch.sql` --all-text employees `batshelper employees-tbl.json`
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "parameters all-text and schema are mutually exclusive" ]] || false
 }

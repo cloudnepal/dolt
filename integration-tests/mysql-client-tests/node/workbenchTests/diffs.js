@@ -22,6 +22,7 @@ export const diffTests = [
       info: "",
       serverStatus: 2,
       warningStatus: 0,
+      changedRows: 0,
     },
   },
   {
@@ -74,13 +75,13 @@ export const diffTests = [
         rows_added: 1,
         rows_deleted: 0,
         rows_modified: 0,
-        cells_added: 4,
+        cells_added: 5,
         cells_deleted: 0,
         cells_modified: 0,
         old_row_count: 0,
         new_row_count: 1,
         old_cell_count: 0,
-        new_cell_count: 4,
+        new_cell_count: 5,
       },
       {
         table_name: "test",
@@ -197,12 +198,15 @@ export const diffTests = [
         to_name: "myview",
         to_fragment: "CREATE VIEW `myview` AS SELECT * FROM test",
         to_extra: { CreatedAt: 0 },
+        to_sql_mode:
+          "NO_ENGINE_SUBSTITUTION,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES",
         to_commit: "WORKING",
         to_commit_date: "2023-03-09T07:56:29.035Z",
         from_type: null,
         from_name: null,
         from_fragment: null,
         from_extra: null,
+        from_sql_mode: null,
         from_commit: "HEAD",
         from_commit_date: "2023-03-09T07:56:28.841Z",
         diff_type: "added",
@@ -234,6 +238,7 @@ export const diffTests = [
           "  `name` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
           "  `fragment` longtext,\n" +
           "  `extra` json,\n" +
+          "  `sql_mode` varchar(256) COLLATE utf8mb4_0900_ai_ci,\n" +
           "  PRIMARY KEY (`type`,`name`)\n" +
           ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
       },
@@ -254,6 +259,60 @@ export const diffTests = [
       },
     ],
     matcher: patchRowsMatcher,
+  },
+  {
+    q: "SELECT * FROM DOLT_SCHEMA_DIFF(:fromRefName, :toRefName)",
+    p: { fromRefName: "HEAD", toRefName: "WORKING" },
+    res: [
+      {
+        from_table_name: "test_info",
+        to_table_name: "",
+        from_create_statement:
+          "CREATE TABLE `test_info` (\n" +
+          "  `id` int NOT NULL,\n" +
+          "  `info` varchar(255),\n" +
+          "  `test_pk` int,\n" +
+          "  PRIMARY KEY (`id`),\n" +
+          "  KEY `test_pk` (`test_pk`),\n" +
+          "  CONSTRAINT `test_info_ibfk_1` FOREIGN KEY (`test_pk`) REFERENCES `test` (`pk`)\n" +
+          ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+        to_create_statement: "",
+      },
+      {
+        from_table_name: "",
+        to_table_name: "dolt_schemas",
+        from_create_statement: "",
+        to_create_statement:
+          "CREATE TABLE `dolt_schemas` (\n" +
+          "  `type` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
+          "  `name` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
+          "  `fragment` longtext,\n" +
+          "  `extra` json,\n" +
+          "  `sql_mode` varchar(256) COLLATE utf8mb4_0900_ai_ci,\n" +
+          "  PRIMARY KEY (`type`,`name`)\n" +
+          ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+      },
+    ],
+  },
+  {
+    q: "SELECT * FROM DOLT_SCHEMA_DIFF(:fromRefName, :toRefName, :tableName)",
+    p: { fromRefName: "HEAD", toRefName: "WORKING", tableName: "test_info" },
+    res: [
+      {
+        from_table_name: "test_info",
+        to_table_name: "",
+        from_create_statement:
+          "CREATE TABLE `test_info` (\n" +
+          "  `id` int NOT NULL,\n" +
+          "  `info` varchar(255),\n" +
+          "  `test_pk` int,\n" +
+          "  PRIMARY KEY (`id`),\n" +
+          "  KEY `test_pk` (`test_pk`),\n" +
+          "  CONSTRAINT `test_info_ibfk_1` FOREIGN KEY (`test_pk`) REFERENCES `test` (`pk`)\n" +
+          ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+        to_create_statement: "",
+      },
+    ],
   },
   {
     q: `CALL DOLT_COMMIT("-A", "-m", :commitMsg)`,
@@ -312,13 +371,13 @@ export const diffTests = [
         rows_added: 1,
         rows_deleted: 0,
         rows_modified: 0,
-        cells_added: 4,
+        cells_added: 5,
         cells_deleted: 0,
         cells_modified: 0,
         old_row_count: 0,
         new_row_count: 1,
         old_cell_count: 0,
-        new_cell_count: 4,
+        new_cell_count: 5,
       },
       {
         table_name: "test",
@@ -394,6 +453,7 @@ export const diffTests = [
           "  `name` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
           "  `fragment` longtext,\n" +
           "  `extra` json,\n" +
+          "  `sql_mode` varchar(256) COLLATE utf8mb4_0900_ai_ci,\n" +
           "  PRIMARY KEY (`type`,`name`)\n" +
           ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
       },

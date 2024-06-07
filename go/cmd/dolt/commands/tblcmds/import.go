@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -30,6 +31,7 @@ import (
 	"github.com/fatih/color"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/text/message"
+	"gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands"
@@ -41,6 +43,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/mvdata"
 	"github.com/dolthub/dolt/go/libraries/doltcore/rowconv"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema/typeinfo"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
@@ -54,6 +57,7 @@ const (
 	createParam       = "create-table"
 	updateParam       = "update-table"
 	replaceParam      = "replace-table"
+	appendParam       = "append-table"
 	tableParam        = "table"
 	fileParam         = "file"
 	schemaParam       = "schema"
@@ -66,6 +70,7 @@ const (
 	quiet             = "quiet"
 	ignoreSkippedRows = "ignore-skipped-rows" // alias for quiet
 	disableFkChecks   = "disable-fk-checks"
+	allTextParam      = "all-text"
 )
 
 var jsonInputFileHelp = "The expected JSON input file format is:" + `
@@ -86,17 +91,19 @@ var importDocs = cli.CommandDocumentationContent{
 	ShortDesc: `Imports data into a dolt table`,
 	LongDesc: `If {{.EmphasisLeft}}--create-table | -c{{.EmphasisRight}} is given the operation will create {{.LessThan}}table{{.GreaterThan}} and import the contents of file into it.  If a table already exists at this location then the operation will fail, unless the {{.EmphasisLeft}}--force | -f{{.EmphasisRight}} flag is provided. The force flag forces the existing table to be overwritten.
 
-The schema for the new table can be specified explicitly by providing a SQL schema definition file, or will be inferred from the imported file.  All schemas, inferred or explicitly defined must define a primary key.  If the file format being imported does not support defining a primary key, then the {{.EmphasisLeft}}--pk{{.EmphasisRight}} parameter must supply the name of the field that should be used as the primary key.
+The schema for the new table can be specified explicitly by providing a SQL schema definition file, or will be inferred from the imported file.  All schemas, inferred or explicitly defined must define a primary key.  If the file format being imported does not support defining a primary key, then the {{.EmphasisLeft}}--pk{{.EmphasisRight}} parameter must supply the name of the field that should be used as the primary key. If no primary key is explicitly defined, the first column in the import file will be used as the primary key.
 
 If {{.EmphasisLeft}}--update-table | -u{{.EmphasisRight}} is given the operation will update {{.LessThan}}table{{.GreaterThan}} with the contents of file. The table's existing schema will be used, and field names will be used to match file fields with table fields unless a mapping file is specified.
 
-During import, if there is an error importing any row, the import will be aborted by default. Use the {{.EmphasisLeft}}--continue{{.EmphasisRight}} flag to continue importing when an error is encountered. You can add the {{.EmphasisLeft}}--quiet{{.EmphasisRight}} flag to prevent the import utility from printing all the skipped rows. 
+If {{.EmphasisLeft}}--append-table | -a{{.EmphasisRight}} is given the operation will add the contents of the file to {{.LessThan}}table{{.GreaterThan}}, without modifying any of the rows of {{.LessThan}}table{{.GreaterThan}}. If the file contains a row that matches the primary key of a row already in the table, the import will be aborted unless the --continue flag is used (in which case that row will not be imported.) The table's existing schema will be used, and field names will be used to match file fields with table fields unless a mapping file is specified.
 
 If {{.EmphasisLeft}}--replace-table | -r{{.EmphasisRight}} is given the operation will replace {{.LessThan}}table{{.GreaterThan}} with the contents of the file. The table's existing schema will be used, and field names will be used to match file fields with table fields unless a mapping file is specified.
 
 If the schema for the existing table does not match the schema for the new file, the import will be aborted by default. To overwrite both the table and the schema, use {{.EmphasisLeft}}-c -f{{.EmphasisRight}}.
 
 A mapping file can be used to map fields between the file being imported and the table being written to. This can be used when creating a new table, or updating or replacing an existing table.
+
+During import, if there is an error importing any row, the import will be aborted by default. Use the {{.EmphasisLeft}}--continue{{.EmphasisRight}} flag to continue importing when an error is encountered. You can add the {{.EmphasisLeft}}--quiet{{.EmphasisRight}} flag to prevent the import utility from printing all the skipped rows. 
 
 ` + schcmds.MappingFileHelp +
 		`
@@ -105,8 +112,9 @@ A mapping file can be used to map fields between the file being imported and the
 In create, update, and replace scenarios the file's extension is used to infer the type of the file.  If a file does not have the expected extension then the {{.EmphasisLeft}}--file-type{{.EmphasisRight}} parameter should be used to explicitly define the format of the file in one of the supported formats (csv, psv, json, xlsx).  For files separated by a delimiter other than a ',' (type csv) or a '|' (type psv), the --delim parameter can be used to specify a delimiter`,
 
 	Synopsis: []string{
-		"-c [-f] [--pk {{.LessThan}}field{{.GreaterThan}}] [--schema {{.LessThan}}file{{.GreaterThan}}] [--map {{.LessThan}}file{{.GreaterThan}}] [--continue]  [--quiet] [--disable-fk-checks] [--file-type {{.LessThan}}type{{.GreaterThan}}] {{.LessThan}}table{{.GreaterThan}} {{.LessThan}}file{{.GreaterThan}}",
+		"-c [-f] [--pk {{.LessThan}}field{{.GreaterThan}}] [--all-text] [--schema {{.LessThan}}file{{.GreaterThan}}] [--map {{.LessThan}}file{{.GreaterThan}}] [--continue]  [--quiet] [--disable-fk-checks] [--file-type {{.LessThan}}type{{.GreaterThan}}] {{.LessThan}}table{{.GreaterThan}} {{.LessThan}}file{{.GreaterThan}}",
 		"-u [--map {{.LessThan}}file{{.GreaterThan}}] [--continue] [--quiet] [--file-type {{.LessThan}}type{{.GreaterThan}}] {{.LessThan}}table{{.GreaterThan}} {{.LessThan}}file{{.GreaterThan}}",
+		"-a [--map {{.LessThan}}file{{.GreaterThan}}] [--continue] [--quiet] [--file-type {{.LessThan}}type{{.GreaterThan}}] {{.LessThan}}table{{.GreaterThan}} {{.LessThan}}file{{.GreaterThan}}",
 		"-r [--map {{.LessThan}}file{{.GreaterThan}}] [--file-type {{.LessThan}}type{{.GreaterThan}}] {{.LessThan}}table{{.GreaterThan}} {{.LessThan}}file{{.GreaterThan}}",
 	},
 }
@@ -125,6 +133,7 @@ type importOptions struct {
 	srcOptions      interface{}
 	quiet           bool
 	disableFkChecks bool
+	allText         bool
 }
 
 func (m importOptions) IsBatched() bool {
@@ -154,9 +163,9 @@ func (m importOptions) FloatThreshold() float64 {
 	return 0.0
 }
 
-func (m importOptions) checkOverwrite(ctx context.Context, root *doltdb.RootValue, fs filesys.ReadableFS) (bool, error) {
+func (m importOptions) checkOverwrite(ctx context.Context, root doltdb.RootValue, fs filesys.ReadableFS) (bool, error) {
 	if !m.force && m.operation == mvdata.CreateOp {
-		return root.HasTable(ctx, m.destTableName)
+		return root.HasTable(ctx, doltdb.TableName{Name: m.destTableName})
 	}
 	return false, nil
 }
@@ -188,6 +197,7 @@ func getImportMoveOptions(ctx context.Context, apr *argparser.ArgParseResults, d
 	contOnErr := apr.Contains(contOnErrParam)
 	quiet := apr.Contains(quiet)
 	disableFks := apr.Contains(disableFkChecks)
+	allText := apr.Contains(allTextParam)
 
 	val, _ := apr.GetValue(primaryKeyParam)
 	pks := funcitr.MapStrings(strings.Split(val, ","), strings.TrimSpace)
@@ -237,6 +247,8 @@ func getImportMoveOptions(ctx context.Context, apr *argparser.ArgParseResults, d
 		moveOp = mvdata.CreateOp
 	case apr.Contains(replaceParam):
 		moveOp = mvdata.ReplaceOp
+	case apr.Contains(appendParam):
+		moveOp = mvdata.AppendOp
 	default:
 		moveOp = mvdata.UpdateOp
 	}
@@ -246,7 +258,7 @@ func getImportMoveOptions(ctx context.Context, apr *argparser.ArgParseResults, d
 		if err != nil {
 			return nil, errhand.VerboseErrorFromError(err)
 		}
-		_, exists, err := root.GetTable(ctx, tableName)
+		_, exists, err := root.GetTable(ctx, doltdb.TableName{Name: tableName})
 		if err != nil {
 			return nil, errhand.VerboseErrorFromError(err)
 		}
@@ -267,6 +279,7 @@ func getImportMoveOptions(ctx context.Context, apr *argparser.ArgParseResults, d
 		srcOptions:      srcOpts,
 		quiet:           quiet,
 		disableFkChecks: disableFks,
+		allText:         allText,
 	}, nil
 
 }
@@ -280,12 +293,24 @@ func validateImportArgs(apr *argparser.ArgParseResults) errhand.VerboseError {
 		return errhand.BuildDError("parameters %s and %s are mutually exclusive", schemaParam, primaryKeyParam).Build()
 	}
 
-	if !apr.Contains(createParam) && !apr.Contains(updateParam) && !apr.Contains(replaceParam) {
-		return errhand.BuildDError("Must include '-c' for initial table import or -u to update existing table or -r to replace existing table.").Build()
+	if !apr.ContainsAny(createParam, updateParam, replaceParam, appendParam) {
+		return errhand.BuildDError("Must specify exactly one of -c, -u, -a, or -r.").SetPrintUsage().Build()
+	}
+
+	if len(apr.ContainsMany(createParam, updateParam, replaceParam, appendParam)) > 1 {
+		return errhand.BuildDError("Must specify exactly one of -c, -u, -a, or -r.").SetPrintUsage().Build()
 	}
 
 	if apr.Contains(schemaParam) && !apr.Contains(createParam) {
 		return errhand.BuildDError("fatal: " + schemaParam + " is not supported for update or replace operations").Build()
+	}
+
+	if apr.Contains(allTextParam) && !apr.Contains(createParam) {
+		return errhand.BuildDError("fatal: --%s is only supported for create operations", allTextParam).Build()
+	}
+
+	if apr.ContainsAll(allTextParam, schemaParam) {
+		return errhand.BuildDError("parameters %s and %s are mutually exclusive", allTextParam, schemaParam).Build()
 	}
 
 	tableName := apr.Arg(0)
@@ -347,13 +372,14 @@ func (cmd ImportCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd ImportCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 2)
 	ap.ArgListHelp = append(ap.ArgListHelp, [2]string{tableParam, "The new or existing table being imported to."})
 	ap.ArgListHelp = append(ap.ArgListHelp, [2]string{fileParam, "The file being imported. Supported file types are csv, psv, and nbf."})
 	ap.SupportsFlag(createParam, "c", "Create a new table, or overwrite an existing table (with the -f flag) from the imported data.")
 	ap.SupportsFlag(updateParam, "u", "Update an existing table with the imported data.")
-	ap.SupportsFlag(forceParam, "f", "If a create operation is being executed, data already exists in the destination, the force flag will allow the target to be overwritten.")
+	ap.SupportsFlag(appendParam, "a", "Require that the operation will not modify any rows in the table.")
 	ap.SupportsFlag(replaceParam, "r", "Replace existing table with imported data while preserving the original schema.")
+	ap.SupportsFlag(forceParam, "f", "If a create operation is being executed, data already exists in the destination, the force flag will allow the target to be overwritten.")
 	ap.SupportsFlag(contOnErrParam, "", "Continue importing when row import errors are encountered.")
 	ap.SupportsFlag(quiet, "", "Suppress any warning messages about invalid rows when using the --continue flag.")
 	ap.SupportsAlias(ignoreSkippedRows, quiet)
@@ -363,6 +389,7 @@ func (cmd ImportCmd) ArgParser() *argparser.ArgParser {
 	ap.SupportsString(primaryKeyParam, "pk", "primary_key", "Explicitly define the name of the field in the schema which should be used as the primary key.")
 	ap.SupportsString(fileTypeParam, "", "file_type", "Explicitly define the type of the file if it can't be inferred from the file extension.")
 	ap.SupportsString(delimParam, "", "delimiter", "Specify a delimiter for a csv style file with a non-comma delimiter.")
+	ap.SupportsFlag(allTextParam, "", "Treats all fields as text. Can only be used when creating a table.")
 	return ap
 }
 
@@ -372,15 +399,14 @@ func (cmd ImportCmd) EventType() eventsapi.ClientEventType {
 }
 
 // Exec executes the command
-func (cmd ImportCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd ImportCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, importDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
+	var verr errhand.VerboseError
 
 	dEnv, err := commands.MaybeMigrateEnv(ctx, dEnv)
-
-	var verr errhand.VerboseError
 	if err != nil {
 		verr = errhand.BuildDError("could not load manifest for gc").AddCause(err).Build()
 		return commands.HandleVErrAndExitCode(verr, usage)
@@ -392,13 +418,11 @@ func (cmd ImportCmd) Exec(ctx context.Context, commandStr string, args []string,
 	}
 
 	mvOpts, verr := getImportMoveOptions(ctx, apr, dEnv)
-
 	if verr != nil {
 		return commands.HandleVErrAndExitCode(verr, usage)
 	}
 
 	root, err := dEnv.WorkingRoot(ctx)
-
 	if err != nil {
 		verr = errhand.BuildDError("Unable to get the working root value for this data repository.").AddCause(err).Build()
 		return commands.HandleVErrAndExitCode(verr, usage)
@@ -420,9 +444,7 @@ func (cmd ImportCmd) Exec(ctx context.Context, commandStr string, args []string,
 	if err != nil {
 		bdr := errhand.BuildDError("\nAn error occurred while moving data")
 		bdr.AddCause(err)
-
 		bdr.AddDetails("Errors during import can be ignored using '--continue'")
-
 		return commands.HandleVErrAndExitCode(bdr.Build(), usage)
 	}
 
@@ -446,7 +468,7 @@ func importStatsCB(stats types.AppliedEditStats) {
 	displayStrLen = cli.DeleteAndPrint(displayStrLen, displayStr)
 }
 
-func newImportDataReader(ctx context.Context, root *doltdb.RootValue, dEnv *env.DoltEnv, impOpts *importOptions) (table.SqlRowReader, *mvdata.DataMoverCreationError) {
+func newImportDataReader(ctx context.Context, root doltdb.RootValue, dEnv *env.DoltEnv, impOpts *importOptions) (table.SqlRowReader, *mvdata.DataMoverCreationError) {
 	var err error
 
 	// Checks whether import destination table already exists. This can probably be simplified to not need a root value...
@@ -458,7 +480,7 @@ func newImportDataReader(ctx context.Context, root *doltdb.RootValue, dEnv *env.
 		return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.CreateReaderErr, Cause: fmt.Errorf("%s already exists. Use -f to overwrite.", impOpts.DestName())}
 	}
 
-	rd, _, err := impOpts.src.NewReader(ctx, root, dEnv.FS, impOpts.srcOptions)
+	rd, _, err := impOpts.src.NewReader(ctx, dEnv, impOpts.srcOptions)
 	if err != nil {
 		return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.CreateReaderErr, Cause: err}
 	}
@@ -475,19 +497,8 @@ func newImportSqlEngineMover(ctx context.Context, dEnv *env.DoltEnv, rdSchema sc
 		return nil, dmce
 	}
 
-	// Validate that the schema from files has primary keys.
-	err := tableSchema.GetPKCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
-		preImage := imOpts.nameMapper.PreImage(col.Name)
-		_, found := rdSchema.GetAllCols().GetByName(preImage)
-		if !found {
-			err = fmt.Errorf("input primary keys do not match primary keys of existing table")
-		}
-		return err == nil, err
-	})
-	if err != nil {
-		return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.SchemaErr, Cause: err}
-	}
-
+	tableSchemaDiff := tableSchema.GetAllCols().NameToCol
+	var rowOperationDiff []string
 	// construct the schema of the set of column to be updated.
 	rowOperationColColl := schema.NewColCollection()
 	rdSchema.GetAllCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
@@ -495,6 +506,9 @@ func newImportSqlEngineMover(ctx context.Context, dEnv *env.DoltEnv, rdSchema sc
 		wrCol, ok := tableSchema.GetAllCols().GetByName(wrColName)
 		if ok {
 			rowOperationColColl = rowOperationColColl.Append(wrCol)
+			delete(tableSchemaDiff, wrColName)
+		} else {
+			rowOperationDiff = append(rowOperationDiff, wrColName)
 		}
 
 		return false, nil
@@ -505,10 +519,22 @@ func newImportSqlEngineMover(ctx context.Context, dEnv *env.DoltEnv, rdSchema sc
 		return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.SchemaErr, Cause: err}
 	}
 
-	// Leave a warning if the import operation is operating on fewer columns than the relevant table's schema.
+	// Leave a warning if the import operation has a different schema than the relevant table's schema.
 	// This can certainly be intentional, but it is often due to typos in the header of a csv file.
-	if rowOperationSchema.GetAllCols().Size() < tableSchema.GetAllCols().Size() {
-		cli.PrintErrln(color.YellowString("Warning: There are fewer columns in the import file's schema than the table's schema.\nIf unintentional, check for any typos in the import file's header."))
+	if len(tableSchemaDiff) != 0 || len(rowOperationDiff) != 0 {
+		cli.PrintErrln(color.YellowString("Warning: The import file's schema does not match the table's schema.\nIf unintentional, check for any typos in the import file's header."))
+		if len(tableSchemaDiff) != 0 {
+			cli.Printf("Missing columns in %s:\n", imOpts.destTableName)
+			for _, col := range tableSchemaDiff {
+				cli.Println("\t" + col.Name)
+			}
+		}
+		if len(rowOperationDiff) != 0 {
+			cli.Println("Extra columns in import file:")
+			for _, col := range rowOperationDiff {
+				cli.Println("\t" + col)
+			}
+		}
 	}
 
 	mv, err := mvdata.NewSqlEngineTableWriter(ctx, dEnv, tableSchema, rowOperationSchema, moveOps, importStatsCB)
@@ -519,7 +545,7 @@ func newImportSqlEngineMover(ctx context.Context, dEnv *env.DoltEnv, rdSchema sc
 	return mv, nil
 }
 
-type badRowFn func(row sql.Row, err error) (quit bool)
+type badRowFn func(row sql.Row, rowSchema sql.PrimaryKeySchema, tableName string, lineNumber int, err error) (quit bool)
 
 func move(ctx context.Context, rd table.SqlRowReader, wr *mvdata.SqlEngineTableWriter, options *importOptions) (int64, error) {
 	g, ctx := errgroup.WithContext(ctx)
@@ -530,10 +556,27 @@ func move(ctx context.Context, rd table.SqlRowReader, wr *mvdata.SqlEngineTableW
 	var printBadRowsStarted bool
 	var badCount int64
 
-	badRowCB := func(row sql.Row, err error) (quit bool) {
+	badRowCB := func(row sql.Row, rowSchema sql.PrimaryKeySchema, tableName string, lineNumber int, err error) (quit bool) {
 		// record the first error encountered unless asked to ignore it
 		if row != nil && rowErr == nil && !options.contOnErr {
-			rowErr = fmt.Errorf("A bad row was encountered: %s: %w", sql.FormatRow(row), err)
+			var sqlRowWithColumns []string
+			for i, val := range row {
+				columnName := "<nil>"
+				if len(rowSchema.Schema) > i {
+					columnName = rowSchema.Schema[i].Name
+				}
+				sqlRowWithColumns = append(sqlRowWithColumns, fmt.Sprintf("\t%s: %v\n", columnName, val))
+			}
+			formattedSqlRow := strings.Join(sqlRowWithColumns, "")
+
+			rowErr = fmt.Errorf("A bad row was encountered inserting into table %s (on line %d):\n%s", tableName, lineNumber, formattedSqlRow)
+			if wie, ok := err.(sql.WrappedInsertError); ok {
+				if e, ok := wie.Cause.(*errors.Error); ok {
+					if ue, ok := e.Cause().(sql.UniqueKeyError); ok {
+						rowErr = fmt.Errorf("row %s would be overwritten by %s: %w", sql.FormatRow(ue.Existing), sql.FormatRow(row), err)
+					}
+				}
+			}
 		}
 
 		atomic.AddInt64(&badCount, 1)
@@ -604,20 +647,23 @@ func moveRows(
 	parsedRowChan chan sql.Row,
 	badRowCb badRowFn,
 ) error {
-	rdSqlSch, err := sqlutil.FromDoltSchema(options.destTableName, rd.GetSchema())
+	rdSqlSch, err := sqlutil.FromDoltSchema("", options.destTableName, rd.GetSchema())
 	if err != nil {
 		return err
 	}
+
+	line := 1
 
 	for {
 		sqlRow, err := rd.ReadSqlRow(ctx)
 		if err == io.EOF {
 			return nil
 		}
+		line += 1
 
 		if err != nil {
 			if table.IsBadRow(err) {
-				quit := badRowCb(sqlRow, err)
+				quit := badRowCb(sqlRow, rdSqlSch, options.destTableName, line, err)
 				if quit {
 					return err
 				}
@@ -640,14 +686,11 @@ func moveRows(
 }
 
 func getImportSchema(ctx context.Context, dEnv *env.DoltEnv, impOpts *importOptions) (schema.Schema, *mvdata.DataMoverCreationError) {
-	root, err := dEnv.WorkingRoot(ctx)
-	if err != nil {
-		return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.SchemaErr, Cause: err}
-	}
-
 	if impOpts.schFile != "" {
-		tn, out, err := mvdata.SchAndTableNameFromFile(ctx, impOpts.schFile, dEnv.FS, root)
-
+		tn, out, err := mvdata.SchAndTableNameFromFile(ctx, impOpts.schFile, dEnv)
+		if err != nil {
+			return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.SchemaErr, Cause: err}
+		}
 		if err == nil && tn != impOpts.destTableName {
 			err = fmt.Errorf("table name '%s' from schema file %s does not match table arg '%s'", tn, impOpts.schFile, impOpts.destTableName)
 		}
@@ -661,18 +704,31 @@ func getImportSchema(ctx context.Context, dEnv *env.DoltEnv, impOpts *importOpti
 
 	if impOpts.operation == mvdata.CreateOp {
 		if impOpts.srcIsStream() {
-			// todo: capture stream data to file so we can use schema inferrence
+			// todo: capture stream data to file so we can use schema inference
 			return nil, nil
 		}
 
-		rd, _, err := impOpts.src.NewReader(ctx, root, dEnv.FS, impOpts.srcOptions)
+		rd, _, err := impOpts.src.NewReader(ctx, dEnv, impOpts.srcOptions)
 		if err != nil {
 			return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.CreateReaderErr, Cause: err}
 		}
 		defer rd.Close(ctx)
 
+		if impOpts.allText {
+			outSch, err := generateAllTextSchema(rd, impOpts)
+			if err != nil {
+				return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.SchemaErr, Cause: err}
+			}
+			return outSch, nil
+		}
+
 		if impOpts.srcIsJson() {
 			return rd.GetSchema(), nil
+		}
+
+		root, err := dEnv.WorkingRoot(ctx)
+		if err != nil {
+			return nil, &mvdata.DataMoverCreationError{ErrType: mvdata.SchemaErr, Cause: err}
 		}
 
 		outSch, err := mvdata.InferSchema(ctx, root, rd, impOpts.destTableName, impOpts.primaryKeys, impOpts)
@@ -691,6 +747,35 @@ func getImportSchema(ctx context.Context, dEnv *env.DoltEnv, impOpts *importOpti
 	defer tblRd.Close(ctx)
 
 	return tblRd.GetSchema(), nil
+}
+
+// generateAllTextSchema returns a schema where each column has a text type. Primary key columns will have type
+// varchar(16383) because text type is not supported for priamry keys.
+func generateAllTextSchema(rd table.ReadCloser, impOpts *importOptions) (schema.Schema, error) {
+	var cols []schema.Column
+	err := rd.GetSchema().GetAllCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
+		var colType typeinfo.TypeInfo
+		if slices.Contains(impOpts.primaryKeys, col.Name) || (len(impOpts.primaryKeys) == 0 && len(cols) == 0) {
+			// text type is not supported for primary keys, pk is either explicitly set or is the first column
+			colType = typeinfo.StringDefaultType
+		} else {
+			colType = typeinfo.TextType
+		}
+
+		col.Kind = colType.NomsKind()
+		col.TypeInfo = colType
+		col.Name = impOpts.ColNameMapper().Map(col.Name)
+		col.Tag = schema.ReservedTagMin + tag
+		// we don't check the file so can't safely add not null constraint
+		col.Constraints = []schema.ColConstraint(nil)
+
+		cols = append(cols, col)
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return schema.SchemaFromCols(schema.NewColCollection(cols...))
 }
 
 func newDataMoverErrToVerr(mvOpts *importOptions, err *mvdata.DataMoverCreationError) errhand.VerboseError {
@@ -791,7 +876,7 @@ func NameAndTypeTransform(row sql.Row, rowOperationSchema sql.PrimaryKeySchema, 
 		// For non string types we want empty strings to be converted to nils. String types should be allowed to take on
 		// an empty string value
 		switch col.Type.(type) {
-		case sql.StringType:
+		case sql.StringType, sql.EnumType, sql.SetType:
 		default:
 			row[i] = emptyStringToNil(row[i])
 		}

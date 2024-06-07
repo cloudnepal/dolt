@@ -20,6 +20,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -57,14 +58,6 @@ var colColl = schema.NewColCollection(
 	schema.NewColumn("col2", col2Tag, types.IntKind, false, schema.NotNullConstraint{}),
 )
 var sch = schema.MustSchemaFromCols(colColl)
-
-var indexSchema schema.Index
-var compositeIndexSchema schema.Index
-
-func init() {
-	indexSchema, _ = sch.Indexes().AddIndexByColTags("idx_col1", []uint64{col1Tag}, nil, schema.IndexProperties{IsUnique: false, Comment: ""})
-	compositeIndexSchema, _ = sch.Indexes().AddIndexByColTags("idx_col1_col2", []uint64{col1Tag, col2Tag}, nil, schema.IndexProperties{IsUnique: false, Comment: ""})
-}
 
 type rowV struct {
 	col1, col2 int
@@ -305,33 +298,36 @@ func TestMergeCommits(t *testing.T) {
 		t.Skip()
 	}
 
-	vrw, ns, rightCommitHash, ancCommitHash, root, mergeRoot, ancRoot, expectedRows, expectedArtifacts := setupMergeTest(t)
+	ddb, vrw, ns, rightCommitHash, ancCommitHash, root, mergeRoot, ancRoot, expectedRows, expectedArtifacts := setupMergeTest(t)
+	defer ddb.Close()
 	merger, err := NewMerger(root, mergeRoot, ancRoot, rightCommitHash, ancCommitHash, vrw, ns)
 	if err != nil {
 		t.Fatal(err)
 	}
 	opts := editor.TestEditorOptions(vrw)
 	// TODO: stats
-	merged, _, err := merger.MergeTable(context.Background(), tableName, opts, MergeOpts{IsCherryPick: false})
+	merged, _, err := merger.MergeTable(sql.NewContext(context.Background()), tableName, opts, MergeOpts{IsCherryPick: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	tbl, _, err := root.GetTable(context.Background(), tableName)
+	ctx := sql.NewEmptyContext()
+
+	tbl, _, err := root.GetTable(ctx, doltdb.TableName{Name: tableName})
 	assert.NoError(t, err)
-	sch, err := tbl.GetSchema(context.Background())
+	sch, err := tbl.GetSchema(ctx)
 	assert.NoError(t, err)
-	expected, err := doltdb.NewTable(context.Background(), vrw, ns, sch, expectedRows, nil, nil)
+	expected, err := doltdb.NewTable(ctx, vrw, ns, sch, expectedRows, nil, nil)
 	assert.NoError(t, err)
-	expected, err = rebuildAllProllyIndexes(context.Background(), expected)
+	expected, err = rebuildAllProllyIndexes(ctx, expected)
 	assert.NoError(t, err)
-	expected, err = expected.SetArtifacts(context.Background(), durable.ArtifactIndexFromProllyMap(expectedArtifacts))
+	expected, err = expected.SetArtifacts(ctx, durable.ArtifactIndexFromProllyMap(expectedArtifacts))
 	require.NoError(t, err)
 
-	mergedRows, err := merged.GetRowData(context.Background())
+	mergedRows, err := merged.table.GetRowData(ctx)
 	assert.NoError(t, err)
 
-	artIdx, err := merged.GetArtifacts(context.Background())
+	artIdx, err := merged.table.GetArtifacts(ctx)
 	require.NoError(t, err)
 	artifacts := durable.ProllyMapFromArtifactIndex(artIdx)
 	MustEqualArtifactMap(t, expectedArtifacts, artifacts)
@@ -339,14 +335,14 @@ func TestMergeCommits(t *testing.T) {
 	MustEqualProlly(t, tableName, durable.ProllyMapFromIndex(expectedRows), durable.ProllyMapFromIndex(mergedRows))
 
 	for _, index := range sch.Indexes().AllIndexes() {
-		mergedIndexRows, err := merged.GetIndexRowData(context.Background(), index.Name())
+		mergedIndexRows, err := merged.table.GetIndexRowData(ctx, index.Name())
 		require.NoError(t, err)
-		expectedIndexRows, err := expected.GetIndexRowData(context.Background(), index.Name())
+		expectedIndexRows, err := expected.GetIndexRowData(ctx, index.Name())
 		require.NoError(t, err)
 		MustEqualProlly(t, index.Name(), durable.ProllyMapFromIndex(expectedIndexRows), durable.ProllyMapFromIndex(mergedIndexRows))
 	}
 
-	h, err := merged.HashOf()
+	h, err := merged.table.HashOf()
 	require.NoError(t, err)
 	eh, err := expected.HashOf()
 	require.NoError(t, err)
@@ -365,13 +361,13 @@ func TestNomsMergeCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts := editor.TestEditorOptions(vrw)
-	merged, stats, err := merger.MergeTable(context.Background(), tableName, opts, MergeOpts{IsCherryPick: false})
+	merged, stats, err := merger.MergeTable(sql.NewContext(context.Background()), tableName, opts, MergeOpts{IsCherryPick: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	assert.Equal(t, expectedStats, stats, "received stats is incorrect")
 
-	tbl, _, err := root.GetTable(context.Background(), tableName)
+	tbl, _, err := root.GetTable(context.Background(), doltdb.TableName{Name: tableName})
 	assert.NoError(t, err)
 	sch, err := tbl.GetSchema(context.Background())
 	assert.NoError(t, err)
@@ -384,9 +380,9 @@ func TestNomsMergeCommits(t *testing.T) {
 	expected, err = expected.SetConflicts(context.Background(), conflictSchema, durable.ConflictIndexFromNomsMap(expectedConflicts, vrw))
 	assert.NoError(t, err)
 
-	mergedRows, err := merged.GetNomsRowData(context.Background())
+	mergedRows, err := merged.table.GetNomsRowData(context.Background())
 	assert.NoError(t, err)
-	_, confIdx, err := merged.GetConflicts(context.Background())
+	_, confIdx, err := merged.table.GetConflicts(context.Background())
 	assert.NoError(t, err)
 	conflicts := durable.NomsMapFromConflictIndex(confIdx)
 
@@ -398,7 +394,7 @@ func TestNomsMergeCommits(t *testing.T) {
 	}
 
 	for _, index := range sch.Indexes().AllIndexes() {
-		mergedIndexRows, err := merged.GetNomsIndexRowData(context.Background(), index.Name())
+		mergedIndexRows, err := merged.table.GetNomsIndexRowData(context.Background(), index.Name())
 		assert.NoError(t, err)
 		expectedIndexRows, err := expected.GetNomsIndexRowData(context.Background(), index.Name())
 		assert.NoError(t, err)
@@ -409,7 +405,7 @@ func TestNomsMergeCommits(t *testing.T) {
 			mustString(types.EncodedValue(context.Background(), mergedIndexRows)))
 	}
 
-	h, err := merged.HashOf()
+	h, err := merged.table.HashOf()
 	assert.NoError(t, err)
 	eh, err := expected.HashOf()
 	assert.NoError(t, err)
@@ -422,7 +418,7 @@ func sortTests(t []testRow) {
 	})
 }
 
-func setupMergeTest(t *testing.T) (types.ValueReadWriter, tree.NodeStore, doltdb.Rootish, doltdb.Rootish, *doltdb.RootValue, *doltdb.RootValue, *doltdb.RootValue, durable.Index, prolly.ArtifactMap) {
+func setupMergeTest(t *testing.T) (*doltdb.DoltDB, types.ValueReadWriter, tree.NodeStore, doltdb.Rootish, doltdb.Rootish, doltdb.RootValue, doltdb.RootValue, doltdb.RootValue, durable.Index, prolly.ArtifactMap) {
 	ddb := mustMakeEmptyRepo(t)
 	vrw := ddb.ValueReadWriter()
 	ns := ddb.NodeStore()
@@ -472,29 +468,31 @@ func setupMergeTest(t *testing.T) (types.ValueReadWriter, tree.NodeStore, doltdb
 		}
 	}
 
-	updatedRows, err := leftMut.Map(context.Background())
+	ctx := sql.NewEmptyContext()
+
+	updatedRows, err := leftMut.Map(ctx)
 	require.NoError(t, err)
-	mergeRows, err := rightMut.Map(context.Background())
+	mergeRows, err := rightMut.Map(ctx)
 	require.NoError(t, err)
 
-	rootTbl, err := doltdb.NewTable(context.Background(), vrw, ns, sch, durable.IndexFromProllyMap(updatedRows), nil, nil)
+	rootTbl, err := doltdb.NewTable(ctx, vrw, ns, sch, durable.IndexFromProllyMap(updatedRows), nil, nil)
 	require.NoError(t, err)
-	rootTbl, err = rebuildAllProllyIndexes(context.Background(), rootTbl)
-	require.NoError(t, err)
-
-	mergeTbl, err := doltdb.NewTable(context.Background(), vrw, ns, sch, durable.IndexFromProllyMap(mergeRows), nil, nil)
-	require.NoError(t, err)
-	mergeTbl, err = rebuildAllProllyIndexes(context.Background(), mergeTbl)
+	rootTbl, err = rebuildAllProllyIndexes(ctx, rootTbl)
 	require.NoError(t, err)
 
-	ancTbl, err := doltdb.NewTable(context.Background(), vrw, ns, sch, durable.IndexFromProllyMap(initialRows), nil, nil)
+	mergeTbl, err := doltdb.NewTable(ctx, vrw, ns, sch, durable.IndexFromProllyMap(mergeRows), nil, nil)
 	require.NoError(t, err)
-	ancTbl, err = rebuildAllProllyIndexes(context.Background(), ancTbl)
+	mergeTbl, err = rebuildAllProllyIndexes(ctx, mergeTbl)
+	require.NoError(t, err)
+
+	ancTbl, err := doltdb.NewTable(ctx, vrw, ns, sch, durable.IndexFromProllyMap(initialRows), nil, nil)
+	require.NoError(t, err)
+	ancTbl, err = rebuildAllProllyIndexes(ctx, ancTbl)
 	require.NoError(t, err)
 
 	rightCm, baseCm, root, mergeRoot, ancRoot := buildLeftRightAncCommitsAndBranches(t, ddb, rootTbl, mergeTbl, ancTbl)
 
-	artifactMap, err := prolly.NewArtifactMapFromTuples(context.Background(), ns, kD)
+	artifactMap, err := prolly.NewArtifactMapFromTuples(ctx, ns, kD)
 	require.NoError(t, err)
 	artEditor := artifactMap.Editor()
 
@@ -511,19 +509,18 @@ func setupMergeTest(t *testing.T) (types.ValueReadWriter, tree.NodeStore, doltdb
 
 	for _, testCase := range testRows {
 		if testCase.conflict {
-
-			err = artEditor.Add(context.Background(), key(testCase.key), rightCmHash, prolly.ArtifactTypeConflict, d)
+			err = artEditor.Add(ctx, key(testCase.key), rightCmHash, prolly.ArtifactTypeConflict, d)
 			require.NoError(t, err)
 		}
 	}
 
-	expectedArtifacts, err := artEditor.Flush(context.Background())
+	expectedArtifacts, err := artEditor.Flush(ctx)
 	require.NoError(t, err)
 
-	return vrw, ns, rightCm, baseCm, root, mergeRoot, ancRoot, durable.IndexFromProllyMap(expectedRows), expectedArtifacts
+	return ddb, vrw, ns, rightCm, baseCm, root, mergeRoot, ancRoot, durable.IndexFromProllyMap(expectedRows), expectedArtifacts
 }
 
-func setupNomsMergeTest(t *testing.T) (types.ValueReadWriter, tree.NodeStore, doltdb.Rootish, doltdb.Rootish, *doltdb.RootValue, *doltdb.RootValue, *doltdb.RootValue, types.Map, types.Map, *MergeStats) {
+func setupNomsMergeTest(t *testing.T) (types.ValueReadWriter, tree.NodeStore, doltdb.Rootish, doltdb.Rootish, doltdb.RootValue, doltdb.RootValue, doltdb.RootValue, types.Map, types.Map, *MergeStats) {
 	ddb := mustMakeEmptyRepo(t)
 	vrw := ddb.ValueReadWriter()
 	ns := ddb.NodeStore()
@@ -612,7 +609,7 @@ func setupNomsMergeTest(t *testing.T) (types.ValueReadWriter, tree.NodeStore, do
 
 // rebuildAllProllyIndexes builds the data for the secondary indexes in |tbl|'s
 // schema.
-func rebuildAllProllyIndexes(ctx context.Context, tbl *doltdb.Table) (*doltdb.Table, error) {
+func rebuildAllProllyIndexes(ctx *sql.Context, tbl *doltdb.Table) (*doltdb.Table, error) {
 	sch, err := tbl.GetSchema(ctx)
 	if err != nil {
 		return nil, err
@@ -634,7 +631,7 @@ func rebuildAllProllyIndexes(ctx context.Context, tbl *doltdb.Table) (*doltdb.Ta
 	primary := durable.ProllyMapFromIndex(tableRowData)
 
 	for _, index := range sch.Indexes().AllIndexes() {
-		rebuiltIndexRowData, err := creation.BuildSecondaryProllyIndex(ctx, tbl.ValueReadWriter(), tbl.NodeStore(), sch, index, primary)
+		rebuiltIndexRowData, err := creation.BuildSecondaryProllyIndex(ctx, tbl.ValueReadWriter(), tbl.NodeStore(), sch, tableName, index, primary)
 		if err != nil {
 			return nil, err
 		}
@@ -692,7 +689,7 @@ func calcExpectedStats(t *testing.T) *MergeStats {
 			// (DeleteAction, UpdateAction),
 			// (UpdateAction, UpdateAction) with conflict,
 			// (InsertAction, InsertAction) with conflict
-			s.Conflicts++
+			s.DataConflicts++
 			continue
 		}
 
@@ -717,21 +714,23 @@ func mustMakeEmptyRepo(t *testing.T) *doltdb.DoltDB {
 	return ddb
 }
 
-func buildLeftRightAncCommitsAndBranches(t *testing.T, ddb *doltdb.DoltDB, rootTbl, mergeTbl, ancTbl *doltdb.Table) (doltdb.Rootish, doltdb.Rootish, *doltdb.RootValue, *doltdb.RootValue, *doltdb.RootValue) {
+func buildLeftRightAncCommitsAndBranches(t *testing.T, ddb *doltdb.DoltDB, rootTbl, mergeTbl, ancTbl *doltdb.Table) (doltdb.Rootish, doltdb.Rootish, doltdb.RootValue, doltdb.RootValue, doltdb.RootValue) {
 	mainHeadSpec, _ := doltdb.NewCommitSpec(env.DefaultInitBranch)
-	mainHead, err := ddb.Resolve(context.Background(), mainHeadSpec, nil)
+	optCmt, err := ddb.Resolve(context.Background(), mainHeadSpec, nil)
 	require.NoError(t, err)
+	mainHead, ok := optCmt.ToCommit()
+	require.True(t, ok)
 
 	mRoot, err := mainHead.GetRootValue(context.Background())
 	require.NoError(t, err)
 
-	mRoot, err = mRoot.PutTable(context.Background(), tableName, ancTbl)
+	mRoot, err = mRoot.PutTable(context.Background(), doltdb.TableName{Name: tableName}, ancTbl)
 	require.NoError(t, err)
 
-	updatedRoot, err := mRoot.PutTable(context.Background(), tableName, rootTbl)
+	updatedRoot, err := mRoot.PutTable(context.Background(), doltdb.TableName{Name: tableName}, rootTbl)
 	require.NoError(t, err)
 
-	mergeRoot, err := mRoot.PutTable(context.Background(), tableName, mergeTbl)
+	mergeRoot, err := mRoot.PutTable(context.Background(), doltdb.TableName{Name: tableName}, mergeTbl)
 	require.NoError(t, err)
 
 	r, mainHash, err := ddb.WriteRootValue(context.Background(), mRoot)
@@ -751,7 +750,7 @@ func buildLeftRightAncCommitsAndBranches(t *testing.T, ddb *doltdb.DoltDB, rootT
 	commit, err := ddb.Commit(context.Background(), hash, ref.NewBranchRef(env.DefaultInitBranch), meta)
 	require.NoError(t, err)
 
-	err = ddb.NewBranchAtCommit(context.Background(), ref.NewBranchRef("to-merge"), initialCommit)
+	err = ddb.NewBranchAtCommit(context.Background(), ref.NewBranchRef("to-merge"), initialCommit, nil)
 	require.NoError(t, err)
 	mergeCommit, err := ddb.Commit(context.Background(), mergeHash, ref.NewBranchRef("to-merge"), meta)
 	require.NoError(t, err)
@@ -759,8 +758,10 @@ func buildLeftRightAncCommitsAndBranches(t *testing.T, ddb *doltdb.DoltDB, rootT
 	root, err := commit.GetRootValue(context.Background())
 	require.NoError(t, err)
 
-	ancCm, err := doltdb.GetCommitAncestor(context.Background(), commit, mergeCommit)
+	optCmt, err = doltdb.GetCommitAncestor(context.Background(), commit, mergeCommit)
 	require.NoError(t, err)
+	ancCm, ok := optCmt.ToCommit()
+	require.True(t, ok)
 
 	ancRoot, err := ancCm.GetRootValue(context.Background())
 	require.NoError(t, err)

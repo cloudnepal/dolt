@@ -49,7 +49,9 @@ type varStringType struct {
 var _ TypeInfo = (*varStringType)(nil)
 
 var (
-	StringDefaultType = &varStringType{gmstypes.MustCreateStringWithDefaults(sqltypes.VarChar, 16383)}
+	MaxVarcharLength = int64(16383)
+	// StringDefaultType is sized to 1k, which allows up to 16 fields per row
+	StringDefaultType = &varStringType{gmstypes.MustCreateStringWithDefaults(sqltypes.VarChar, MaxVarcharLength/16)}
 )
 
 func CreateVarStringTypeFromSqlType(stringType sql.StringType) TypeInfo {
@@ -61,7 +63,7 @@ func CreateVarStringTypeFromParams(params map[string]string) (TypeInfo, error) {
 	var collation sql.CollationID
 	var err error
 	if collationStr, ok := params[varStringTypeParam_Collate]; ok {
-		collation, err = sql.ParseCollation(nil, &collationStr, false)
+		collation, err = sql.ParseCollation("", collationStr, false)
 		if err != nil {
 			return nil, err
 		}
@@ -142,7 +144,7 @@ func (ti *varStringType) ConvertValueToNomsValue(ctx context.Context, vrw types.
 	if v == nil {
 		return types.NullValue, nil
 	}
-	strVal, err := ti.sqlStringType.Convert(v)
+	strVal, _, err := ti.sqlStringType.Convert(v)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +213,7 @@ func (ti *varStringType) GetTypeParams() map[string]string {
 // IsValid implements TypeInfo interface.
 func (ti *varStringType) IsValid(v types.Value) bool {
 	if val, ok := v.(types.String); ok {
-		_, err := ti.sqlStringType.Convert(string(val))
+		_, _, err := ti.sqlStringType.Convert(string(val))
 		if err != nil {
 			return false
 		}

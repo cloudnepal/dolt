@@ -9,7 +9,6 @@ teardown() {
     teardown_common
 }
 
-# Create a single primary key table and do stuff
 @test "checkout: dolt checkout takes working set changes with you" {
     dolt sql <<SQL
 create table test(a int primary key);
@@ -54,6 +53,72 @@ SQL
     [[ "$output" =~ "modified" ]] || false
 }
 
+@test "checkout: dolt checkout takes working set changes with you on new table" {
+    dolt sql <<SQL
+create table test(a int primary key);
+insert into test values (1);
+SQL
+    dolt add . && dolt commit -am "Initial table with one row"
+    dolt branch feature
+
+    dolt sql -q "create table t2(b int primary key)"
+    dolt sql -q "insert into t2 values (1);"
+
+    # This is fine for an untracked table, takes it to the new branch with you
+    dolt checkout feature
+
+    run dolt sql -q "select count(*) from t2"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "1" ]] || false
+
+    run dolt status
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "new table" ]] || false
+
+    dolt checkout main
+
+    run dolt sql -q "select count(*) from t2"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "1" ]] || false
+
+    run dolt status
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "new table" ]] || false
+
+    # Now check the table into main and make additonal changes
+    dolt add . && dolt commit -m "new table"
+    dolt sql -q "insert into t2 values (2);"
+
+    # This is an error, matching git (cannot check out a branch that lacks a
+    # file you have modified)
+    run dolt checkout feature
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "Your local changes to the following tables would be overwritten by checkout" ]] || false
+    [[ "$output" =~ "t2" ]] || false 
+}
+
+@test "checkout: checkout would overwrite local changes" {
+    dolt sql <<SQL
+create table test(a int primary key);
+insert into test values (1);
+SQL
+    dolt add .
+
+    dolt commit -am "Initial table with one row"
+    dolt checkout -b feature
+
+    dolt sql -q "insert into test values (2)"
+    dolt commit -am "inserted a value"
+    dolt checkout main
+
+    dolt sql -q "insert into test values (3)"
+    run dolt checkout feature
+
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "Your local changes to the following tables would be overwritten by checkout" ]] || false
+    [[ "$output" =~ "test" ]] || false 
+}
+
 @test "checkout: dolt checkout doesn't stomp working set changes on other branch" {
     dolt sql <<SQL
 create table test(a int primary key);
@@ -66,42 +131,73 @@ SQL
 
     dolt sql  <<SQL
 call dolt_checkout('feature');
-insert into test values (2), (3), (4);
-commit;
+insert into test values (2);
 SQL
-
-    skip "checkout stomps working set changes made on the feature branch via SQL. Needs to be prevented."
-    skip "See https://github.com/dolthub/dolt/issues/2246"
 
     # With no uncommitted working set changes, this works fine (no
     # working set comes with us, we get the working set of the feature
     # branch instead)
     run dolt checkout feature
     [ "$status" -eq 0 ]
-
+ 
     run dolt sql -q "select count(*) from test"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "4" ]] || false
+    [[ "$output" =~ "2" ]] || false
 
+    # These working set changes come with us when we change back to main
     dolt checkout main
     run dolt sql -q "select count(*) from test"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "4" ]] || false
+    [[ "$output" =~ "2" ]] || false
 
     # Reset our test setup
     dolt sql  <<SQL
 call dolt_checkout('feature');
 call dolt_reset('--hard');
-insert into test values (2), (3), (4);
-commit;
+insert into test values (3);
 SQL
 
-    # With a dirty working set, dolt checkout should fail
-    dolt sql -q "insert into test values (5)"
+    # With a dirty working set on the other branch, dolt checkout should fail
     run dolt checkout feature
-
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "some error" ]] || false
+    [[ "$output" =~ "checkout would overwrite uncommitted changes" ]] || false
+
+    # Same as above, but changes are staged, not in working
+    dolt sql  <<SQL
+call dolt_checkout('feature');
+call dolt_reset('--hard');
+insert into test values (3);
+call dolt_add('.');
+SQL
+
+    run dolt checkout feature
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "checkout would overwrite uncommitted changes" ]] || false
+
+    # Same as above, but changes are staged and working
+    dolt add .
+    dolt sql  <<SQL
+call dolt_checkout('feature');
+call dolt_reset('--hard');
+insert into test values (3);
+call dolt_add('.');
+insert into test values (4);
+SQL
+
+    run dolt checkout feature
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "checkout would overwrite uncommitted changes" ]] || false
+    
+    dolt reset --hard
+    dolt sql -q "insert into test values (3)"
+    dolt add .
+    dolt sql -q "insert into test values (4)"
+    
+    # with staged changes matching on both branches, permit the checkout
+    dolt checkout feature
+    run dolt sql -q "select count(*) from test"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "3" ]] || false
 }
 
 @test "checkout: dolt checkout table to restore working tree tables with add and drop foreign key" {
@@ -112,7 +208,7 @@ SQL
     dolt sql -q "ALTER TABLE z ADD CONSTRAINT foreign_key1 FOREIGN KEY (c1) references t(c1)"
     run dolt status
     [[ "$output" =~ "Changes not staged for commit:" ]] || false
-    [[ "$output" =~ "modified:       z" ]] || false
+    [[ "$output" =~ "modified:         z" ]] || false
 
     run dolt schema show z
     [ "$status" -eq 0 ]
@@ -134,7 +230,7 @@ SQL
     dolt sql -q "alter table z drop constraint foreign_key1"
     run dolt status
     [[ "$output" =~ "Changes not staged for commit:" ]] || false
-    [[ "$output" =~ "modified:       z" ]] || false
+    [[ "$output" =~ "modified:         z" ]] || false
 
     run dolt schema show z
     [ "$status" -eq 0 ]
@@ -196,6 +292,11 @@ SQL
     [ "$status" -eq 1 ]
     [[ "$output" =~ "Please commit your changes or stash them before you switch branches." ]] || false
 
+    # Still on main
+    run dolt status
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "branch1" ]] || false
+
     run dolt checkout -f main
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Switched to branch 'main'" ]] || false
@@ -213,6 +314,46 @@ SQL
     [[ ! "$output" =~ "4" ]] || false
 }
 
+@test "checkout: -B flag will forcefully reset an existing branch" {
+    dolt sql -q 'create table test (id int primary key);'
+    dolt sql -q 'insert into test (id) values (89012);'
+    dolt commit -Am 'first change.'
+    dolt sql -q 'insert into test (id) values (76543);'
+    dolt commit -Am 'second change.'
+
+    dolt checkout -b testbr main~1
+    run dolt sql -q "select * from test;"
+    [[ "$output" =~ "89012" ]] || false
+    [[ ! "$output" =~ "76543" ]] || false
+
+    # make a change to the branch which we'll lose
+    dolt sql -q 'insert into test (id) values (19283);'
+    dolt commit -Am 'change to testbr.'
+
+    dolt checkout main
+    dolt checkout -B testbr main
+    run dolt sql -q "select * from test;"
+    [[ "$output" =~ "89012" ]] || false
+    [[ "$output" =~ "76543" ]] || false
+    [[ ! "$output" =~ "19283" ]] || false
+}
+
+@test "checkout: -B will create a branch that does not exist" {
+    dolt sql -q 'create table test (id int primary key);'
+    dolt sql -q 'insert into test (id) values (89012);'
+    dolt commit -Am 'first change.'
+    dolt sql -q 'insert into test (id) values (76543);'
+    dolt commit -Am 'second change.'
+
+    dolt checkout -B testbr main~1
+    run dolt sql -q "select * from test;"
+    [[ "$output" =~ "89012" ]] || false
+    [[ ! "$output" =~ "76543" ]] || false
+}
+
+
+
+
 @test "checkout: attempting to checkout a detached head shows a suggestion instead" {
   dolt sql -q "create table test (id int primary key);"
   dolt add .
@@ -225,7 +366,7 @@ SQL
   run dolt checkout "$sha"
   [ "$status" -ne 0 ]
   cmd=$(echo "${lines[1]}" | cut -d ' ' -f 1,2,3)
-  [[ $cmd =~ "dolt checkout $sha" ]]
+  [[ $cmd =~ "dolt checkout $sha" ]] || false
 }
 
 @test "checkout: commit --amend only changes commit message" {
@@ -291,7 +432,9 @@ SQL
   # remove special characters (color)
   shaparent2=$(echo $shaparent2 | sed -E "s/[[:cntrl:]]\[[0-9]{1,3}m//g")
 
-  dolt merge test-branch
+  run dolt merge test-branch
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "CONFLICT (content):" ]] || false
   dolt conflicts resolve --theirs .
   dolt commit -m "final merge"
 
@@ -323,7 +466,10 @@ SQL
   # remove special characters (color)
   shaparent2=$(echo $shaparent2 | sed -E "s/[[:cntrl:]]\[[0-9]{1,3}m//g")
 
-  dolt merge test-branch
+  run dolt merge test-branch
+  [ "$status" -eq 1 ]
+  echo "$output"
+  [[ "$output" =~ "CONFLICT (content):" ]] || false
   dolt conflicts resolve --theirs .
   dolt commit -m "final merge"
 

@@ -24,10 +24,10 @@ import (
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands"
 	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/typed/json"
@@ -73,14 +73,14 @@ func (cmd CatCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd CatCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 2)
 	ap.ArgListHelp = append(ap.ArgListHelp, [2]string{"table", "The table that the given index belongs to."})
 	ap.ArgListHelp = append(ap.ArgListHelp, [2]string{"index", "The name of the index that belongs to the given table."})
 	ap.SupportsString(formatFlag, "r", "result format", "How to format the resulting output. Valid values are tabular, csv, json. Defaults to tabular.")
 	return ap
 }
 
-func (cmd CatCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd CatCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, catDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
@@ -114,7 +114,7 @@ func (cmd CatCmd) Exec(ctx context.Context, commandStr string, args []string, dE
 	tableName := apr.Arg(0)
 	indexName := apr.Arg(1)
 
-	table, ok, err := working.GetTable(ctx, tableName)
+	table, ok, err := working.GetTable(ctx, doltdb.TableName{Name: tableName})
 	if err != nil {
 		return commands.HandleVErrAndExitCode(errhand.BuildDError("Unable to get table `%s`.", tableName).AddCause(err).Build(), nil)
 	}
@@ -143,15 +143,13 @@ func (cmd CatCmd) Exec(ctx context.Context, commandStr string, args []string, dE
 }
 
 func (cmd CatCmd) prettyPrintResults(ctx context.Context, doltSch schema.Schema, idx durable.Index) error {
-
 	wr, err := getTableWriter(cmd.resultFormat, doltSch)
 	if err != nil {
 		return err
 	}
 	defer wr.Close(ctx)
 
-	sess := dsess.DefaultSession(dsess.EmptyDatabaseProvider())
-	sqlCtx := sql.NewContext(ctx, sql.WithSession(sess))
+	sqlCtx := sql.NewEmptyContext()
 
 	rowItr, err := table.NewTableIterator(ctx, doltSch, idx, 0)
 	if err != nil {
@@ -177,7 +175,7 @@ func (cmd CatCmd) prettyPrintResults(ctx context.Context, doltSch schema.Schema,
 }
 
 func getTableWriter(format resultFormat, sch schema.Schema) (wr table.SqlRowWriter, err error) {
-	s, err := sqlutil.FromDoltSchema("", sch)
+	s, err := sqlutil.FromDoltSchema("", "", sch)
 	if err != nil {
 		return nil, err
 	}

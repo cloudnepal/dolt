@@ -28,14 +28,15 @@ import (
 )
 
 // renameTable renames a table with in a RootValue and returns the updated root.
-func renameTable(ctx context.Context, root *doltdb.RootValue, oldName, newName string) (*doltdb.RootValue, error) {
+func renameTable(ctx context.Context, root doltdb.RootValue, oldName, newName string) (doltdb.RootValue, error) {
 	if newName == oldName {
 		return root, nil
 	} else if root == nil {
 		panic("invalid parameters")
 	}
 
-	return root.RenameTable(ctx, oldName, newName)
+	// TODO: schema name
+	return root.RenameTable(ctx, doltdb.TableName{Name: oldName}, doltdb.TableName{Name: newName})
 }
 
 // Nullable represents whether a column can have a null value.
@@ -53,7 +54,7 @@ const (
 // Returns an error if the column added conflicts with the existing schema in tag or name.
 func addColumnToTable(
 	ctx context.Context,
-	root *doltdb.RootValue,
+	root doltdb.RootValue,
 	tbl *doltdb.Table,
 	tblName string,
 	tag uint64,
@@ -67,10 +68,6 @@ func addColumnToTable(
 	oldSchema, err := tbl.GetSchema(ctx)
 	if err != nil {
 		return nil, err
-	}
-
-	if schema.IsKeyless(oldSchema) {
-		return nil, ErrKeylessAltTbl
 	}
 
 	if err := validateNewColumn(ctx, root, tbl, tblName, tag, newColName, typeInfo); err != nil {
@@ -117,7 +114,7 @@ func createColumn(nullable Nullable, newColName string, tag uint64, typeInfo typ
 // ValidateNewColumn returns an error if the column as specified cannot be added to the schema given.
 func validateNewColumn(
 	ctx context.Context,
-	root *doltdb.RootValue,
+	root doltdb.RootValue,
 	tbl *doltdb.Table,
 	tblName string,
 	tag uint64,
@@ -137,7 +134,7 @@ func validateNewColumn(
 	cols := sch.GetAllCols()
 	err = cols.Iter(func(currColTag uint64, currCol schema.Column) (stop bool, err error) {
 		if currColTag == tag {
-			return false, schema.ErrTagPrevUsed(tag, newColName, tblName)
+			return false, schema.ErrTagPrevUsed(tag, newColName, tblName, tblName)
 		} else if strings.ToLower(currCol.Name) == strings.ToLower(newColName) {
 			return true, fmt.Errorf("A column with the name %s already exists in table %s.", newColName, tblName)
 		}
@@ -149,12 +146,12 @@ func validateNewColumn(
 		return err
 	}
 
-	_, tblName, found, err := root.GetTableByColTag(ctx, tag)
+	_, oldTblName, found, err := doltdb.GetTableByColTag(ctx, root, tag)
 	if err != nil {
 		return err
 	}
 	if found {
-		return schema.ErrTagPrevUsed(tag, newColName, tblName)
+		return schema.ErrTagPrevUsed(tag, newColName, tblName, oldTblName.Name)
 	}
 
 	return nil
@@ -269,10 +266,12 @@ func replaceColumnInSchema(sch schema.Schema, oldCol schema.Column, newCol schem
 			tags,
 			index.PrefixLengths(),
 			schema.IndexProperties{
-				IsUnique:      index.IsUnique(),
-				IsSpatial:     index.IsSpatial(),
-				IsUserDefined: index.IsUserDefined(),
-				Comment:       index.Comment(),
+				IsUnique:           index.IsUnique(),
+				IsSpatial:          index.IsSpatial(),
+				IsFullText:         index.IsFullText(),
+				IsUserDefined:      index.IsUserDefined(),
+				Comment:            index.Comment(),
+				FullTextProperties: index.FullTextProperties(),
 			})
 		if err != nil {
 			return nil, err
@@ -329,15 +328,14 @@ func modifyPkOrdinals(oldSch, newSch schema.Schema) ([]int, error) {
 	return newPkOrdinals, nil
 }
 
-var ErrKeylessAltTbl = errors.New("schema alterations not supported for keyless tables")
-
 // backupFkcIndexesForKeyDrop finds backup indexes to cover foreign key references during a primary
 // key drop. If multiple indexes are valid, we sort by unique and select the first.
 // This will not work with a non-pk index drop without an additional index filter argument.
 func backupFkcIndexesForPkDrop(ctx *sql.Context, tbl string, sch schema.Schema, fkc *doltdb.ForeignKeyCollection) ([]doltdb.FkIndexUpdate, error) {
 	fkUpdates := make([]doltdb.FkIndexUpdate, 0)
 
-	declared, referenced := fkc.KeysForTable(tbl)
+	// TODO: schema names
+	declared, referenced := fkc.KeysForTable(doltdb.TableName{Name: tbl})
 	for _, fk := range declared {
 		if fk.TableIndex == "" {
 			// pk used in fk definition on |tbl|

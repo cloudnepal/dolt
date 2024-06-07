@@ -15,6 +15,7 @@
 package filesys
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -204,15 +205,12 @@ func (fs *localFS) OpenForWriteAppend(fp string, perm os.FileMode) (io.WriteClos
 
 // WriteFile writes the entire data buffer to a given file.  The file will be created if it does not exist,
 // and if it does exist it will be overwritten.
-func (fs *localFS) WriteFile(fp string, data []byte) error {
-	var err error
-	fp, err = fs.Abs(fp)
-
+func (fs *localFS) WriteFile(fp string, data []byte, perms os.FileMode) error {
+	abs, err := fs.Abs(fp)
 	if err != nil {
 		return err
 	}
-
-	return os.WriteFile(fp, data, os.ModePerm)
+	return file.WriteFileAtomically(abs, bytes.NewReader(data), perms)
 }
 
 // MkDirs creates a folder and all the parent folders that are necessary to create it.
@@ -271,8 +269,7 @@ func (fs *localFS) Delete(path string, force bool) error {
 }
 
 // MoveFile will move a file from the srcPath in the filesystem to the destPath
-func (fs *localFS) MoveFile(srcPath, destPath string) error {
-	var err error
+func (fs *localFS) MoveFile(srcPath, destPath string) (err error) {
 	srcPath, err = fs.Abs(srcPath)
 
 	if err != nil {
@@ -281,6 +278,20 @@ func (fs *localFS) MoveFile(srcPath, destPath string) error {
 
 	destPath, err = fs.Abs(destPath)
 
+	if err != nil {
+		return err
+	}
+
+	return file.Rename(srcPath, destPath)
+}
+
+func (fs *localFS) MoveDir(srcPath, destPath string) (err error) {
+	srcPath, err = fs.Abs(srcPath)
+	if err != nil {
+		return err
+	}
+
+	destPath, err = fs.Abs(destPath)
 	if err != nil {
 		return err
 	}

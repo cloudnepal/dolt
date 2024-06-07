@@ -23,45 +23,54 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions/commitwalk"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/prolly"
 )
 
-var _ sql.Table = (*LogTable)(nil)
-
-var _ sql.StatisticsTable = (*LogTable)(nil)
+const logsDefaultRowCount = 100
 
 // LogTable is a sql.Table implementation that implements a system table which shows the dolt commit log
 type LogTable struct {
+	dbName            string
 	ddb               *doltdb.DoltDB
 	head              *doltdb.Commit
 	headHash          hash.Hash
 	headCommitClosure *prolly.CommitClosure
 }
 
+var _ sql.Table = (*LogTable)(nil)
+var _ sql.StatisticsTable = (*LogTable)(nil)
+var _ sql.IndexAddressable = (*LogTable)(nil)
+
 // NewLogTable creates a LogTable
-func NewLogTable(_ *sql.Context, ddb *doltdb.DoltDB, head *doltdb.Commit) sql.Table {
-	return &LogTable{ddb: ddb, head: head}
+func NewLogTable(_ *sql.Context, dbName string, ddb *doltdb.DoltDB, head *doltdb.Commit) sql.Table {
+	return &LogTable{dbName: dbName, ddb: ddb, head: head}
 }
 
 // DataLength implements sql.StatisticsTable
 func (dt *LogTable) DataLength(ctx *sql.Context) (uint64, error) {
-	return uint64(4*types.Text.MaxByteLength()*4 + 16), nil
+	numBytesPerRow := schema.SchemaAvgLength(dt.Schema())
+	numRows, _, err := dt.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
 }
 
 // RowCount implements sql.StatisticsTable
-func (dt *LogTable) RowCount(ctx *sql.Context) (uint64, error) {
+func (dt *LogTable) RowCount(ctx *sql.Context) (uint64, bool, error) {
 	cc, err := dt.head.GetCommitClosure(ctx)
 	if err != nil {
 		// TODO: remove this when we deprecate LD
-		return 1000, nil
+		return logsDefaultRowCount, false, nil
 	}
 	if cc.IsEmpty() {
-		return 1, nil
+		return 1, true, nil
 	}
 	cnt, err := cc.Count()
-	return uint64(cnt + 1), err
+	return uint64(cnt + 1), true, err
 }
 
 // Name is a sql.Table interface function which returns the name of the table which is defined by the constant
@@ -79,11 +88,11 @@ func (dt *LogTable) String() string {
 // Schema is a sql.Table interface function that gets the sql.Schema of the log system table.
 func (dt *LogTable) Schema() sql.Schema {
 	return []*sql.Column{
-		{Name: "commit_hash", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: true},
-		{Name: "committer", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: false},
-		{Name: "email", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: false},
-		{Name: "date", Type: types.Datetime, Source: doltdb.LogTableName, PrimaryKey: false},
-		{Name: "message", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: false},
+		{Name: "commit_hash", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: true, DatabaseSource: dt.dbName},
+		{Name: "committer", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "email", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "date", Type: types.Datetime, Source: doltdb.LogTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "message", Type: types.Text, Source: doltdb.LogTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
 	}
 }
 
@@ -108,13 +117,18 @@ func (dt *LogTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIte
 }
 
 func (dt *LogTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
-	return index.DoltCommitIndexes(dt.Name(), dt.ddb, true)
+	return index.DoltCommitIndexes(dt.dbName, dt.Name(), dt.ddb, true)
 }
 
 // IndexedAccess implements sql.IndexAddressable
 func (dt *LogTable) IndexedAccess(lookup sql.IndexLookup) sql.IndexedTable {
 	nt := *dt
 	return &nt
+}
+
+// PreciseMatch implements sql.IndexAddressable
+func (dt *LogTable) PreciseMatch() bool {
+	return true
 }
 
 func (dt *LogTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
@@ -158,16 +172,16 @@ func (dt *LogTable) commitHashPartitionIter(ctx *sql.Context, lookup sql.IndexLo
 // CommitIsInScope returns true if a given commit hash is head or is
 // visible from the current head's ancestry graph.
 func (dt *LogTable) CommitIsInScope(ctx context.Context, height uint64, h hash.Hash) (bool, error) {
-	cc, err := dt.HeadCommitClosure(ctx)
-	if err != nil {
-		return false, err
-	}
 	headHash, err := dt.HeadHash()
 	if err != nil {
 		return false, err
 	}
 	if headHash == h {
 		return true, nil
+	}
+	cc, err := dt.HeadCommitClosure(ctx)
+	if err != nil {
+		return false, err
 	}
 	return cc.ContainsKey(ctx, h, height)
 }
@@ -217,9 +231,15 @@ func NewLogItr(ctx *sql.Context, ddb *doltdb.DoltDB, head *doltdb.Commit) (*LogI
 // Next retrieves the next row. It will return io.EOF if it's the last row.
 // After retrieving the last row, Close will be automatically closed.
 func (itr *LogItr) Next(ctx *sql.Context) (sql.Row, error) {
-	h, cm, err := itr.child.Next(ctx)
+	h, optCmt, err := itr.child.Next(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	cm, ok := optCmt.ToCommit()
+	if !ok {
+		// Should have been caught by the commit walk.
+		return nil, doltdb.ErrGhostCommitRuntimeFailure
 	}
 
 	meta, err := cm.GetCommitMeta(ctx)

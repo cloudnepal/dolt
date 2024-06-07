@@ -36,7 +36,7 @@ import (
 	"github.com/dolthub/dolt/go/store/val"
 )
 
-func newProllyConflictsTable(ctx *sql.Context, tbl *doltdb.Table, sourceUpdatableTbl sql.UpdatableTable, tblName string, root *doltdb.RootValue, rs RootSetter) (sql.Table, error) {
+func newProllyConflictsTable(ctx *sql.Context, tbl *doltdb.Table, sourceUpdatableTbl sql.UpdatableTable, tblName string, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
 	arts, err := tbl.GetArtifacts(ctx)
 	if err != nil {
 		return nil, err
@@ -51,7 +51,7 @@ func newProllyConflictsTable(ctx *sql.Context, tbl *doltdb.Table, sourceUpdatabl
 	if err != nil {
 		return nil, err
 	}
-	sqlSch, err := sqlutil.FromDoltSchema(doltdb.DoltConfTablePrefix+tblName, confSch)
+	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConfTablePrefix+tblName, confSch)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ type ProllyConflictsTable struct {
 	tblName                   string
 	sqlSch                    sql.PrimaryKeySchema
 	baseSch, ourSch, theirSch schema.Schema
-	root                      *doltdb.RootValue
+	root                      doltdb.RootValue
 	tbl                       *doltdb.Table
 	rs                        RootSetter
 	artM                      prolly.ArtifactMap
@@ -205,7 +205,7 @@ func (itr *prollyConflictRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 
 	if !itr.keyless {
 		for i := 0; i < itr.kd.Count(); i++ {
-			f, err := index.GetField(ctx, itr.kd, i, c.k, itr.baseRows.NodeStore())
+			f, err := tree.GetField(ctx, itr.kd, i, c.k, itr.baseRows.NodeStore())
 			if err != nil {
 				return nil, err
 			}
@@ -238,7 +238,7 @@ func (itr *prollyConflictRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 func (itr *prollyConflictRowIter) putConflictRowVals(ctx *sql.Context, c conf, r sql.Row) error {
 	if c.bV != nil {
 		for i := 0; i < itr.baseVD.Count(); i++ {
-			f, err := index.GetField(ctx, itr.baseVD, i, c.bV, itr.baseRows.NodeStore())
+			f, err := tree.GetField(ctx, itr.baseVD, i, c.bV, itr.baseRows.NodeStore())
 			if err != nil {
 				return err
 			}
@@ -248,7 +248,7 @@ func (itr *prollyConflictRowIter) putConflictRowVals(ctx *sql.Context, c conf, r
 
 	if c.oV != nil {
 		for i := 0; i < itr.oursVD.Count(); i++ {
-			f, err := index.GetField(ctx, itr.oursVD, i, c.oV, itr.baseRows.NodeStore())
+			f, err := tree.GetField(ctx, itr.oursVD, i, c.oV, itr.baseRows.NodeStore())
 			if err != nil {
 				return err
 			}
@@ -259,7 +259,7 @@ func (itr *prollyConflictRowIter) putConflictRowVals(ctx *sql.Context, c conf, r
 
 	if c.tV != nil {
 		for i := 0; i < itr.theirsVD.Count(); i++ {
-			f, err := index.GetField(ctx, itr.theirsVD, i, c.tV, itr.baseRows.NodeStore())
+			f, err := tree.GetField(ctx, itr.theirsVD, i, c.tV, itr.baseRows.NodeStore())
 			if err != nil {
 				return err
 			}
@@ -288,13 +288,13 @@ func (itr *prollyConflictRowIter) putKeylessConflictRowVals(ctx *sql.Context, c 
 
 	if c.bV != nil {
 		// Cardinality
-		r[itr.n-3], err = index.GetField(ctx, itr.baseVD, 0, c.bV, ns)
+		r[itr.n-3], err = tree.GetField(ctx, itr.baseVD, 0, c.bV, ns)
 		if err != nil {
 			return err
 		}
 
 		for i := 0; i < itr.baseVD.Count()-1; i++ {
-			f, err := index.GetField(ctx, itr.baseVD, i+1, c.bV, ns)
+			f, err := tree.GetField(ctx, itr.baseVD, i+1, c.bV, ns)
 			if err != nil {
 				return err
 			}
@@ -305,13 +305,13 @@ func (itr *prollyConflictRowIter) putKeylessConflictRowVals(ctx *sql.Context, c 
 	}
 
 	if c.oV != nil {
-		r[itr.n-2], err = index.GetField(ctx, itr.oursVD, 0, c.oV, ns)
+		r[itr.n-2], err = tree.GetField(ctx, itr.oursVD, 0, c.oV, ns)
 		if err != nil {
 			return err
 		}
 
 		for i := 0; i < itr.oursVD.Count()-1; i++ {
-			f, err := index.GetField(ctx, itr.oursVD, i+1, c.oV, ns)
+			f, err := tree.GetField(ctx, itr.oursVD, i+1, c.oV, ns)
 			if err != nil {
 				return err
 			}
@@ -324,13 +324,13 @@ func (itr *prollyConflictRowIter) putKeylessConflictRowVals(ctx *sql.Context, c 
 	r[itr.o+itr.oursVD.Count()-1] = getDiffType(c.bV, c.oV)
 
 	if c.tV != nil {
-		r[itr.n-1], err = index.GetField(ctx, itr.theirsVD, 0, c.tV, ns)
+		r[itr.n-1], err = tree.GetField(ctx, itr.theirsVD, 0, c.tV, ns)
 		if err != nil {
 			return err
 		}
 
 		for i := 0; i < itr.theirsVD.Count()-1; i++ {
-			f, err := index.GetField(ctx, itr.theirsVD, i+1, c.tV, ns)
+			f, err := tree.GetField(ctx, itr.theirsVD, i+1, c.tV, ns)
 			if err != nil {
 				return err
 			}
@@ -403,7 +403,7 @@ func (itr *prollyConflictRowIter) loadTableMaps(ctx context.Context, baseHash, t
 		if err != nil {
 			return err
 		}
-		baseTbl, ok, err := rv.GetTable(ctx, itr.tblName)
+		baseTbl, ok, err := rv.GetTable(ctx, doltdb.TableName{Name: itr.tblName})
 		if err != nil {
 			return err
 		}
@@ -428,7 +428,7 @@ func (itr *prollyConflictRowIter) loadTableMaps(ctx context.Context, baseHash, t
 		if err != nil {
 			return err
 		}
-		theirTbl, ok, err := rv.GetTable(ctx, itr.tblName)
+		theirTbl, ok, err := rv.GetTable(ctx, doltdb.TableName{Name: itr.tblName})
 		if err != nil {
 			return err
 		}
@@ -463,23 +463,15 @@ type prollyConflictOurTableUpdater struct {
 }
 
 func newProllyConflictOurTableUpdater(ourUpdater sql.RowUpdater, versionMappings *versionMappings, baseSch, ourSch, theirSch schema.Schema) *prollyConflictOurTableUpdater {
-	// The schema columns need to be all equal in order for us to reliably build the PKs
-	schemaOK := schema.ColCollsAreEqual(baseSch.GetAllCols(), ourSch.GetAllCols()) &&
-		schema.ColCollsAreEqual(ourSch.GetAllCols(), theirSch.GetAllCols())
-
 	return &prollyConflictOurTableUpdater{
 		srcUpdater:      ourUpdater,
 		versionMappings: versionMappings,
 		pkOrdinals:      ourSch.GetPkOrdinals(),
-		schemaOK:        schemaOK,
 	}
 }
 
 // Update implements sql.RowUpdater. It translates updates on the conflict table to the source table.
 func (cu *prollyConflictOurTableUpdater) Update(ctx *sql.Context, oldRow sql.Row, newRow sql.Row) error {
-	if !cu.schemaOK {
-		return fmt.Errorf("the source table cannot be automatically updated through the conflict table since the base, our, and their schemas are not equal")
-	}
 
 	// Apply updates to columns prefixed with our_
 	// Updates to other columns are no-ops.
@@ -490,26 +482,6 @@ func (cu *prollyConflictOurTableUpdater) Update(ctx *sql.Context, oldRow sql.Row
 	}
 	for i, j := range cu.versionMappings.ourMapping {
 		ourNewRow[i] = newRow[j]
-	}
-
-	// Are we keyed?
-	if len(cu.pkOrdinals) > 0 {
-		// If so, set the PKs for the old row from either the base, ours, or theirs versions.
-		// This is necessary to allow updates to the conflict table to insert rows against the source table.
-		firstPkOrd := cu.pkOrdinals[0]
-
-		var mapping val.OrdinalMapping
-		if oldRow[cu.versionMappings.ourMapping[firstPkOrd]] != nil {
-			mapping = cu.versionMappings.ourMapping
-		} else if oldRow[cu.versionMappings.theirMapping[firstPkOrd]] != nil {
-			mapping = cu.versionMappings.theirMapping
-		} else {
-			mapping = cu.versionMappings.baseMapping
-		}
-
-		for _, ord := range cu.pkOrdinals {
-			ourOldRow[ord] = oldRow[mapping[ord]]
-		}
 	}
 
 	return cu.srcUpdater.Update(ctx, ourOldRow, ourNewRow)
@@ -617,7 +589,7 @@ func (cd *prollyConflictDeleter) putPrimaryKeys(ctx *sql.Context, r sql.Row) err
 	}()
 
 	for i := 0; i < cd.kd.Count()-2; i++ {
-		err := index.PutField(ctx, cd.ed.NodeStore(), cd.kB, i, r[o+i])
+		err := tree.PutField(ctx, cd.ed.NodeStore(), cd.kB, i, r[o+i])
 
 		if err != nil {
 			return err
@@ -640,7 +612,7 @@ func (cd *prollyConflictDeleter) putKeylessHash(ctx *sql.Context, r sql.Row) err
 	// init cardinality to 0
 	cd.vB.PutUint64(0, 0)
 	for i, v := range rowVals {
-		err := index.PutField(ctx, cd.ed.NodeStore(), cd.vB, i+1, v)
+		err := tree.PutField(ctx, cd.ed.NodeStore(), cd.vB, i+1, v)
 		if err != nil {
 			return err
 		}
@@ -681,7 +653,7 @@ func (cd *prollyConflictDeleter) Close(ctx *sql.Context) error {
 		return err
 	}
 
-	updatedRoot, err := cd.ct.root.PutTable(ctx, cd.ct.tblName, updatedTbl)
+	updatedRoot, err := cd.ct.root.PutTable(ctx, doltdb.TableName{Name: cd.ct.tblName}, updatedTbl)
 	if err != nil {
 		return err
 	}

@@ -18,7 +18,7 @@ import (
 	"context"
 	"fmt"
 
-	fb "github.com/google/flatbuffers/go"
+	fb "github.com/dolthub/flatbuffers/v23/go"
 
 	"github.com/dolthub/dolt/go/gen/fb/serial"
 	"github.com/dolthub/dolt/go/store/datas"
@@ -83,7 +83,7 @@ func serializeNomsForeignKeys(ctx context.Context, vrw types.ValueReadWriter, fk
 	return fkMapEditor.Map(ctx)
 }
 
-// deserializeNomsForeignKeys returns a new ForeignKeyCollection using the provided map returned previously by GetMap.
+// deserializeFlatbufferForeignKeys returns a new ForeignKeyCollection using the provided map returned previously by GetMap.
 func deserializeFlatbufferForeignKeys(msg types.SerialMessage) (*ForeignKeyCollection, error) {
 	if serial.GetFileID(msg) != serial.ForeignKeyCollectionFileID {
 		return nil, fmt.Errorf("expect Serial Message with ForeignKeyCollectionFileID")
@@ -100,7 +100,10 @@ func deserializeFlatbufferForeignKeys(msg types.SerialMessage) (*ForeignKeyColle
 
 	var fk serial.ForeignKey
 	for i := 0; i < c.ForeignKeysLength(); i++ {
-		c.ForeignKeys(&fk, i)
+		_, err = c.TryForeignKeys(&fk, i)
+		if err != nil {
+			return nil, err
+		}
 
 		childCols := make([]uint64, fk.ChildTableColumnsLength())
 		for j := range childCols {
@@ -150,7 +153,7 @@ func deserializeFlatbufferForeignKeys(msg types.SerialMessage) (*ForeignKeyColle
 	return collection, nil
 }
 
-// serializeNomsForeignKeys serializes a ForeignKeyCollection as a types.Map.
+// serializeFlatbufferForeignKeys serializes a ForeignKeyCollection as a types.Map.
 func serializeFlatbufferForeignKeys(fkc *ForeignKeyCollection) types.SerialMessage {
 	foreignKeys := fkc.AllKeys()
 	offsets := make([]fb.UOffsetT, len(foreignKeys))
@@ -219,7 +222,7 @@ func serializeUint64Vector(b *fb.Builder, u []uint64) fb.UOffsetT {
 	return b.EndVector(len(u))
 }
 
-func emptyForeignKeyCollection(msg types.SerialMessage) (bool, error) {
+func EmptyForeignKeyCollection(msg types.SerialMessage) (bool, error) {
 	if serial.GetFileID(msg) != serial.ForeignKeyCollectionFileID {
 		return false, nil
 	}

@@ -21,56 +21,43 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: [ ubuntu-22.04, macos-latest ]
-        dolt_fmt: [ "__DOLT__", "__LD_1__" ]
-        journal: [ "" ]
-        include:
-          - os: "ubuntu-22.04"
-            dolt_fmt: "__DOLT__"
-            journal: "true"
-        exclude:
-          - os: "macos-latest"
-            dolt_fmt: "__LD_1__"
-            journal: ""
+        os: [ ubuntu-22.04 ]
     env:
       use_credentials: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' && secrets.AWS_ACCESS_KEY_ID != '' }}
     steps:
       - name: Conditionally Set ENV VARS for AWS tests
-        env:
-          DOLT_FMT: ${{ matrix.dolt_fmt }}
-          DOLT_ENABLE_CHUNK_JOURNAL: ${{ matrix.journal }}
         run: |
           if [[ $use_credentials == true ]]; then
             echo "AWS_SDK_LOAD_CONFIG=1" >> $GITHUB_ENV
             echo "AWS_REGION=us-west-2" >> $GITHUB_ENV
             echo "DOLT_BATS_AWS_TABLE=dolt-ci-bats-manifests-us-west-2" >> $GITHUB_ENV
             echo "DOLT_BATS_AWS_BUCKET=dolt-ci-bats-chunks-us-west-2" >> $GITHUB_ENV
-            if [[ "$DOLT_FMT" == "__DOLT__" ]]; then
-                echo "DOLT_BATS_AWS_EXISTING_REPO=aws_remote_bats_tests__dolt__" >> $GITHUB_ENV
-            else
-                echo "DOLT_BATS_AWS_EXISTING_REPO=aws_remote_bats_tests" >> $GITHUB_ENV
-            fi
+            echo "DOLT_BATS_AWS_EXISTING_REPO=aws_remote_bats_tests__dolt__" >> $GITHUB_ENV
           fi
+      - name: Configure filter tags for lambda bats
+        if: ${{ matrix.os == 'ubuntu-22.04' && env.use_credentials == 'true' }}
+        run: |
+          echo "BATS_FILTER=--filter-tags no_lambda" >> $GITHUB_ENV
       - name: Configure AWS Credentials
         if: ${{ env.use_credentials == 'true' }}
-        uses: aws-actions/configure-aws-credentials@567d4149d67f15f52b09796bea6573fc32952783
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-west-2
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           role-duration-seconds: 10800 # 3 hours D:
+      - uses: actions/checkout@v4
       - name: Setup Go 1.x
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
-          go-version: ^1.19
+          go-version-file: go/go.mod
         id: go
       - name: Setup Python 3.x
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: ^16
       - name: Create CI Bin
@@ -104,22 +91,22 @@ jobs:
       - name: Install Maven
         working-directory: ./.ci_bin
         run: |
-          curl -LO https://dlcdn.apache.org/maven/maven-3/3.9.0/binaries/apache-maven-3.9.0-bin.tar.gz
-          tar -xf apache-maven-3.9.0-bin.tar.gz
-          echo "$(pwd)/apache-maven-3.9.0/bin" >> $GITHUB_PATH
+          curl -LO https://dlcdn.apache.org/maven/maven-3/3.9.4/binaries/apache-maven-3.9.4-bin.tar.gz
+          tar -xf apache-maven-3.9.4-bin.tar.gz
+          echo "$(pwd)/apache-maven-3.9.4/bin" >> $GITHUB_PATH
       - name: Install Hadoop
         working-directory: ./.ci_bin
         run: |
-          curl -LO https://downloads.apache.org/hadoop/common/hadoop-3.3.4/hadoop-3.3.4.tar.gz
-          tar xvf hadoop-3.3.4.tar.gz
-          echo "$(pwd)/hadoop-3.3.4/bin" >> $GITHUB_PATH
+          curl -LO https://downloads.apache.org/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz
+          tar xvf hadoop-3.3.6.tar.gz
+          echo "$(pwd)/hadoop-3.3.6/bin" >> $GITHUB_PATH
       - name: Install parquet-cli
         id: parquet_cli
         working-directory: ./.ci_bin
         run: |
           curl -OL https://github.com/apache/parquet-mr/archive/refs/tags/apache-parquet-1.12.3.tar.gz
           tar zxvf apache-parquet-1.12.3.tar.gz
-          cd parquet-mr-apache-parquet-1.12.3/parquet-cli
+          cd parquet-java-apache-parquet-1.12.3/parquet-cli
           mvn clean install -DskipTests
           runtime_jar="$(pwd)"/target/parquet-cli-1.12.3-runtime.jar
           echo "runtime_jar=$runtime_jar" >> $GITHUB_OUTPUT
@@ -127,10 +114,19 @@ jobs:
         run: expect -v
       - name: Test all Unix
         env:
-          DOLT_FMT: ${{ matrix.dolt_fmt }}
+          SQL_ENGINE: "local-engine"
           PARQUET_RUNTIME_JAR: ${{ steps.parquet_cli.outputs.runtime_jar }}
           BATS_TEST_RETRIES: "3"
         run: |
-          if [ -n "$DOLT_FMT" ]; then export DOLT_DEFAULT_BIN_FORMAT="$DOLT_FMT"; fi
-          bats --tap .
+          bats --tap $BATS_FILTER .
+        working-directory: ./integration-tests/bats
+      - name: Test all Unix, SQL_ENGINE=remote-engine
+        # If we have AWS credentials, we run these remote-engine tests here instead of in the separate job.
+        if: ${{ env.use_credentials == 'true' && matrix.os == 'ubuntu-22.04' }}
+        env:
+          SQL_ENGINE: "remote-engine"
+          PARQUET_RUNTIME_JAR: ${{ steps.parquet_cli.outputs.runtime_jar }}
+          BATS_TEST_RETRIES: "3"
+        run: |
+          bats --tap $BATS_FILTER .
         working-directory: ./integration-tests/bats

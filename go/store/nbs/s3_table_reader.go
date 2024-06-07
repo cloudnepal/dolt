@@ -34,10 +34,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/jpillora/backoff"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/dolthub/dolt/go/store/hash"
 )
 
 const (
@@ -47,17 +49,7 @@ const (
 
 type s3TableReaderAt struct {
 	s3 *s3ObjectReader
-	h  addr
-}
-
-type s3svc interface {
-	AbortMultipartUploadWithContext(ctx aws.Context, input *s3.AbortMultipartUploadInput, opts ...request.Option) (*s3.AbortMultipartUploadOutput, error)
-	CreateMultipartUploadWithContext(ctx aws.Context, input *s3.CreateMultipartUploadInput, opts ...request.Option) (*s3.CreateMultipartUploadOutput, error)
-	UploadPartWithContext(ctx aws.Context, input *s3.UploadPartInput, opts ...request.Option) (*s3.UploadPartOutput, error)
-	UploadPartCopyWithContext(ctx aws.Context, input *s3.UploadPartCopyInput, opts ...request.Option) (*s3.UploadPartCopyOutput, error)
-	CompleteMultipartUploadWithContext(ctx aws.Context, input *s3.CompleteMultipartUploadInput, opts ...request.Option) (*s3.CompleteMultipartUploadOutput, error)
-	GetObjectWithContext(ctx aws.Context, input *s3.GetObjectInput, opts ...request.Option) (*s3.GetObjectOutput, error)
-	PutObjectWithContext(ctx aws.Context, input *s3.PutObjectInput, opts ...request.Option) (*s3.PutObjectOutput, error)
+	h  hash.Hash
 }
 
 func (s3tra *s3TableReaderAt) Close() error {
@@ -78,7 +70,7 @@ func (s3tra *s3TableReaderAt) ReadAtWithStats(ctx context.Context, p []byte, off
 
 // TODO: Bring all the multipart upload and remote-conjoin stuff over here and make this a better analogue to ddbTableStore
 type s3ObjectReader struct {
-	s3     s3svc
+	s3     s3iface.S3API
 	bucket string
 	readRl chan struct{}
 	ns     string
@@ -91,11 +83,11 @@ func (s3or *s3ObjectReader) key(k string) string {
 	return k
 }
 
-func (s3or *s3ObjectReader) Reader(ctx context.Context, name addr) (io.ReadCloser, error) {
+func (s3or *s3ObjectReader) Reader(ctx context.Context, name hash.Hash) (io.ReadCloser, error) {
 	return s3or.reader(ctx, name)
 }
 
-func (s3or *s3ObjectReader) ReadAt(ctx context.Context, name addr, p []byte, off int64, stats *Stats) (n int, err error) {
+func (s3or *s3ObjectReader) ReadAt(ctx context.Context, name hash.Hash, p []byte, off int64, stats *Stats) (n int, err error) {
 	t1 := time.Now()
 
 	defer func() {
@@ -115,7 +107,7 @@ func s3RangeHeader(off, length int64) string {
 const maxS3ReadFromEndReqSize = 256 * 1024 * 1024       // 256MB
 const preferredS3ReadFromEndReqSize = 128 * 1024 * 1024 // 128MB
 
-func (s3or *s3ObjectReader) ReadFromEnd(ctx context.Context, name addr, p []byte, stats *Stats) (n int, sz uint64, err error) {
+func (s3or *s3ObjectReader) ReadFromEnd(ctx context.Context, name hash.Hash, p []byte, stats *Stats) (n int, sz uint64, err error) {
 	defer func(t1 time.Time) {
 		stats.S3BytesPerRead.Sample(uint64(len(p)))
 		stats.S3ReadLatency.SampleTimeSince(t1)
@@ -159,7 +151,7 @@ func (s3or *s3ObjectReader) ReadFromEnd(ctx context.Context, name addr, p []byte
 	return s3or.readRange(ctx, name, p, fmt.Sprintf("%s=-%d", s3RangePrefix, len(p)))
 }
 
-func (s3or *s3ObjectReader) reader(ctx context.Context, name addr) (io.ReadCloser, error) {
+func (s3or *s3ObjectReader) reader(ctx context.Context, name hash.Hash) (io.ReadCloser, error) {
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(s3or.bucket),
 		Key:    aws.String(s3or.key(name.String())),
@@ -171,7 +163,7 @@ func (s3or *s3ObjectReader) reader(ctx context.Context, name addr) (io.ReadClose
 	return result.Body, nil
 }
 
-func (s3or *s3ObjectReader) readRange(ctx context.Context, name addr, p []byte, rangeHeader string) (n int, sz uint64, err error) {
+func (s3or *s3ObjectReader) readRange(ctx context.Context, name hash.Hash, p []byte, rangeHeader string) (n int, sz uint64, err error) {
 	read := func() (int, uint64, error) {
 		if s3or.readRl != nil {
 			s3or.readRl <- struct{}{}

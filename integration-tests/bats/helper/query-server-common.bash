@@ -2,39 +2,43 @@ SERVER_REQS_INSTALLED="FALSE"
 SERVER_PID=""
 DEFAULT_DB=""
 
-set_server_reqs_installed() {
-    SERVER_REQS_INSTALLED=$(python3 -c "
-requirements_installed = True
-try:
-    import mysql.connector
-except:
-    requirements_installed = False
-
-print(str(requirements_installed).upper())
-")
-}
-
+# wait_for_connection(<PORT>, <TIMEOUT IN MS>) attempts to connect to the sql-server at the specified
+# port on localhost, using the $SQL_USER (or 'dolt' if unspecified) as the user name, and trying once
+# per second until the millisecond timeout is reached. If a connection is successfully established,
+# this function returns 0. If a connection was not able to be established within the timeout period,
+# this function returns 1.
 wait_for_connection() {
-    PYTEST_DIR="$BATS_TEST_DIRNAME/helper"
-    python3 -c "
-import os
-import sys
+  port=$1
+  timeout=$2
+  user=${SQL_USER:-dolt}
+  end_time=$((SECONDS+($timeout/1000)))
 
-args = sys.argv[sys.argv.index('--') + 1:]
-working_dir, database, port_str, timeout_ms = args
-os.chdir(working_dir)
+  while [ $SECONDS -lt $end_time ]; do
+    run dolt -u $user -p "$DOLT_REMOTE_PASSWORD" --host localhost --no-tls --port $port --use-db "$DEFAULT_DB" sql -q "SELECT 1;"
+    if [ $status -eq 0 ]; then
+      echo "Connected successfully!"
+      return 0
+    fi
+    sleep 1
+  done
 
-from pytest import wait_for_connection
-wait_for_connection(port=int(port_str), timeout_ms=int(timeout_ms), database=database, user='dolt')
-" -- "$PYTEST_DIR" "$DEFAULT_DB" "$1" "$2"
+  echo "Failed to connect to database $DEFAULT_DB on port $port within $timeout ms."
+  return 1
 }
 
 start_sql_server() {
     DEFAULT_DB="$1"
+    logFile="$2"
     PORT=$( definePORT )
-    dolt sql-server --host 0.0.0.0 --port=$PORT --user dolt --socket "dolt.$PORT.sock" &
+    if [[ $logFile ]]
+    then
+        dolt sql-server --host 0.0.0.0 --port=$PORT --user "${SQL_USER:-dolt}" --socket "dolt.$PORT.sock" > $logFile 2>&1 &
+    else
+        dolt sql-server --host 0.0.0.0 --port=$PORT --user "${SQL_USER:-dolt}" --socket "dolt.$PORT.sock" &
+    fi
+    echo db:$DEFAULT_DB logFile:$logFile PORT:$PORT CWD:$PWD
     SERVER_PID=$!
-    wait_for_connection $PORT 5000
+    wait_for_connection $PORT 8500
 }
 
 # like start_sql_server, but the second argument is a string with all
@@ -45,7 +49,7 @@ start_sql_server_with_args() {
     PORT=$( definePORT )
     dolt sql-server "$@" --port=$PORT --socket "dolt.$PORT.sock" &
     SERVER_PID=$!
-    wait_for_connection $PORT 5000
+    wait_for_connection $PORT 8500
 }
 
 start_sql_server_with_config() {
@@ -68,7 +72,7 @@ behavior:
     cat "$2" >> .cliconfig.yaml
     dolt sql-server --config .cliconfig.yaml --socket "dolt.$PORT.sock" &
     SERVER_PID=$!
-    wait_for_connection $PORT 5000
+    wait_for_connection $PORT 8500
 }
 
 start_sql_multi_user_server() {
@@ -90,7 +94,7 @@ behavior:
 " > .cliconfig.yaml
     dolt sql-server --config .cliconfig.yaml --socket "dolt.$PORT.sock" &
     SERVER_PID=$!
-    wait_for_connection $PORT 5000
+    wait_for_connection $PORT 8500
 }
 
 start_multi_db_server() {
@@ -98,7 +102,7 @@ start_multi_db_server() {
     PORT=$( definePORT )
     dolt sql-server --host 0.0.0.0 --port=$PORT --user dolt --data-dir ./ --socket "dolt.$PORT.sock" &
     SERVER_PID=$!
-    wait_for_connection $PORT 5000
+    wait_for_connection $PORT 8500
 }
 
 # stop_sql_server stops the SQL server. For cases where it's important
@@ -124,13 +128,13 @@ stop_sql_server() {
 }
 
 definePORT() {
-  getPORT=""
-  for i in {0..9}
+  for i in {0..99}
   do
-    let getPORT="($$ + $i) % (65536-1024) + 1024"
-    portinuse=$(lsof -i -P -n | grep LISTEN | grep $getPORT | wc -l)
-    if [ $portinuse -eq 0 ]; then
-      echo "$getPORT"
+    port=$((RANDOM % 4096 + 2048))
+    # nc (netcat) returns 0 when it _can_ connect to a port (therefore in use), 1 otherwise.
+    run nc -z localhost $port
+    if [ "$status" -eq 1 ]; then
+      echo $port
       break
     fi
   done

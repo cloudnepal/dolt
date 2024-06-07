@@ -32,7 +32,11 @@ type TagProps struct {
 }
 
 func CreateTag(ctx context.Context, dEnv *env.DoltEnv, tagName, startPoint string, props TagProps) error {
-	return CreateTagOnDB(ctx, dEnv.DoltDB, tagName, startPoint, props, dEnv.RepoStateReader().CWBHeadRef())
+	headRef, err := dEnv.RepoStateReader().CWBHeadRef()
+	if err != nil {
+		return err
+	}
+	return CreateTagOnDB(ctx, dEnv.DoltDB, tagName, startPoint, props, headRef)
 }
 
 func CreateTagOnDB(ctx context.Context, ddb *doltdb.DoltDB, tagName, startPoint string, props TagProps, headRef ref.DoltRef) error {
@@ -53,24 +57,22 @@ func CreateTagOnDB(ctx context.Context, ddb *doltdb.DoltDB, tagName, startPoint 
 	}
 
 	cs, err := doltdb.NewCommitSpec(startPoint)
-
 	if err != nil {
 		return err
 	}
 
-	cm, err := ddb.Resolve(ctx, cs, headRef)
-
+	optCmt, err := ddb.Resolve(ctx, cs, headRef)
 	if err != nil {
 		return err
+	}
+	cm, ok := optCmt.ToCommit()
+	if !ok {
+		return doltdb.ErrGhostCommitEncountered
 	}
 
 	meta := datas.NewTagMeta(props.TaggerName, props.TaggerEmail, props.Description)
 
 	return ddb.NewTagAtCommit(ctx, tagRef, cm, meta)
-}
-
-func DeleteTags(ctx context.Context, dEnv *env.DoltEnv, tagNames ...string) error {
-	return DeleteTagsOnDB(ctx, dEnv.DoltDB, tagNames...)
 }
 
 func DeleteTagsOnDB(ctx context.Context, ddb *doltdb.DoltDB, tagNames ...string) error {

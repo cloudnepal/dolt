@@ -30,11 +30,12 @@ import (
 
 func TestInsertIntoQueryCatalogTable(t *testing.T) {
 	dEnv := dtestutils.CreateTestEnv()
+	defer dEnv.DoltDB.Close()
 
 	ctx := context.Background()
 	root, _ := dEnv.WorkingRoot(ctx)
 
-	_, ok, err := root.GetTable(ctx, doltdb.DoltQueryCatalogTableName)
+	_, ok, err := root.GetTable(ctx, doltdb.TableName{Name: doltdb.DoltQueryCatalogTableName})
 	require.NoError(t, err)
 	require.False(t, ok)
 
@@ -50,7 +51,7 @@ func TestInsertIntoQueryCatalogTable(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, sq, retrieved)
 
-	_, ok, err = root.GetTable(ctx, doltdb.DoltQueryCatalogTableName)
+	_, ok, err = root.GetTable(ctx, doltdb.TableName{Name: doltdb.DoltQueryCatalogTableName})
 	require.NoError(t, err)
 	require.True(t, ok)
 

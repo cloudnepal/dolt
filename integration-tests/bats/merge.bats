@@ -27,6 +27,84 @@ teardown() {
     teardown_common
 }
 
+@test "merge: db collation ff merge" {
+    dolt sql -q "create database colldb"
+    cd colldb
+
+    dolt branch other
+    dolt sql -q "alter database colldb collate utf8mb4_spanish_ci"
+    dolt commit -Am "changed collation"
+
+    dolt checkout other
+    run dolt merge main
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Everything up-to-date" ]] || false
+}
+
+@test "merge: db collation non ff merge" {
+    dolt sql -q "create database colldb"
+    cd colldb
+
+    dolt checkout -b other
+    dolt sql -q "alter database colldb collate utf8mb4_spanish_ci"
+    dolt commit -Am "changed other collation"
+
+    dolt checkout main
+    dolt sql -q "alter database colldb collate utf8mb4_spanish_ci"
+    dolt commit -Am "changed main collation"
+
+    run dolt merge other
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Everything up-to-date" ]] || false
+}
+
+@test "merge: db collation merge conflict" {
+    dolt sql -q "create database colldb"
+    cd colldb
+
+    dolt checkout -b other
+    dolt sql -q "alter database colldb collate utf8mb4_spanish_ci"
+    dolt commit -Am "changed other collation"
+
+    dolt checkout main
+    dolt sql -q "alter database colldb collate utf8mb4_danish_ci"
+    dolt commit -Am "changed main collation"
+
+    run dolt merge other
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "database collation conflict" ]] || false
+
+    dolt sql -q "alter database colldb collate utf8mb4_spanish_ci"
+    dolt commit -Am "fix main collation"
+    run dolt merge other
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Everything up-to-date" ]] || false
+}
+
+@test "merge: unresolved FKs not dropped on merge (issue #5531)" {
+    dolt sql <<SQL
+    SET foreign_key_checks = off;
+    CREATE TABLE operations (id int primary key);
+    CREATE TABLE diff_summaries (id int primary key, op_id_fk int, foreign key (op_id_fk) references operations (id));
+SQL
+    dolt commit -Am 'initial commit'
+    dolt checkout -b base
+
+    dolt branch two
+    dolt checkout -b one
+    dolt sql -q 'insert into operations values (1)'
+    dolt commit -Am 'insert operations 1'
+    dolt checkout two
+    dolt sql -q 'insert into operations values (2)'
+    dolt commit -Am 'insert operations 2'
+    dolt checkout -b merged
+    dolt merge --no-edit one
+    run dolt schema show diff_summaries
+    log_status_eq 0
+    [[ "$output" =~ "op_id_fk" ]] || false
+    [[ "$output" =~ "FOREIGN KEY (\`op_id_fk\`) REFERENCES \`operations\`" ]] || false
+}
+
 @test "merge: three-way merge with longer key on both left and right" {
 
     # Base table has a key length of 2. Left and right will both add a column to
@@ -60,7 +138,7 @@ SQL
         
     run dolt merge b2
     log_status_eq 1
-    [[ "$output" =~ "cause: error: cannot merge table t1 because its different primary keys differ" ]]
+    [[ "$output" =~ "cause: error: cannot merge table t1 because its different primary keys differ" ]] || false
 }
 
 
@@ -120,7 +198,9 @@ SQL
     # dirty the working set with changes to test2
     dolt sql -q "INSERT INTO test2 VALUES (9,9,9);"
 
-    dolt merge other --no-commit
+    run dolt merge other --no-commit
+    log_status_eq 1
+    [[ "$output" =~ "Automatic merge failed" ]] || false
     dolt merge --abort
 
     run dolt sql -q "SELECT * from dolt_merge_status"
@@ -145,10 +225,11 @@ SQL
 
     dolt checkout main
     dolt merge other --no-commit
+    dolt status
     run dolt status
     log_status_eq 0
     [[ "$output" =~ "still merging" ]] || false
-    [[ "$output" =~ "modified:       test" ]] || false
+    [[ "$output" =~ "modified:         test1" ]] || false
 
     dolt merge --abort
     run dolt status
@@ -162,16 +243,16 @@ SQL
 
 @test "merge: squash merge" {
     dolt checkout -b merge_branch
-    dolt SQL -q "INSERT INTO test1 values (0,1,2)"
+    dolt sql -q "INSERT INTO test1 values (0,1,2)"
     dolt add test1
     dolt commit -m "add pk 0 to test1"
 
     dolt checkout main
-    dolt SQL -q "INSERT INTO test1 values (1,2,3)"
+    dolt sql -q "INSERT INTO test1 values (1,2,3)"
     dolt add test1
     dolt commit -m "add pk 1 to test1"
 
-    dolt SQL -q "INSERT INTO test2 values (0,1,2)"
+    dolt sql -q "INSERT INTO test2 values (0,1,2)"
     run dolt status
     log_status_eq 0
     [[ "$output" =~ "test2" ]] || false
@@ -187,10 +268,10 @@ SQL
     [[ "$output" =~ "test2" ]] || false
     [[ "$output" =~ "test1" ]] || false
 
-    # make sure the squashed commit is not in the log.
     dolt add .
     dolt commit -m "squash merge"
 
+    # make sure the squashed commit is not in the log.
     run dolt log
     log_status_eq 0
     [[ "$output" =~ "add pk 1 to test1" ]] || false
@@ -209,7 +290,7 @@ SQL
 
     dolt checkout main
 
-    run dolt merge merge_branch~ --no-commit
+    run dolt merge merge_branch~
     log_status_eq 0
     [[ "$output" =~ "Fast-forward" ]] || false
     run dolt sql -q 'select count(*) from test1 where pk = 1'
@@ -232,7 +313,8 @@ SQL
     dolt commit -m "add pk 0 = 2,2 to test1"
 
     run dolt merge merge_branch -m "merge_branch"
-    log_status_eq 0
+    log_status_eq 1
+    [[ "$output" =~ "Automatic merge failed" ]] || false
     [[ "$output" =~ "test1" ]] || false
 
     dolt add test1
@@ -261,7 +343,8 @@ SQL
     dolt commit -m "add pk 0 = 2,2 to test1"
 
     run dolt merge merge_branch --no-commit
-    log_status_eq 0
+    log_status_eq 1
+    [[ "$output" =~ "Automatic merge failed" ]] || false
     [[ "$output" =~ "test1" ]] || false
 
     run dolt commit -m 'create a merge commit'
@@ -508,7 +591,8 @@ SQL
     dolt commit -am "added row"
 
     run dolt merge other
-    log_status_eq 0
+    log_status_eq 1
+    [[ "$output" =~ "Automatic merge failed" ]] || false
 
     run dolt sql -q "select * from dolt_constraint_violations" -r=csv
     [[ "$output" =~ "test,2" ]] || false
@@ -541,16 +625,16 @@ SQL
     # left composite index left-over
     run dolt sql -r csv -q "SELECT count(*) from test WHERE c0 = 1 AND c1 = 0;"
     log_status_eq 0
-    [ ${lines[1]} -eq 0 ]
+    [[ ${lines[1]} -eq 0 ]] || false
 
     # right composite index left-over
     run dolt sql -r csv -q "SELECT count(*) from test WHERE c0 = 0 AND c1 = 1;"
     log_status_eq 0
-    [ ${lines[1]} -eq 0 ]
+    [[ ${lines[1]} -eq 0 ]] || false
 
     run dolt sql -r csv -q "SELECT count(*) from test WHERE c0 = 1 AND c1 = 1;"
     log_status_eq 0
-    [ ${lines[1]} -eq 1 ]
+    [[ ${lines[1]} -eq 1 ]] || false
 }
 
 @test "merge: merge a branch with a new table" {
@@ -597,8 +681,7 @@ SQL
     dolt commit -am "add data to test1, drop test2"
 
     dolt checkout main
-    run dolt merge feature-branch -m "merge feature-branch"
-    log_status_eq 0
+    dolt merge feature-branch -m "merge feature-branch"
 
     run dolt sql -q "show tables"
     log_status_eq 0
@@ -635,8 +718,7 @@ SQL
     dolt commit -am "add data to test1"
 
     dolt checkout main
-    run dolt merge feature-branch -m "merge feature-branch"
-    log_status_eq 0
+    dolt merge feature-branch -m "merge feature-branch"
 
     run dolt sql -q "show tables"
     log_status_eq 0
@@ -669,7 +751,44 @@ SQL
     run dolt merge feature-branch
 
     log_status_eq 1
-    [[ "$output" =~ "conflict" ]] || false
+    [[ "$output" =~ "conflict: table with same name deleted and modified" ]] || false
+}
+
+@test "merge: merge a branch that edits the schema of a deleted table" {
+    dolt sql << SQL
+INSERT INTO test2 VALUES (0, 0, 0);
+INSERT INTO test2 VALUES (1, 1, 1);
+SQL
+    dolt add -A && dolt commit -am "add data to test2"
+
+    dolt branch feature-branch
+    dolt sql -q "drop table test2"
+    dolt commit -am "drop table test2"
+
+    dolt checkout feature-branch
+    dolt sql << SQL
+ALTER TABLE test2 DROP COLUMN c2;
+SQL
+    dolt commit -am "add data to test2"
+
+    dolt checkout main
+    run dolt merge feature-branch
+
+    log_status_eq 1
+    [[ "$output" =~ "CONFLICT (schema): Merge conflict in test" ]] || false
+
+    run dolt conflicts cat .
+    [[ "$output" =~ "+------------+-------------------------------------------------------------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+    [[ "$output" =~ "| our_schema | their_schema                                                      | base_schema                                                       | description                                            |" ]] || false
+    [[ "$output" =~ "+------------+-------------------------------------------------------------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+    [[ "$output" =~ '| <deleted>  | CREATE TABLE `test2` (                                            | CREATE TABLE `test2` (                                            | cannot merge a table deletion with schema modification |' ]] || false
+    [[ "$output" =~ '|            |   `pk` int NOT NULL,                                              |   `pk` int NOT NULL,                                              |                                                        |' ]] || false
+    [[ "$output" =~ '|            |   `c1` int,                                                       |   `c1` int,                                                       |                                                        |' ]] || false
+    [[ "$output" =~ '|            |   PRIMARY KEY (`pk`)                                              |   `c2` int,                                                       |                                                        |' ]] || false
+    [[ "$output" =~ '|            | ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin; |   PRIMARY KEY (`pk`)                                              |                                                        |' ]] || false
+    [[ "$output" =~ "|            |                                                                   | ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin; |                                                        |" ]] || false
+    [[ "$output" =~ "+------------+-------------------------------------------------------------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+
 }
 
 @test "merge: merge a branch that deletes an edited table" {
@@ -693,7 +812,42 @@ SQL
     run dolt merge feature-branch
 
     log_status_eq 1
-    [[ "$output" =~ "conflict" ]] || false
+    [[ "$output" =~ "conflict: table with same name deleted and modified" ]] || false
+}
+
+@test "merge: merge a branch that deletes a schema-edited table" {
+    dolt sql << SQL
+INSERT INTO test2 VALUES (0, 0, 0);
+INSERT INTO test2 VALUES (1, 1, 1);
+SQL
+    dolt add -A && dolt commit -am "add data to test2"
+
+    dolt branch feature-branch
+    dolt sql << SQL
+ALTER TABLE test2 DROP COLUMN c2;
+SQL
+    dolt commit -am "add data to test2"
+
+    dolt checkout feature-branch
+    dolt sql -q "drop table test2"
+    dolt commit -am "drop table test2"
+
+    dolt checkout main
+    run dolt merge feature-branch
+
+    log_status_eq 1
+    run dolt conflicts cat .
+    [[ "$output" =~ "+-------------------------------------------------------------------+--------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+    [[ "$output" =~ "| our_schema                                                        | their_schema | base_schema                                                       | description                                            |" ]] || false
+    [[ "$output" =~ "+-------------------------------------------------------------------+--------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+    [[ "$output" =~ '| CREATE TABLE `test2` (                                            | <deleted>    | CREATE TABLE `test2` (                                            | cannot merge a table deletion with schema modification |' ]] || false
+    [[ "$output" =~ '|   `pk` int NOT NULL,                                              |              |   `pk` int NOT NULL,                                              |                                                        |' ]] || false
+    [[ "$output" =~ '|   `c1` int,                                                       |              |   `c1` int,                                                       |                                                        |' ]] || false
+    [[ "$output" =~ '|   PRIMARY KEY (`pk`)                                              |              |   `c2` int,                                                       |                                                        |' ]] || false
+    [[ "$output" =~ '| ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin; |              |   PRIMARY KEY (`pk`)                                              |                                                        |' ]] || false
+    [[ "$output" =~ "|                                                                   |              | ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin; |                                                        |" ]] || false
+    [[ "$output" =~ "+-------------------------------------------------------------------+--------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+
 }
 
 @test "merge: merge a branch that deletes a deleted table" {
@@ -750,13 +904,16 @@ SQL
     dolt commit -am "non-fk insert"
 
     dolt checkout main
-    dolt merge right
+    run dolt merge right
+    log_status_eq 1
+    [[ "$output" =~ "Automatic merge failed" ]] || false
     dolt commit -afm "commit constraint violations"
 
-    dolt merge other --no-commit
+    run dolt merge other --no-commit
+    [[ "$output" =~ "Automatic merge failed" ]] || false
 
     run dolt sql -r csv -q "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_child;";
-    [[ "${lines[1]}" = "foreign key,1,1" ]]
+    [[ "${lines[1]}" = "foreign key,1,1" ]] || false
 }
 
 @test "merge: non-conflicting / non-violating merge succeeds when conflicts and violations already exist" {
@@ -786,37 +943,38 @@ SQL
     dolt checkout main
     # Create a conflicted state by merging other into main
     run dolt merge other
-    [[ "$output" =~ "CONFLICT" ]]
+    [[ "$output" =~ "CONFLICT" ]] || false
 
     run dolt sql -r csv -q "SELECT * FROM parent;"
-    [[ "${lines[1]}" = "1,2" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
 
     run dolt sql -r csv -q "SELECT * from child;"
-    [[ "${lines[1]}" = "1,2" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
 
     run dolt sql -r csv -q "SELECT base_col1, base_pk, our_col1, our_pk, their_col1, their_pk from dolt_conflicts_parent;"
-    [[ "$output" =~ "1,1,2,1,3,1" ]]
+    [[ "$output" =~ "1,1,2,1,3,1" ]] || false
 
     run dolt sql -r csv -q "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_child;"
-    [[ "$output" =~ "foreign key,1,2" ]]
+    [[ "$output" =~ "foreign key,1,2" ]] || false
 
     # commit it so we can merge again
     dolt commit -afm "committing merge conflicts"
 
     # merge should be allowed and previous conflicts and violations should be retained
-    dolt merge other2 --no-commit
+    run dolt merge other2 --no-commit
+    [[ "$output" =~ "Automatic merge failed" ]] || false
     run dolt sql -r csv -q "SELECT * FROM parent;"
-    [[ "${lines[1]}" = "1,2" ]]
-    [[ "${lines[2]}" = "3,1" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
+    [[ "${lines[2]}" = "3,1" ]] || false
 
     run dolt sql -r csv -q "SELECT * from child;"
-    [[ "${lines[1]}" = "1,2" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
 
     run dolt sql -r csv -q "SELECT base_col1, base_pk, our_col1, our_pk, their_col1, their_pk from dolt_conflicts_parent;"
-    [[ "${lines[1]}" =~ "1,1,2,1,3,1" ]]
+    [[ "${lines[1]}" =~ "1,1,2,1,3,1" ]] || false
 
     run dolt sql -r csv -q "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_child;"
-    [[ "${lines[1]}" =~ "foreign key,1,2" ]]
+    [[ "${lines[1]}" =~ "foreign key,1,2" ]] || false
 }
 
 @test "merge: conflicting merge should retain previous conflicts and constraint violations" {
@@ -846,20 +1004,20 @@ SQL
 
     # Create a conflicted state by merging other into main
     run dolt merge other
-    log_status_eq 0
-    [[ "$output" =~ "CONFLICT" ]]
+    log_status_eq 1
+    [[ "$output" =~ "CONFLICT" ]] || false
 
     run dolt sql -r csv -q "SELECT * FROM parent;"
-    [[ "${lines[1]}" = "1,2" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
 
     run dolt sql -r csv -q "SELECT * from child;"
-    [[ "${lines[1]}" = "1,2" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
 
     run dolt sql -r csv -q "SELECT base_col1, base_pk, our_col1, our_pk, their_col1, their_pk from dolt_conflicts_parent;"
-    [[ "${lines[1]}" = "1,1,2,1,3,1" ]]
+    [[ "${lines[1]}" = "1,1,2,1,3,1" ]] || false
 
     run dolt sql -r csv -q "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_child;"
-    [[ "${lines[1]}" = "foreign key,1,2" ]]
+    [[ "${lines[1]}" = "foreign key,1,2" ]] || false
 
     # commit it so we can merge again
     dolt commit -afm "committing merge conflicts"
@@ -868,19 +1026,19 @@ SQL
 
     # Merge should fail due to conflict and previous conflict and violation state should be retained
     run dolt merge other2
-    [[ "$output" =~ "existing unresolved conflicts would be overridden by new conflicts produced by merge" ]]
+    [[ "$output" =~ "existing unresolved conflicts would be overridden by new conflicts produced by merge" ]] || false
 
     run dolt sql -r csv -q "SELECT * FROM parent;"
-    [[ "${lines[1]}" = "1,2" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
 
     run dolt sql -r csv -q "SELECT * from child;"
-    [[ "${lines[1]}" = "1,2" ]]
+    [[ "${lines[1]}" = "1,2" ]] || false
 
     run dolt sql -r csv -q "SELECT base_col1, base_pk, our_col1, our_pk, their_col1, their_pk from dolt_conflicts_parent;"
-    [[ "${lines[1]}" = "1,1,2,1,3,1" ]]
+    [[ "${lines[1]}" = "1,1,2,1,3,1" ]] || false
 
     run dolt sql -r csv -q "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_child;"
-    [[ "${lines[1]}" = "foreign key,1,2" ]]
+    [[ "${lines[1]}" = "foreign key,1,2" ]] || false
 }
 
 @test "merge: violated check constraint" {
@@ -900,10 +1058,10 @@ SQL
 
     dolt merge other
     run dolt sql -r csv -q "SELECT * from dolt_constraint_violations";
-    [[ "$output" =~ "t,1" ]]
+    [[ "$output" =~ "t,1" ]] || false
 
     run dolt status
-    [[ ! "$output" =~ "nothing to commit, working tree clean" ]]
+    [[ ! "$output" =~ "nothing to commit, working tree clean" ]] || false
 }
 
 @test "merge: ourRoot renames, theirRoot modifies" {
@@ -918,7 +1076,35 @@ SQL
 
     run dolt merge merge_branch
     log_status_eq 1
-    [[ "$output" =~ "table with same name deleted and modified" ]] || false
+    [[ "$output" =~ "conflict: table with same name deleted and modified" ]] || false
+}
+
+@test "merge: ourRoot renames, theirRoot modifies the schema" {
+    dolt checkout -b merge_branch
+    dolt sql -q "ALTER TABLE test1 DROP COLUMN c2;"
+    dolt commit -am "modify test1"
+
+    dolt checkout main
+    dolt sql -q "ALTER TABLE test1 RENAME TO new_name"
+    dolt add .
+    dolt commit -am "rename test1"
+
+    run dolt merge merge_branch
+    log_status_eq 1
+    [[ "$output" =~ "CONFLICT (schema): Merge conflict in test" ]] || false
+
+    run dolt conflicts cat .
+    [[ "$output" =~ "+------------+-------------------------------------------------------------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+    [[ "$output" =~ "| our_schema | their_schema                                                      | base_schema                                                       | description                                            |" ]] || false
+    [[ "$output" =~ "+------------+-------------------------------------------------------------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+    [[ "$output" =~ '| <deleted>  | CREATE TABLE `test1` (                                            | CREATE TABLE `test1` (                                            | cannot merge a table deletion with schema modification |' ]] || false
+    [[ "$output" =~ '|            |   `pk` int NOT NULL,                                              |   `pk` int NOT NULL,                                              |                                                        |' ]] || false
+    [[ "$output" =~ '|            |   `c1` int,                                                       |   `c1` int,                                                       |                                                        |' ]] || false
+    [[ "$output" =~ '|            |   PRIMARY KEY (`pk`)                                              |   `c2` int,                                                       |                                                        |' ]] || false
+    [[ "$output" =~ '|            | ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin; |   PRIMARY KEY (`pk`)                                              |                                                        |' ]] || false
+    [[ "$output" =~ "|            |                                                                   | ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin; |                                                        |" ]] || false
+    [[ "$output" =~ "+------------+-------------------------------------------------------------------+-------------------------------------------------------------------+--------------------------------------------------------+" ]] || false
+
 }
 
 @test "merge: ourRoot modifies, theirRoot renames" {
@@ -933,7 +1119,23 @@ SQL
 
     run dolt merge merge_branch
     log_status_eq 1
-    [[ "$output" =~ "table with same name deleted and modified" ]] || false
+    [[ "$output" =~ "conflict: table with same name deleted and modified" ]] || false
+}
+
+@test "merge: ourRoot modifies the schema, theirRoot renames" {
+    dolt checkout -b merge_branch
+    dolt sql -q "ALTER TABLE test1 RENAME TO new_name"
+    dolt add .
+    dolt commit -am "rename test1"
+
+    dolt checkout main
+    dolt sql -q "ALTER TABLE test1 DROP COLUMN c2;"
+    dolt commit -am "modify test1"
+
+    run dolt merge merge_branch
+    log_status_eq 1
+    [[ "$output" =~ "cannot create column pk on table new_name" ]] || false
+    [[ "$output" =~ "already used in table test1" ]] || false
 }
 
 @test "merge: dolt merge commits successful non-fast-forward merge" {
@@ -948,7 +1150,7 @@ SQL
     dolt checkout main
     run dolt merge other --no-commit --commit
     log_status_eq 1
-    [[ "$output" =~ "cannot define both 'commit' and 'no-commit' flags at the same time" ]] || false
+    [[ "$output" =~ "Flags '--commit' and '--no-commit' cannot be used together" ]] || false
 
     run dolt merge other --no-commit
     log_status_eq 0
@@ -977,9 +1179,14 @@ SQL
     run dolt sql -q "select * from test1;" -r csv
     [[ ! "$output" =~ "1,2,3" ]] || false
 
-    run dolt merge other --no-ff --no-commit
+    run dolt merge main --no-ff --no-commit
     log_status_eq 0
     [[ "$output" =~ "Automatic merge went well; stopped before committing as requested" ]] || false
+
+    run dolt status
+    [[ "$output" =~ "All conflicts and constraint violations fixed but you are still merging." ]] || false
+    [[ "$output" =~ "Changes to be committed:" ]] || false
+    [[ "$output" =~ "modified:         test1" ]] || false
 
     run dolt log --oneline -n 1
     [[ "$output" =~ "added tables" ]] || false
@@ -987,6 +1194,8 @@ SQL
 
     run dolt commit -m "merge main"
     log_status_eq 0
+    [[ "$output" =~ "Merge: " ]] || false
+    [[ "$output" =~ "merge main" ]] || false
 }
 
 @test "merge: specify ---author for merge that's used for creating commit" {
@@ -1033,4 +1242,121 @@ SQL
     run dolt merge right -m "merge right into main"
     [ $status -eq 0 ]
     [[ "$output" =~ "2 tables changed, 3 rows added(+), 1 rows modified(*), 1 rows deleted(-)" ]] || false
+}
+
+@test "merge: merge with --no-commit prints correct merge stats" {
+    dolt sql -q "CREATE table t (pk int primary key, col1 int);"
+    dolt sql -q "CREATE table t2 (pk int primary key);"
+    dolt sql -q "INSERT INTO t VALUES (1, 1), (2, 2);"
+    dolt commit -Am "add table t"
+
+    dolt checkout -b right
+    dolt sql -q "insert into t values (3, 3), (4, 4);"
+    dolt sql -q "delete from t where pk = 1;"
+    dolt sql -q "update t set col1 = 200 where pk = 2;"
+    dolt sql -q "insert into t2 values (1);"
+    dolt commit -Am "right"
+
+    dolt checkout main
+    dolt sql -q "insert into t values (5, 5);"
+    dolt commit -Am "left"
+
+    run dolt merge right -m "merge right into main" --no-commit
+    [ $status -eq 0 ]
+    [[ "$output" =~ "2 tables changed, 3 rows added(+), 1 rows modified(*), 1 rows deleted(-)" ]] || false
+}
+
+@test "merge: setting DOLT_AUTHOR_DATE" {
+    dolt sql -q "CREATE table t (pk int primary key, col1 int);"
+    dolt sql -q "INSERT INTO t VALUES (1, 1), (2, 2);"
+    dolt commit -Am "add table t"
+
+    dolt checkout -b right
+    dolt sql -q "insert into t values (3, 3), (4, 4);"
+    dolt sql -q "delete from t where pk = 1;"
+    dolt commit -Am "right"
+
+    dolt checkout main
+    dolt sql -q "insert into t values (5, 5);"
+    dolt commit -Am "left"
+
+   
+    TZ=PST+8 DOLT_AUTHOR_DATE='2023-09-26T01:23:45' dolt merge right -m "merge right into main"
+
+    run dolt_log_in_PST
+    [[ "$output" =~ 'Tue Sep 26 01:23:45' ]] || false
+}
+
+@test "merge: setting DOLT_AUTHOR_DATE and DOLT_COMMITTER_DATE" {
+    dolt sql -q "CREATE table t (pk int primary key, col1 int);"
+    dolt sql -q "INSERT INTO t VALUES (1, 1), (2, 2);"
+    dolt commit -Am "add table t"
+
+    dolt remote add local file://./remote
+    dolt push local main
+
+    dolt checkout -b right
+    dolt sql -q "insert into t values (3, 3), (4, 4);"
+    dolt sql -q "delete from t where pk = 1;"
+    dolt commit -Am "right"
+    dolt push local right
+
+    dolt checkout main
+    dolt sql -q "insert into t values (5, 5);"
+    dolt commit -Am "left"
+    dolt push local main
+    
+    # We don't have any way to print the committer time of a commit, so instead we'll do the merge
+    # here and on a clone and assert that they get the same hash
+    TZ=PST+8 DOLT_COMMITTER_DATE='2023-09-26T12:34:56' DOLT_AUTHOR_DATE='2023-09-26T01:23:45' dolt merge right -m "merge right into main"
+
+    run dolt_log_in_PST
+    [[ "$output" =~ 'Tue Sep 26 01:23:45' ]] || false
+
+    head1=`get_head_commit`
+
+    dolt clone file://./remote clone
+    cd clone
+    dolt fetch
+    dolt checkout right
+    dolt checkout main
+
+    TZ=PST+8 DOLT_COMMITTER_DATE='2023-09-26T12:34:56' DOLT_AUTHOR_DATE='2023-09-26T01:23:45' dolt merge right -m "merge right into main"
+
+    run dolt_log_in_PST
+    [[ "$output" =~ 'Tue Sep 26 01:23:45' ]] || false
+
+    head2=`get_head_commit`
+
+    [ "$head1" == "$head2" ]
+}
+
+@test "merge: three-way merge with mergible json fails when --dont_merge_json is set" {
+
+    # Base table has a key length of 2. Left and right will both add a column to
+    # the key, and the keys for all rows will differ in the last column.
+    dolt sql <<SQL
+create table t (pk int primary key, j json);
+insert into t values (1, '{}');
+call dolt_commit('-Am', 'new table');
+call dolt_branch('b1');
+call dolt_branch('b2');
+
+call dolt_checkout('b1');
+update t set j = '{"a": 1}';
+call dolt_commit('-Am', 'added key "a"');
+
+call dolt_checkout('b2');
+update t set j = '{"b": 1}';
+call dolt_commit('-Am', 'added key "b"');
+
+SQL
+
+    dolt checkout b2
+
+    run dolt merge --dont_merge_json b1
+    log_status_eq 1
+
+    run dolt merge b1
+    log_status_eq 0
 }

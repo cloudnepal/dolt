@@ -44,11 +44,11 @@ func (s MergeStatusTable) String() string {
 
 func (s MergeStatusTable) Schema() sql.Schema {
 	return []*sql.Column{
-		{Name: "is_merging", Type: types.Boolean, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: false},
-		{Name: "source", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true},
-		{Name: "source_commit", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true},
-		{Name: "target", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true},
-		{Name: "unmerged_tables", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true},
+		{Name: "is_merging", Type: types.Boolean, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: false, DatabaseSource: s.dbName},
+		{Name: "source", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true, DatabaseSource: s.dbName},
+		{Name: "source_commit", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true, DatabaseSource: s.dbName},
+		{Name: "target", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true, DatabaseSource: s.dbName},
+		{Name: "unmerged_tables", Type: types.Text, Source: doltdb.MergeStatusTableName, PrimaryKey: false, Nullable: true, DatabaseSource: s.dbName},
 	}
 }
 
@@ -88,18 +88,24 @@ type MergeStatusIter struct {
 func newMergeStatusItr(ctx context.Context, ws *doltdb.WorkingSet) (*MergeStatusIter, error) {
 	wr := ws.WorkingRoot()
 
-	inConflict, err := wr.TablesInConflict(ctx)
+	inConflict, err := doltdb.TablesWithDataConflicts(ctx, wr)
 	if err != nil {
 		return nil, err
 	}
 
-	tblsWithViolations, err := wr.TablesWithConstraintViolations(ctx)
+	tblsWithViolations, err := doltdb.TablesWithConstraintViolations(ctx, wr)
 	if err != nil {
 		return nil, err
+	}
+
+	var schConflicts []string
+	if ws.MergeActive() {
+		schConflicts = ws.MergeState().TablesWithSchemaConflicts()
 	}
 
 	unmergedTblNames := set.NewStrSet(inConflict)
 	unmergedTblNames.Add(tblsWithViolations...)
+	unmergedTblNames.Add(schConflicts...)
 
 	var sourceCommitSpecStr *string
 	var sourceCommitHash *string

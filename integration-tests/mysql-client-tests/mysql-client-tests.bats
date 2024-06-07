@@ -53,7 +53,7 @@ teardown() {
 }
 
 @test "node mysql client, hosted workbench stability" {
-    node $BATS_TEST_DIRNAME/node/workbench.js $USER $PORT $REPO_NAME
+    node $BATS_TEST_DIRNAME/node/workbench.js $USER $PORT $REPO_NAME $BATS_TEST_DIRNAME/node/testdata
 }
 
 @test "c mysql connector" {
@@ -98,6 +98,10 @@ cmake ..
 
 @test "ruby ruby/mysql test" {
     ruby $BATS_TEST_DIRNAME/ruby/ruby-mysql-test.rb $USER $PORT $REPO_NAME
+}
+
+@test "ruby mysql2 test" {
+    ruby $BATS_TEST_DIRNAME/ruby/mysql2-test.rb $USER $PORT $REPO_NAME
 }
 
 @test "elixir myxql test" {
@@ -158,4 +162,18 @@ EOF" -m "postgres"
     Rscript $BATS_TEST_DIRNAME/r/rmariadb-test.r $USER $PORT $REPO_NAME
 }
 
+@test "rust mysql client" {
+    cd $BATS_TEST_DIRNAME/rust
+    cargo run --bin mysql_connector_test $USER $PORT $REPO_NAME
+}
+
+@test "php mysqli mysql client" {
+    cd $BATS_TEST_DIRNAME/php
+    php mysqli_connector_test.php $USER $PORT $REPO_NAME
+}
+
+@test "php pdo mysql client" {
+    cd $BATS_TEST_DIRNAME/php
+    php pdo_connector_test.php $USER $PORT $REPO_NAME
+}
 

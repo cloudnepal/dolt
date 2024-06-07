@@ -10,6 +10,9 @@ make_repo() {
 }
 
 setup() {
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "This test tests remote connections directly, SQL_ENGINE is not needed."
+    fi
     setup_no_dolt_init
     make_repo repo1
     mkdir rem1
@@ -46,14 +49,14 @@ teardown() {
     dolt checkout -b other
     start_sql_server repo1
 
-    run dolt sql-client --use-db repo1 -P $PORT -u dolt -q "call dolt_push()"
+    run dolt sql -q "call dolt_push()"
     [ $status -ne 0 ]
-    [[ "$output" =~ "the current branch has no upstream branch" ]] || false
+    [[ "$output" =~ "The current branch other has no upstream branch" ]] || false
 
-    dolt sql-client --use-db repo1 -P $PORT -u dolt -q "call dolt_push('--set-upstream', 'origin', 'other')"
+    dolt sql -q "call dolt_push('--set-upstream', 'origin', 'other')"
 
     skip "In-memory branch doesn't track upstream"
-    dolt sql-client --use-db repo1 -P $PORT -u dolt -q "call dolt_push()"
+    dolt sql -q "call dolt_push()"
 }
 
 @test "remotes-sql-server: push on sql-session commit" {
@@ -63,17 +66,17 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_to_remote remote1
     start_sql_server repo1
 
-    dolt sql-client --use-db repo1 -P $PORT -u dolt -q "CALL DOLT_COMMIT('-am', 'Step 1');"
+    dolt sql -q "CALL DOLT_COMMIT('-am', 'Step 1');"
     stop_sql_server 1 && sleep 0.5
 
     cd ../repo2
     dolt pull remote1
     run dolt sql -q "select * from test" -r csv
     [ "$status" -eq 0 ]
-    [[ "${lines[0]}" =~ "pk" ]]
-    [[ "${lines[1]}" =~ "0" ]]
-    [[ "${lines[2]}" =~ "1" ]]
-    [[ "${lines[3]}" =~ "2" ]]
+    [[ "${lines[0]}" =~ "pk" ]] || false
+    [[ "${lines[1]}" =~ "0" ]] || false
+    [[ "${lines[2]}" =~ "1" ]] || false
+    [[ "${lines[3]}" =~ "2" ]] || false
 }
 
 @test "remotes-sql-server: async push on sql-session commit" {
@@ -86,7 +89,7 @@ teardown() {
 
     start_sql_server repo1
 
-    dolt sql-client --use-db repo1 -P $PORT -u dolt -q "CALL DOLT_COMMIT('-am', 'Step 1');"
+    dolt sql -q "CALL DOLT_COMMIT('-am', 'Step 1');"
 
     # wait for the process to exit after we stop it
     stop_sql_server 1
@@ -96,10 +99,10 @@ teardown() {
     
     run dolt sql -q "select * from test" -r csv
     [ "$status" -eq 0 ]
-    [[ "${lines[0]}" =~ "pk" ]]
-    [[ "${lines[1]}" =~ "0" ]]
-    [[ "${lines[2]}" =~ "1" ]]
-    [[ "${lines[3]}" =~ "2" ]]
+    [[ "${lines[0]}" =~ "pk" ]] || false
+    [[ "${lines[1]}" =~ "0" ]] || false
+    [[ "${lines[2]}" =~ "1" ]] || false
+    [[ "${lines[3]}" =~ "2" ]] || false
 }
 
 @test "remotes-sql-server: pull new commits on read" {
@@ -114,23 +117,27 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
     start_sql_server repo2 && sleep 1
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables" -r csv
+    run dolt sql -q "show tables" --result-format csv
     [ $status -eq 0 ]
     [[ "$output" =~ "Tables_in_repo2" ]] || false
     [[ "$output" =~ "test" ]] || false
 }
 
-@test "remotes-sql-server: pull remote not found error" {
+@test "remotes-sql-server: pull remote not found" {
     skiponwindows "Missing dependencies"
 
     cd repo1
     dolt config --local --add sqlserver.global.dolt_read_replica_remote unknown
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
 
-    run dolt sql-server -P 3333
-    [ "$status" -eq 1 ]
-    [[ ! "$output" =~ "panic" ]]
-    [[ "$output" =~ "remote not found: 'unknown'" ]] || false
+    start_sql_server repo1 ./server-log.txt
+
+    run dolt sql -q "show tables"
+    [ $status -eq 0 ]
+    [[ "$output" =~ "Table" ]] || false
+
+    run grep 'replication disabled' ./server-log.txt
+    [[ "$output" =~ "replication disabled" ]] || false
 }
 
 @test "remotes-sql-server: quiet pull warnings" {
@@ -140,23 +147,30 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_skip_replication_errors 1
     dolt config --local --add sqlserver.global.dolt_read_replica_remote unknown
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
-    start_sql_server repo1
 
-    run dolt sql-client --use-db repo1 -P $PORT -u dolt -q "show tables"
+    start_sql_server repo1 ./server-log.txt
+
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [[ "$output" =~ "Table" ]] || false
+
+    run grep 'failed to load replica database from remote' ./server-log.txt
+    [[ "$output" =~ "failed to load replica database from remote" ]] || false
 }
 
-@test "remotes-sql-server: push remote not found error" {
+@test "remotes-sql-server: push remote not found" {
     skiponwindows "Missing dependencies"
 
     cd repo1
     dolt config --local --add sqlserver.global.dolt_replicate_to_remote unknown
 
-    run dolt sql-server -P 3333
-    [ "$status" -eq 1 ]
-    [[ ! "$output" =~ "panic" ]]
-    [[ "$output" =~ "remote not found: 'unknown'" ]] || false
+    start_sql_server repo1 ./server-log.txt
+
+    run dolt sql -q "show tables"
+    [[ "$output" =~ "Table" ]] || false
+
+    run grep 'replication disabled' ./server-log.txt
+    [[ "$output" =~ "replication disabled" ]] || false
 }
 
 @test "remotes-sql-server: quiet push warnings" {
@@ -167,7 +181,7 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_to_remote unknown
     start_sql_server repo1
 
-    run dolt sql-client --use-db repo1 -P $PORT -u dolt -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [[ "$output" =~ "Tables_in_repo1" ]] || false
     [[ "$output" =~ "test" ]] || false
@@ -186,11 +200,11 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads main,new_feature
     start_sql_server repo2
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "call dolt_checkout('new_feature')"
+    run dolt sql -q "call dolt_checkout('new_feature')"
     [ $status -eq 0 ]
     [[ "$output" =~ "0" ]] || false
     
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "select name from dolt_branches order by name"
+    run dolt sql -q "select name from dolt_branches order by name"
     [ $status -eq 0 ]
     [[ "$output" =~ "name" ]] || false
     [[ "$output" =~ "main" ]] || false
@@ -213,18 +227,18 @@ teardown() {
 
     cd ../repo2
     dolt config --local --add sqlserver.global.dolt_read_replica_remote remote1
-    dolt config --local --add sqlserver.global.dolt_replicate_heads main
+    dolt config --local --add sqlserver.global.dolt_replicate_all_heads 1
     start_sql_server repo2
 
     # No data on main
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [ "$output" = "" ]
 
     # Connecting to heads that exist only on the remote should work fine (they get fetched)
-    dolt sql-client --use-db "repo2/b1" -u dolt -P $PORT -q "show tables" "Tables_in_repo2/b1\ntest"
-    dolt sql-client --use-db repo2 -P $PORT -u dolt -q 'use `repo2/b2`'
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q 'select * from `repo2/b2`.test'
+    dolt --use-db "repo2/b1" sql -q "show tables"
+    dolt sql -q 'use `repo2/b2`'
+    run dolt sql -q 'select * from `repo2/b2`.test'
     [ $status -eq 0 ]
     [[ "$output" =~ "pk" ]] || false
     [[ "$output" =~ " 0 " ]] || false
@@ -232,7 +246,7 @@ teardown() {
     [[ "$output" =~ " 2 " ]] || false
 
     # Remote branch we have never USEd before
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q 'select * from `repo2/b3`.test'
+    run dolt sql -q 'select * from `repo2/b3`.test'
     [ $status -eq 0 ]
     [[ "$output" =~ "pk" ]] || false
     [[ "$output" =~ " 0 " ]] || false
@@ -240,11 +254,11 @@ teardown() {
     [[ "$output" =~ " 2 " ]] || false
     
     # Connecting to heads that don't exist should error out
-    run dolt sql-client --use-db "repo2/notexist" -u dolt -P $PORT -q 'use `repo2/b2`'
+    run dolt --use-db "repo2/notexist" sql -q 'use `repo2/b2`'
     [ $status -ne 0 ]
     [[ $output =~ "database not found" ]] || false
     
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q 'use `repo2/notexist`'
+    run dolt sql -q 'use `repo2/notexist`'
     [ $status -ne 0 ]
     [[ $output =~ "database not found" ]] || false
 }
@@ -261,7 +275,7 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
     start_sql_server repo2
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [[ $output =~ "Tables_in_repo2" ]] || false
     [[ $output =~ "test" ]] || false
@@ -276,7 +290,7 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads unknown
     start_sql_server repo2
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -ne 0 ]
     [[ "$output" =~ "remote not found: 'unknown'" ]] || false    
 }
@@ -290,7 +304,7 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
     start_sql_server repo2
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -ne 0 ]
     [[ "$output" =~ "remote not found: 'unknown'" ]] || false
 }
@@ -308,7 +322,7 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
     start_sql_server repo2
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "SHOW tables"
+    run dolt sql -q "SHOW tables"
     [ $status -eq 0 ]
     [ "$output" = "" ]
 }
@@ -318,7 +332,8 @@ teardown() {
 
     cd repo1
     dolt checkout -b feature-branch
-    dolt commit -am "new commit"
+    dolt sql -q "create table newTable (a int primary key)"
+    dolt commit -Am "new commit"
     dolt push remote1 feature-branch
 
     cd ../repo2
@@ -326,15 +341,13 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
     start_sql_server repo2
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "SHOW tables"
+    run dolt sql -q "SHOW tables"
     [ $status -eq 0 ]
     [ "$output" = "" ]
 
-    # Can't connect to a specific branch with dolt sql-client
-    run dolt sql-client --use-db "repo2/feature-branch" -u dolt -P $PORT -q "SHOW Tables"
+    run dolt --use-db "repo2/feature-branch" sql -q "SHOW Tables"
     [ $status -eq 0 ]
-    [[ $output =~ "feature-branch" ]] || false
-    [[ $output =~ "test" ]] || false
+    [[ $output =~ "newTable" ]] || false
 }
 
 @test "remotes-sql-server: connect to hash works" {
@@ -350,15 +363,15 @@ teardown() {
     dolt config --local --add sqlserver.global.dolt_replicate_heads main
     start_sql_server repo2
 
-    dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    dolt sql -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [[ $output =~ "Tables_in_repo2" ]] || false
     [[ $output =~ "test" ]] || false
     
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "use \`repo2/$head_hash\`"
+    run dolt sql -q "use \`repo2/$head_hash\`"
     [ $status -eq 0 ]
-    [ "$output" = "" ]
+    [ "$output" = "Database changed" ]
 }
 
 @test "remotes-sql-server: connect to tag works" {
@@ -375,15 +388,15 @@ teardown() {
     dolt tag v1
     start_sql_server repo2
 
-    dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    dolt sql -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [[ $output =~ "Tables_in_repo2" ]] || false
     [[ $output =~ "test" ]] || false
 
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "use \`repo2/v1\`"
+    run dolt sql -q "use \`repo2/v1\`"
     [ $status -eq 0 ]
-    [ "$output" = "" ]
+    [ "$output" = "Database changed" ]
 }
 
 @test "remotes-sql-server: connect to remote branch that does not exist locally" {
@@ -407,21 +420,21 @@ teardown() {
     start_sql_server repo2
 
     # No data on main
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [ "$output" = "" ]
 
-    run dolt sql-client --use-db repo2/feature -P $PORT -u dolt -q "select active_branch()"
+    run dolt --use-db repo2/feature sql -q "select active_branch()"
     [ $status -eq 0 ]
     [[ "$output" =~ "feature" ]] || false
     [[ ! "$output" =~ "main" ]] || false
 
-    run dolt sql-client --use-db repo2/feature -P $PORT -u dolt -q "show tables"
+    run dolt --use-db repo2/feature sql -q "show tables"
     [ $status -eq 0 ]
     [[ "$output" =~ "Tables_in_repo2/feature" ]] || false
     [[ "$output" =~ "test" ]] || false
 
-    run dolt branch
+    run dolt -u dolt branch
     [[ "$output" =~ "feature" ]] || false
 }
 
@@ -449,11 +462,11 @@ teardown() {
     dolt branch newbranch
     dolt push remote1 newbranch
 
-    run dolt sql-client --use-db repo2/feature -P $PORT -u dolt -q "select active_branch()"
+    run dolt --use-db repo2/feature --port $PORT --host 0.0.0.0 --no-tls -u dolt sql -q "select active_branch()"
     [ $status -eq 0 ]
     [[ "$output" =~ "feature" ]] || false
 
-    run dolt sql-client --use-db repo2/newbranch -P $PORT -u dolt -q "select active_branch()"
+    run dolt --use-db repo2/newbranch --port $PORT --host 0.0.0.0 --no-tls -u dolt sql -q "select active_branch()"
     [ $status -eq 0 ]
     [[ "$output" =~ "newbranch" ]] || false
 
@@ -482,13 +495,13 @@ teardown() {
     start_sql_server repo2 >> server_log.txt 2>&1
 
     # No data on main
-    run dolt sql-client --use-db repo2 -P $PORT -u dolt -q "show tables"
+    run dolt sql -q "show tables"
     [ $status -eq 0 ]
     [ "$output" = "" ]
 
-    run dolt sql-client --use-db repo2/feature -P $PORT -u dolt -q "select active_branch()"
+    run dolt --use-db repo2/feature sql -q "select active_branch()"
     [ $status -eq 1 ]
-    [[ "$output" =~ "database not found: repo2/feature" ]] || false
+    [[ "$output" =~ "'feature' matched multiple remote tracking branches" ]] || false
 
     run grep "'feature' matched multiple remote tracking branches" server_log.txt
     [ "${#lines[@]}" -ne 0 ]

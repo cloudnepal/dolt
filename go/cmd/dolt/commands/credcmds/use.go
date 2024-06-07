@@ -25,6 +25,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
 )
 
 var useDocs = cli.CommandDocumentationContent{
@@ -68,12 +69,12 @@ func (cmd UseCmd) EventType() eventsapi.ClientEventType {
 }
 
 func (cmd UseCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 1)
 	return ap
 }
 
 // Exec executes the command
-func (cmd UseCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd UseCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, useDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
@@ -95,7 +96,7 @@ func (cmd UseCmd) Exec(ctx context.Context, commandStr string, args []string, dE
 				if !hasGCfg {
 					panic("global config not found.  Should create it here if this is a thing.")
 				}
-				err := gcfg.SetStrings(map[string]string{env.UserCreds: cred.KeyIDBase32Str()})
+				err := gcfg.SetStrings(map[string]string{config.UserCreds: cred.KeyIDBase32Str()})
 				if err != nil {
 					verr = errhand.BuildDError("error: updating user credentials in config").AddCause(err).Build()
 				}

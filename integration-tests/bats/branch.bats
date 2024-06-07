@@ -44,6 +44,8 @@ teardown() {
 @test "branch: moving current working branch takes its working set" {
     dolt sql -q 'create table test (id int primary key);'
     dolt branch -m main new_main
+    run dolt branch --show-current
+    [[ "$output" =~ "new_main" ]] || false
     run dolt sql -q 'show tables'
     [[ "$output" =~ "test" ]] || false
 }
@@ -139,3 +141,162 @@ teardown() {
     [[ ! "$output" =~ "b3" ]] || false
 }
 
+@test "branch: attempting to delete the currently checked out branch results in an error" {
+    run dolt branch -D main
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "Cannot delete checked out branch 'main'" ]] || false
+}
+
+@test "branch: supplying multiple directives results in an error" {
+    run dolt branch -m -c main main2
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "Must specify exactly one of --move/-m, --copy/-c, --delete/-d, -D, --show-current, or --list." ]] || false
+}
+
+@test "branch: -a can only be supplied when listing branches" {
+    dolt branch -a
+
+    dolt branch -a --list main
+
+    dolt branch test
+
+    run dolt branch -a -d test
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--all/-a can only be supplied when listing branches, not when deleting branches" ]] || false
+
+    run dolt branch -a -c copy
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--all/-a can only be supplied when listing branches, not when copying branches" ]] || false
+
+    run dolt branch -a -m main new
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--all/-a can only be supplied when listing branches, not when moving branches" ]] || false
+
+    run dolt branch -a new
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--all/-a can only be supplied when listing branches, not when creating branches" ]] || false
+}
+
+@test "branch: -v can only be supplied when listing branches" {
+    dolt branch -v
+
+    dolt branch -v --list main
+
+    dolt branch test
+
+    run dolt branch -v -d test
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--verbose/-v can only be supplied when listing branches, not when deleting branches" ]] || false
+
+    run dolt branch -v -c copy
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--verbose/-v can only be supplied when listing branches, not when copying branches" ]] || false
+
+    run dolt branch -v -m main new
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--verbose/-v can only be supplied when listing branches, not when moving branches" ]] || false
+
+    run dolt branch -v new
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--verbose/-v can only be supplied when listing branches, not when creating branches" ]] || false
+}
+
+@test "branch: -r can only be supplied when listing or deleting branches" {
+    dolt branch -r
+
+    dolt branch -r --list main
+
+    dolt branch test
+
+    run dolt branch -r -c copy
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--remote/-r can only be supplied when listing or deleting branches, not when copying branches" ]] || false
+
+    run dolt branch -r -m main new
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--remote/-r can only be supplied when listing or deleting branches, not when moving branches" ]] || false
+
+    run dolt branch -r new
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "--remote/-r can only be supplied when listing or deleting branches, not when creating branches" ]] || false
+}
+
+@test "branch: -- escapes arg parsing" {
+    # use -- to turn off arg parsing for the remaining arguments and treat
+    # them all as position arguments
+    dolt branch -- -b
+
+    # verify that the '-b' branch was created successfully
+    run dolt sql -r csv -q "select count(*) from dolt_branches where name='-b';"
+    [ $status -eq 0 ]
+    [[ $output =~ "1" ]] || false
+
+    # verify that we can use -- to delete the -b branch
+    dolt branch -d -f  -- -b
+    run dolt sql -r csv -q "select count(*) from dolt_branches where name='-b';"
+    [ $status -eq 0 ]
+    [[ $output =~ "0" ]] || false
+}
+
+@test "branch: print nothing on successfull create" {
+    run dolt branch newbranch1 HEAD
+    [ $status -eq "0" ]
+    [[ $output == "" ]] || false
+
+    # Get the current commit - bare.
+    run dolt merge-base HEAD HEAD
+    [ $status -eq "0" ]
+    hash="$output"
+   
+    run dolt branch newbranch2 $hash
+    [ $status -eq "0" ]
+    [[ $output == "" ]] || false
+}
+
+@test "branch: don't allow branch creation with HEAD or a commit id as a name" {
+    # Get the current commit - bare.
+    run dolt merge-base HEAD HEAD
+    [ $status -eq "0" ]
+    hash="$output"
+
+    run dolt branch HEAD $hash
+    [ $status -eq "1" ]
+    [[ "$output" == "HEAD is an invalid branch name" ]] || false
+
+    run dolt branch $hash HEAD
+    [ $status -eq "1" ]
+    [[ "$output" =~ "is an invalid branch name" ]] || false
+    [[ ! "$output" =~ "HEAD" ]] || false
+
+    dolt branch altBranch HEAD
+
+    run dolt branch -m altBranch HEAD
+    [ $status -eq "1" ]
+    [[ "$output" == "HEAD is an invalid branch name" ]] || false
+    run dolt branch -m altBranch $hash
+    [ $status -eq "1" ]
+    [[ "$output" =~ "is an invalid branch name" ]] || false
+
+    run dolt branch -c altBranch HEAD
+    [ $status -eq "1" ]
+    [[ "$output" == "HEAD is an invalid branch name" ]] || false
+    run dolt branch -c altBranch $hash
+    [ $status -eq "1" ]
+    [[ "$output" =~ "is an invalid branch name" ]] || false
+
+    dolt checkout altBranch
+
+    run dolt branch -m HEAD
+    [ $status -eq "1" ]
+    [[ "$output" == "HEAD is an invalid branch name" ]] || false
+    run dolt branch -m $hash
+    [ $status -eq "1" ]
+    [[ "$output" =~ "is an invalid branch name" ]] || false
+
+    run dolt branch -c HEAD
+    [ $status -eq "1" ]
+    [[ "$output" == "HEAD is an invalid branch name" ]] || false
+    run dolt branch -c $hash
+    [ $status -eq "1" ]
+    [[ "$output" =~ "is an invalid branch name" ]] || false
+}

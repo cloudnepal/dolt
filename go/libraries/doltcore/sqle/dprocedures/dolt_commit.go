@@ -20,63 +20,84 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
-	"github.com/dolthub/vitess/go/vt/proto/query"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/store/datas"
 )
-
-var hashType = types.MustCreateString(query.Type_TEXT, 32, sql.Collation_ascii_bin)
 
 // doltCommit is the stored procedure version for the CLI command `dolt commit`.
 func doltCommit(ctx *sql.Context, args ...string) (sql.RowIter, error) {
-	res, err := doDoltCommit(ctx, args)
+	commitHash, skipped, err := doDoltCommit(ctx, args)
 	if err != nil {
 		return nil, err
 	}
-	return rowToIter(res), nil
+	if skipped {
+		return nil, nil
+	}
+	return rowToIter(commitHash), nil
 }
 
 // doltCommitHashOut is the stored procedure version for the CLI function `commit`. The first parameter is the variable
 // to set the hash of.
 func doltCommitHashOut(ctx *sql.Context, outHash *string, args ...string) (sql.RowIter, error) {
-	res, err := doDoltCommit(ctx, args)
+	commitHash, skipped, err := doDoltCommit(ctx, args)
 	if err != nil {
 		return nil, err
 	}
-	*outHash = res
-	return rowToIter(res), nil
+	if skipped {
+		return nil, nil
+	}
+
+	*outHash = commitHash
+	return rowToIter(commitHash), nil
 }
 
-func doDoltCommit(ctx *sql.Context, args []string) (string, error) {
+// doDoltCommit creates a dolt commit using the specified command line |args| provided. The response is the commit hash
+// of the new commit (or the empty string if the commit was skipped), a boolean that indicates if creating the commit
+// was skipped (e.g. due to --skip-empty), and an error describing any error encountered.
+func doDoltCommit(ctx *sql.Context, args []string) (string, bool, error) {
 	if err := branch_control.CheckAccess(ctx, branch_control.Permissions_Write); err != nil {
-		return "", err
+		return "", false, err
 	}
 	// Get the information for the sql context.
 	dbName := ctx.GetCurrentDatabase()
 
 	apr, err := cli.CreateCommitArgParser().Parse(args)
 	if err != nil {
-		return "", err
+		return "", false, err
+	}
+
+	if err := cli.VerifyCommitArgs(apr); err != nil {
+		return "", false, err
 	}
 
 	dSess := dsess.DSessFromSess(ctx.Session)
 	roots, ok := dSess.GetRoots(ctx, dbName)
 	if !ok {
-		return "", fmt.Errorf("Could not load database %s", dbName)
+		return "", false, fmt.Errorf("Could not load database %s", dbName)
 	}
 
 	if apr.Contains(cli.UpperCaseAllFlag) {
-		roots, err = actions.StageAllTables(ctx, roots)
+		roots, err = actions.StageAllTables(ctx, roots, true)
 		if err != nil {
-			return "", fmt.Errorf(err.Error())
+			return "", false, fmt.Errorf(err.Error())
+		}
+		roots, err = actions.StageDatabase(ctx, roots)
+		if err != nil {
+			return "", false, fmt.Errorf(err.Error())
 		}
 	} else if apr.Contains(cli.AllFlag) {
 		roots, err = actions.StageModifiedAndDeletedTables(ctx, roots)
 		if err != nil {
-			return "", fmt.Errorf(err.Error())
+			return "", false, fmt.Errorf(err.Error())
+		}
+		roots, err = actions.StageDatabase(ctx, roots)
+		if err != nil {
+			return "", false, fmt.Errorf(err.Error())
 		}
 	}
 
@@ -84,11 +105,13 @@ func doDoltCommit(ctx *sql.Context, args []string) (string, error) {
 	if authorStr, ok := apr.GetValue(cli.AuthorParam); ok {
 		name, email, err = cli.ParseAuthor(authorStr)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 	} else {
-		name = dSess.Username()
-		email = dSess.Email()
+		// In SQL mode, use the current SQL user as the commit author, instead of the `dolt config` configured values.
+		// We won't have an email address for the SQL user though, so instead use the MySQL user@address notation.
+		name = ctx.Client().User
+		email = fmt.Sprintf("%s@%s", ctx.Client().User, ctx.Client().Address)
 	}
 
 	amend := apr.Contains(cli.AmendFlag)
@@ -98,25 +121,34 @@ func doDoltCommit(ctx *sql.Context, args []string) (string, error) {
 		if amend {
 			commit, err := dSess.GetHeadCommit(ctx, dbName)
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			commitMeta, err := commit.GetCommitMeta(ctx)
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			msg = commitMeta.Description
 		} else {
-			return "", fmt.Errorf("Must provide commit message.")
+			return "", false, fmt.Errorf("Must provide commit message.")
 		}
 	}
 
 	t := ctx.QueryTime()
 	if commitTimeStr, ok := apr.GetValue(cli.DateParam); ok {
 		var err error
-		t, err = cli.ParseDate(commitTimeStr)
+		t, err = dconfig.ParseDate(commitTimeStr)
 
 		if err != nil {
-			return "", fmt.Errorf(err.Error())
+			return "", false, fmt.Errorf(err.Error())
+		}
+	} else if datas.CustomAuthorDate {
+		t = datas.AuthorDate()
+	}
+
+	if apr.Contains(cli.ForceFlag) {
+		err = ctx.SetSessionVariable(ctx, "dolt_force_transaction_commit", 1)
+		if err != nil {
+			return "", false, fmt.Errorf(err.Error())
 		}
 	}
 
@@ -124,31 +156,34 @@ func doDoltCommit(ctx *sql.Context, args []string) (string, error) {
 		Message:    msg,
 		Date:       t,
 		AllowEmpty: apr.Contains(cli.AllowEmptyFlag),
+		SkipEmpty:  apr.Contains(cli.SkipEmptyFlag),
 		Amend:      amend,
 		Force:      apr.Contains(cli.ForceFlag),
 		Name:       name,
 		Email:      email,
 	})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	// Nothing to commit, and we didn't pass --allowEmpty
-	if pendingCommit == nil {
-		return "", errors.New("nothing to commit")
+	if pendingCommit == nil && apr.Contains(cli.SkipEmptyFlag) {
+		return "", true, nil
+	} else if pendingCommit == nil {
+		return "", false, errors.New("nothing to commit")
 	}
 
 	newCommit, err := dSess.DoltCommit(ctx, dbName, dSess.GetTransaction(), pendingCommit)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	h, err := newCommit.HashOf()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
-	return h.String(), nil
+	return h.String(), false, nil
 }
 
 func getDoltArgs(ctx *sql.Context, row sql.Row, children []sql.Expression) ([]string, error) {
@@ -160,7 +195,7 @@ func getDoltArgs(ctx *sql.Context, row sql.Row, children []sql.Expression) ([]st
 			return nil, err
 		}
 
-		text, err := types.Text.Convert(childVal)
+		text, _, err := types.Text.Convert(childVal)
 
 		if err != nil {
 			return nil, err

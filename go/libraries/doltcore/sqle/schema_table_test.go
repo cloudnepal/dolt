@@ -27,32 +27,25 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dtestutils"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/json"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
 )
 
 func TestSchemaTableMigrationOriginal(t *testing.T) {
-	ctx := NewTestSQLCtx(context.Background())
 	dEnv := dtestutils.CreateTestEnv()
 	tmpDir, err := dEnv.TempTableFilesDir()
 	require.NoError(t, err)
 	opts := editor.Options{Deaf: dEnv.DbEaFactory(), Tempdir: tmpDir}
-	db, err := NewDatabase(ctx, "dolt", dEnv.DbData(), opts)
+	db, err := NewDatabase(context.Background(), "dolt", dEnv.DbData(), opts)
 	require.NoError(t, err)
 
-	dbState, err := getDbState(db, dEnv)
+	_, ctx, err := NewTestEngine(dEnv, context.Background(), db)
 	require.NoError(t, err)
 
-	err = dsess.DSessFromSess(ctx.Session).AddDB(ctx, dbState)
-	require.NoError(t, err)
-	ctx.SetCurrentDatabase(db.Name())
-
-	err = db.createSqlTable(ctx, doltdb.SchemasTableName, sql.NewPrimaryKeySchema(sql.Schema{ // original schema of dolt_schemas table
+	err = db.createSqlTable(ctx, doltdb.SchemasTableName, "", sql.NewPrimaryKeySchema(sql.Schema{ // original schema of dolt_schemas table
 		{Name: doltdb.SchemasTablesTypeCol, Type: gmstypes.Text, Source: doltdb.SchemasTableName, PrimaryKey: true},
 		{Name: doltdb.SchemasTablesNameCol, Type: gmstypes.Text, Source: doltdb.SchemasTableName, PrimaryKey: true},
 		{Name: doltdb.SchemasTablesFragmentCol, Type: gmstypes.Text, Source: doltdb.SchemasTableName, PrimaryKey: false},
-	}), sql.Collation_Default)
+	}), sql.Collation_Default, "")
 	require.NoError(t, err)
 
 	sqlTbl, found, err := db.GetTableInsensitive(ctx, doltdb.SchemasTableName)
@@ -86,37 +79,32 @@ func TestSchemaTableMigrationOriginal(t *testing.T) {
 
 	require.NoError(t, iter.Close(ctx))
 	expectedRows := []sql.Row{
-		{"view", "view1", "SELECT v1 FROM test;", nil},
-		{"view", "view2", "SELECT v2 FROM test;", nil},
+		{"view", "view1", "SELECT v1 FROM test;", nil, nil},
+		{"view", "view2", "SELECT v2 FROM test;", nil, nil},
 	}
 
 	assert.Equal(t, expectedRows, rows)
 }
 
 func TestSchemaTableMigrationV1(t *testing.T) {
-	ctx := NewTestSQLCtx(context.Background())
 	dEnv := dtestutils.CreateTestEnv()
 	tmpDir, err := dEnv.TempTableFilesDir()
 	require.NoError(t, err)
 	opts := editor.Options{Deaf: dEnv.DbEaFactory(), Tempdir: tmpDir}
-	db, err := NewDatabase(ctx, "dolt", dEnv.DbData(), opts)
+	db, err := NewDatabase(context.Background(), "dolt", dEnv.DbData(), opts)
 	require.NoError(t, err)
 
-	dbState, err := getDbState(db, dEnv)
+	_, ctx, err := NewTestEngine(dEnv, context.Background(), db)
 	require.NoError(t, err)
-
-	err = dsess.DSessFromSess(ctx.Session).AddDB(ctx, dbState)
-	require.NoError(t, err)
-	ctx.SetCurrentDatabase(db.Name())
 
 	// original schema of dolt_schemas table with the ID column
-	err = db.createSqlTable(ctx, doltdb.SchemasTableName, sql.NewPrimaryKeySchema(sql.Schema{
+	err = db.createSqlTable(ctx, doltdb.SchemasTableName, "", sql.NewPrimaryKeySchema(sql.Schema{
 		{Name: doltdb.SchemasTablesTypeCol, Type: gmstypes.Text, Source: doltdb.SchemasTableName, PrimaryKey: false},
 		{Name: doltdb.SchemasTablesNameCol, Type: gmstypes.Text, Source: doltdb.SchemasTableName, PrimaryKey: false},
 		{Name: doltdb.SchemasTablesFragmentCol, Type: gmstypes.Text, Source: doltdb.SchemasTableName, PrimaryKey: false},
 		{Name: doltdb.SchemasTablesIdCol, Type: gmstypes.Int64, Source: doltdb.SchemasTableName, PrimaryKey: true},
 		{Name: doltdb.SchemasTablesExtraCol, Type: gmstypes.JsonType{}, Source: doltdb.SchemasTableName, PrimaryKey: false, Nullable: true},
-	}), sql.Collation_Default)
+	}), sql.Collation_Default, "")
 	require.NoError(t, err)
 
 	sqlTbl, found, err := db.GetTableInsensitive(ctx, doltdb.SchemasTableName)
@@ -148,16 +136,9 @@ func TestSchemaTableMigrationV1(t *testing.T) {
 		require.NoError(t, err)
 		// convert the JSONDocument to a string for comparison
 		if row[3] != nil {
-			// Annoying difference in representation between storage versions here
-			jsonDoc, ok := row[3].(gmstypes.JSONDocument)
+			jsonDoc, ok := row[3].(sql.JSONWrapper)
 			if ok {
-				row[3], err = jsonDoc.ToString(nil)
-				row[3] = strings.ReplaceAll(row[3].(string), " ", "") // remove spaces
-			}
-
-			nomsJson, ok := row[3].(json.NomsJSON)
-			if ok {
-				row[3], err = nomsJson.ToString(ctx)
+				row[3], err = gmstypes.StringifyJSON(jsonDoc)
 				row[3] = strings.ReplaceAll(row[3].(string), " ", "") // remove spaces
 			}
 
@@ -170,8 +151,8 @@ func TestSchemaTableMigrationV1(t *testing.T) {
 	require.NoError(t, iter.Close(ctx))
 
 	expectedRows := []sql.Row{
-		{"view", "view1", "SELECT v1 FROM test;", `{"extra":"data"}`},
-		{"view", "view2", "SELECT v2 FROM test;", nil},
+		{"view", "view1", "SELECT v1 FROM test;", `{"extra":"data"}`, nil},
+		{"view", "view2", "SELECT v2 FROM test;", nil, nil},
 	}
 
 	assert.Equal(t, expectedRows, rows)

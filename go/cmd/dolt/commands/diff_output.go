@@ -17,6 +17,7 @@ package commands
 import (
 	"context"
 	ejson "encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -26,32 +27,34 @@ import (
 	"github.com/fatih/color"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
-	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
-	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlfmt"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/typed/json"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/untyped/sqlexport"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/untyped/tabular"
 	"github.com/dolthub/dolt/go/libraries/utils/iohelp"
-	"github.com/dolthub/dolt/go/store/atomicerr"
 )
 
 // diffWriter is an interface that lets us write diffs in a variety of output formats
 type diffWriter interface {
 	// BeginTable is called when a new table is about to be written, before any schema or row diffs are written
-	BeginTable(ctx context.Context, td diff.TableDelta) error
+	BeginTable(fromTableName, toTableName string, isAdd, isDrop bool) error
 	// WriteTableSchemaDiff is called to write a schema diff for the table given (if requested by args)
-	WriteTableSchemaDiff(ctx context.Context, toRoot *doltdb.RootValue, td diff.TableDelta) error
+	WriteTableSchemaDiff(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary) error
+	// WriteEventDiff is called to write an event diff
+	WriteEventDiff(ctx context.Context, eventName, oldDefn, newDefn string) error
 	// WriteTriggerDiff is called to write a trigger diff
 	WriteTriggerDiff(ctx context.Context, triggerName, oldDefn, newDefn string) error
 	// WriteViewDiff is called to write a view diff
 	WriteViewDiff(ctx context.Context, viewName, oldDefn, newDefn string) error
+	// WriteTableDiffStats is called to write the diff stats for the table given
+	WriteTableDiffStats(diffStats []diffStatistics, oldColLen, newColLen int, areTablesKeyless bool) error
 	// RowWriter returns a row writer for the table delta provided, which will have Close() called on it when rows are
 	// done being written.
-	RowWriter(ctx context.Context, td diff.TableDelta, unionSch sql.Schema) (diff.SqlRowDiffWriter, error)
+	RowWriter(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary, unionSch sql.Schema) (diff.SqlRowDiffWriter, error)
 	// Close finalizes the work of the writer
 	Close(ctx context.Context) error
 }
@@ -70,69 +73,113 @@ func newDiffWriter(diffOutput diffOutput) (diffWriter, error) {
 	}
 }
 
-func printDiffStat(ctx context.Context, td diff.TableDelta, oldColLen, newColLen int) errhand.VerboseError {
-	// todo: use errgroup.Group
-	ae := atomicerr.New()
-	ch := make(chan diff.DiffStatProgress)
-	go func() {
-		defer close(ch)
-		err := diff.StatForTableDelta(ctx, ch, td)
+func pluralize(singular, plural string, n uint64) string {
+	var noun string
+	if n != 1 {
+		noun = plural
+	} else {
+		noun = singular
+	}
+	return fmt.Sprintf("%s %s", humanize.Comma(int64(n)), noun)
+}
 
-		ae.SetIfError(err)
-	}()
+type tabularDiffWriter struct{}
 
+var _ diffWriter = (*tabularDiffWriter)(nil)
+
+func (t tabularDiffWriter) Close(ctx context.Context) error {
+	return nil
+}
+
+func (t tabularDiffWriter) BeginTable(fromTableName, toTableName string, isAdd, isDrop bool) error {
+	bold := color.New(color.Bold)
+	if isDrop {
+		_, _ = bold.Printf("diff --dolt a/%s b/%s\n", fromTableName, fromTableName)
+		_, _ = bold.Println("deleted table")
+	} else if isAdd {
+		_, _ = bold.Printf("diff --dolt a/%s b/%s\n", toTableName, toTableName)
+		_, _ = bold.Println("added table")
+	} else {
+		_, _ = bold.Printf("diff --dolt a/%s b/%s\n", fromTableName, toTableName)
+		_, _ = bold.Printf("--- a/%s\n", fromTableName)
+		_, _ = bold.Printf("+++ b/%s\n", toTableName)
+	}
+	return nil
+}
+
+func (t tabularDiffWriter) WriteTableSchemaDiff(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary) error {
+	var fromCreateStmt = ""
+	if fromTableInfo != nil {
+		fromCreateStmt = fromTableInfo.CreateStmt
+	}
+
+	var toCreateStmt = ""
+	if toTableInfo != nil {
+		toCreateStmt = toTableInfo.CreateStmt
+	}
+
+	if fromCreateStmt != toCreateStmt {
+		cli.Println(textdiff.LineDiff(fromCreateStmt, toCreateStmt))
+	}
+
+	return nil
+}
+
+func (t tabularDiffWriter) WriteEventDiff(ctx context.Context, eventName, oldDefn, newDefn string) error {
+	// identical implementation
+	return t.WriteViewDiff(ctx, eventName, oldDefn, newDefn)
+}
+
+func (t tabularDiffWriter) WriteTriggerDiff(ctx context.Context, triggerName, oldDefn, newDefn string) error {
+	// identical implementation
+	return t.WriteViewDiff(ctx, triggerName, oldDefn, newDefn)
+}
+
+func (t tabularDiffWriter) WriteViewDiff(ctx context.Context, viewName, oldDefn, newDefn string) error {
+	diffString := textdiff.LineDiff(oldDefn, newDefn)
+	cli.Println(diffString)
+	return nil
+}
+
+func (t tabularDiffWriter) WriteTableDiffStats(diffStats []diffStatistics, oldColLen, newColLen int, areTablesKeyless bool) error {
 	acc := diff.DiffStatProgress{}
-	var count int64
-	var pos int
 	eP := cli.NewEphemeralPrinter()
-	for p := range ch {
-		if ae.IsSet() {
-			break
-		}
+	var pos int
+	for i, diffStat := range diffStats {
+		acc.Adds += diffStat.RowsAdded
+		acc.Removes += diffStat.RowsDeleted
+		acc.Changes += diffStat.RowsModified
+		acc.CellChanges += diffStat.CellsModified
+		acc.NewRowSize += diffStat.NewRowCount
+		acc.OldRowSize += diffStat.OldRowCount
+		acc.NewCellSize += diffStat.NewCellCount
+		acc.OldCellSize += diffStat.OldCellCount
 
-		acc.Adds += p.Adds
-		acc.Removes += p.Removes
-		acc.Changes += p.Changes
-		acc.CellChanges += p.CellChanges
-		acc.NewRowSize += p.NewRowSize
-		acc.OldRowSize += p.OldRowSize
-		acc.NewCellSize += p.NewCellSize
-		acc.OldCellSize += p.OldCellSize
-
-		if count%10000 == 0 {
-			eP.Printf("prev size: %d, new size: %d, adds: %d, deletes: %d, modifications: %d\n", acc.OldRowSize, acc.NewRowSize, acc.Adds, acc.Removes, acc.Changes)
+		if i != 0 && i%10000 == 0 {
+			msg := fmt.Sprintf("prev size: %d, new size: %d, adds: %d, deletes: %d, modifications: %d\n", acc.OldRowSize, acc.NewRowSize, acc.Adds, acc.Removes, acc.Changes)
+			eP.Printf(msg)
 			eP.Display()
+			pos += len(msg)
 		}
-
-		count++
 	}
 
-	pos = cli.DeleteAndPrint(pos, "")
-
-	if err := ae.Get(); err != nil {
-		return errhand.BuildDError("").AddCause(err).Build()
-	}
-
-	keyless, err := td.IsKeyless(ctx)
-	if err != nil {
-		return errhand.BuildDError("").AddCause(err).Build()
-	}
+	cli.DeleteAndPrint(pos, "")
 
 	if (acc.Adds+acc.Removes+acc.Changes) == 0 && (acc.OldCellSize-acc.NewCellSize) == 0 {
 		cli.Println("No data changes. See schema changes by using -s or --schema.")
 		return nil
 	}
 
-	if keyless {
-		printKeylessStat(acc)
+	if areTablesKeyless {
+		t.printKeylessStat(acc)
 	} else {
-		printStat(acc, oldColLen, newColLen)
+		t.printStat(acc, oldColLen, newColLen)
 	}
 
 	return nil
 }
 
-func printStat(acc diff.DiffStatProgress, oldColLen, newColLen int) {
+func (t tabularDiffWriter) printStat(acc diff.DiffStatProgress, oldColLen, newColLen int) {
 	numCellInserts, numCellDeletes := sqle.GetCellsAddedAndDeleted(acc, newColLen)
 	rowsUnmodified := uint64(acc.OldRowSize - acc.Changes - acc.Removes)
 	unmodified := pluralize("Row Unmodified", "Rows Unmodified", rowsUnmodified)
@@ -166,7 +213,7 @@ func printStat(acc diff.DiffStatProgress, oldColLen, newColLen int) {
 	cli.Printf("(%s vs %s)\n\n", oldValues, newValues)
 }
 
-func printKeylessStat(acc diff.DiffStatProgress) {
+func (t tabularDiffWriter) printKeylessStat(acc diff.DiffStatProgress) {
 	insertions := pluralize("Row Added", "Rows Added", acc.Adds)
 	deletions := pluralize("Row Deleted", "Rows Deleted", acc.Removes)
 
@@ -174,115 +221,7 @@ func printKeylessStat(acc diff.DiffStatProgress) {
 	cli.Printf("%s\n", deletions)
 }
 
-func pluralize(singular, plural string, n uint64) string {
-	var noun string
-	if n != 1 {
-		noun = plural
-	} else {
-		noun = singular
-	}
-	return fmt.Sprintf("%s %s", humanize.Comma(int64(n)), noun)
-}
-
-type tabularDiffWriter struct{}
-
-var _ diffWriter = (*tabularDiffWriter)(nil)
-
-func (t tabularDiffWriter) Close(ctx context.Context) error {
-	return nil
-}
-
-func (t tabularDiffWriter) BeginTable(ctx context.Context, td diff.TableDelta) error {
-	bold := color.New(color.Bold)
-	if td.IsDrop() {
-		_, _ = bold.Printf("diff --dolt a/%s b/%s\n", td.FromName, td.FromName)
-		_, _ = bold.Println("deleted table")
-	} else if td.IsAdd() {
-		_, _ = bold.Printf("diff --dolt a/%s b/%s\n", td.ToName, td.ToName)
-		_, _ = bold.Println("added table")
-	} else {
-		_, _ = bold.Printf("diff --dolt a/%s b/%s\n", td.FromName, td.ToName)
-		h1, err := td.FromTable.HashOf()
-
-		if err != nil {
-			panic(err)
-		}
-
-		_, _ = bold.Printf("--- a/%s @ %s\n", td.FromName, h1.String())
-
-		h2, err := td.ToTable.HashOf()
-
-		if err != nil {
-			panic(err)
-		}
-
-		_, _ = bold.Printf("+++ b/%s @ %s\n", td.ToName, h2.String())
-	}
-	return nil
-}
-
-func (t tabularDiffWriter) WriteTableSchemaDiff(ctx context.Context, toRoot *doltdb.RootValue, td diff.TableDelta) error {
-	fromSch, toSch, err := td.GetSchemas(ctx)
-	if err != nil {
-		return errhand.BuildDError("cannot retrieve schema for table %s", td.ToName).AddCause(err).Build()
-	}
-
-	var fromCreateStmt = ""
-	if td.FromTable != nil {
-		// TODO: use UserSpaceDatabase for these, no reason for this separate database implementation
-		sqlDb := sqle.NewSingleTableDatabase(td.FromName, fromSch, td.FromFks, td.FromFksParentSch)
-		sqlCtx, engine, _ := sqle.PrepareCreateTableStmt(ctx, sqlDb)
-		fromCreateStmt, err = sqle.GetCreateTableStmt(sqlCtx, engine, td.FromName)
-		if err != nil {
-			return errhand.VerboseErrorFromError(err)
-		}
-	}
-
-	var toCreateStmt = ""
-	if td.ToTable != nil {
-		sqlDb := sqle.NewSingleTableDatabase(td.ToName, toSch, td.ToFks, td.ToFksParentSch)
-		sqlCtx, engine, _ := sqle.PrepareCreateTableStmt(ctx, sqlDb)
-		toCreateStmt, err = sqle.GetCreateTableStmt(sqlCtx, engine, td.ToName)
-		if err != nil {
-			return errhand.VerboseErrorFromError(err)
-		}
-	}
-
-	if fromCreateStmt != toCreateStmt {
-		cli.Println(textdiff.LineDiff(fromCreateStmt, toCreateStmt))
-	}
-
-	resolvedFromFks := map[string]struct{}{}
-	for _, fk := range td.FromFks {
-		if len(fk.ReferencedTableColumns) > 0 {
-			resolvedFromFks[fk.Name] = struct{}{}
-		}
-	}
-
-	for _, fk := range td.ToFks {
-		if _, ok := resolvedFromFks[fk.Name]; ok {
-			continue
-		}
-		if len(fk.ReferencedTableColumns) > 0 {
-			cli.Println(fmt.Sprintf("resolved foreign key `%s` on table `%s`", fk.Name, fk.TableName))
-		}
-	}
-
-	return nil
-}
-
-func (t tabularDiffWriter) WriteTriggerDiff(ctx context.Context, triggerName, oldDefn, newDefn string) error {
-	// identical implementation
-	return t.WriteViewDiff(ctx, triggerName, oldDefn, newDefn)
-}
-
-func (t tabularDiffWriter) WriteViewDiff(ctx context.Context, viewName, oldDefn, newDefn string) error {
-	diffString := textdiff.LineDiff(oldDefn, newDefn)
-	cli.Println(diffString)
-	return nil
-}
-
-func (t tabularDiffWriter) RowWriter(ctx context.Context, td diff.TableDelta, unionSch sql.Schema) (diff.SqlRowDiffWriter, error) {
+func (t tabularDiffWriter) RowWriter(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary, unionSch sql.Schema) (diff.SqlRowDiffWriter, error) {
 	return tabular.NewFixedWidthDiffTableWriter(unionSch, iohelp.NopWrCloser(cli.CliOut), 100), nil
 }
 
@@ -294,23 +233,36 @@ func (s sqlDiffWriter) Close(ctx context.Context) error {
 	return nil
 }
 
-func (s sqlDiffWriter) BeginTable(ctx context.Context, td diff.TableDelta) error {
+func (s sqlDiffWriter) BeginTable(fromTableName, toTableName string, isAdd, isDrop bool) error {
 	return nil
 }
 
-func (s sqlDiffWriter) WriteTableSchemaDiff(ctx context.Context, toRoot *doltdb.RootValue, td diff.TableDelta) error {
-	toSchemas, err := toRoot.GetAllSchemas(ctx)
-	if err != nil {
-		return errhand.BuildDError("could not read schemas from toRoot").AddCause(err).Build()
+func (s sqlDiffWriter) WriteTableSchemaDiff(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary) error {
+	stmts := tds.AlterStmts
+	if tds.IsAdd() {
+		stmts = []string{toTableInfo.CreateStmt}
+	} else if tds.IsDrop() {
+		stmts = []string{sqlfmt.DropTableStmt(fromTableInfo.Name)}
 	}
-
-	ddlStatements, err := diff.SqlSchemaDiff(ctx, td, toSchemas)
-	if err != nil {
-		return errhand.VerboseErrorFromError(err)
-	}
-
-	for _, stmt := range ddlStatements {
+	for _, stmt := range stmts {
+		if len(stmt) == 0 {
+			continue
+		}
 		cli.Println(stmt)
+	}
+
+	return nil
+}
+
+func (s sqlDiffWriter) WriteEventDiff(ctx context.Context, eventName, oldDefn, newDefn string) error {
+	// definitions will already be semicolon terminated, no need to add additional ones
+	if oldDefn == "" {
+		cli.Println(newDefn)
+	} else if newDefn == "" {
+		cli.Println(fmt.Sprintf("DROP EVENT %s;", sql.QuoteIdentifier(eventName)))
+	} else {
+		cli.Println(fmt.Sprintf("DROP EVENT %s;", sql.QuoteIdentifier(eventName)))
+		cli.Println(newDefn)
 	}
 
 	return nil
@@ -344,22 +296,30 @@ func (s sqlDiffWriter) WriteViewDiff(ctx context.Context, viewName, oldDefn, new
 	return nil
 }
 
-func (s sqlDiffWriter) RowWriter(ctx context.Context, td diff.TableDelta, unionSch sql.Schema) (diff.SqlRowDiffWriter, error) {
-	targetSch := td.ToSch
+func (s sqlDiffWriter) WriteTableDiffStats(diffStats []diffStatistics, oldColLen, newColLen int, areTablesKeyless bool) error {
+	// TODO: implement this
+	return errors.New("diff stats are not supported for sql output")
+}
+
+func (s sqlDiffWriter) RowWriter(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary, unionSch sql.Schema) (diff.SqlRowDiffWriter, error) {
+	var targetSch schema.Schema
+	if toTableInfo != nil {
+		targetSch = toTableInfo.Sch
+	}
 	if targetSch == nil {
-		targetSch = td.FromSch
+		targetSch = fromTableInfo.Sch
 	}
 
-	return sqlexport.NewSqlDiffWriter(td.ToName, targetSch, iohelp.NopWrCloser(cli.CliOut)), nil
+	// TOOD: schema names
+	return sqlexport.NewSqlDiffWriter(tds.ToTableName.Name, targetSch, iohelp.NopWrCloser(cli.CliOut)), nil
 }
 
 type jsonDiffWriter struct {
-	wr               io.WriteCloser
-	schemaDiffWriter diff.SchemaDiffWriter
-	rowDiffWriter    diff.SqlRowDiffWriter
-	tablesWritten    int
-	triggersWritten  int
-	viewsWritten     int
+	wr              io.WriteCloser
+	tablesWritten   int
+	triggersWritten int
+	viewsWritten    int
+	eventsWritten   int
 }
 
 var _ diffWriter = (*tabularDiffWriter)(nil)
@@ -370,10 +330,13 @@ func newJsonDiffWriter(wr io.WriteCloser) (*jsonDiffWriter, error) {
 	}, nil
 }
 
-const tablesHeader = `"tables":[`
-const jsonDiffTableHeader = `{"name":"%s","schema_diff":`
-const jsonDiffDataDiffHeader = `],"data_diff":[`
-const jsonDataDiffFooter = `}]`
+const jsonDiffHeader = `"tables":[`
+const jsonDiffFooter = `]`
+const jsonDiffSep = `},`
+const jsonDiffTableHeader = `{"name":"%s",`
+const jsonDiffTableFooter = `}`
+const jsonDiffDataDiffHeader = `"data_diff":[`
+const jsonDiffDataDiffFooter = `]`
 
 func (j *jsonDiffWriter) beginDocumentIfNecessary() error {
 	if j.tablesWritten == 0 && j.triggersWritten == 0 && j.viewsWritten == 0 {
@@ -383,27 +346,25 @@ func (j *jsonDiffWriter) beginDocumentIfNecessary() error {
 	return nil
 }
 
-func (j *jsonDiffWriter) BeginTable(ctx context.Context, td diff.TableDelta) error {
+func (j *jsonDiffWriter) BeginTable(fromTableName, toTableName string, isAdd, isDrop bool) error {
 	err := j.beginDocumentIfNecessary()
 	if err != nil {
 		return err
 	}
 
 	if j.tablesWritten == 0 {
-		err := iohelp.WriteAll(j.wr, []byte(tablesHeader))
-		if err != nil {
-			return err
-		}
+		err = iohelp.WriteAll(j.wr, []byte(jsonDiffHeader))
 	} else {
-		err := iohelp.WriteAll(j.wr, []byte(`},`))
-		if err != nil {
-			return err
-		}
+		// close previous table object, and start new one
+		err = iohelp.WriteAll(j.wr, []byte(jsonDiffSep))
+	}
+	if err != nil {
+		return err
 	}
 
-	tableName := td.FromName
+	tableName := fromTableName
 	if len(tableName) == 0 {
-		tableName = td.ToName
+		tableName = toTableName
 	}
 
 	err = iohelp.WriteAll(j.wr, []byte(fmt.Sprintf(jsonDiffTableHeader, tableName)))
@@ -412,34 +373,36 @@ func (j *jsonDiffWriter) BeginTable(ctx context.Context, td diff.TableDelta) err
 	}
 
 	j.tablesWritten++
-
-	j.schemaDiffWriter, err = json.NewSchemaDiffWriter(iohelp.NopWrCloser(j.wr))
 	return err
 }
 
-func (j *jsonDiffWriter) WriteTableSchemaDiff(ctx context.Context, toRoot *doltdb.RootValue, td diff.TableDelta) error {
-	toSchemas, err := toRoot.GetAllSchemas(ctx)
-	if err != nil {
-		return errhand.BuildDError("could not read schemas from toRoot").AddCause(err).Build()
-	}
-
-	stmts, err := diff.SqlSchemaDiff(ctx, td, toSchemas)
+func (j *jsonDiffWriter) WriteTableSchemaDiff(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary) error {
+	jsonSchDiffWriter, err := json.NewSchemaDiffWriter(iohelp.NopWrCloser(j.wr))
 	if err != nil {
 		return err
 	}
 
+	stmts := tds.AlterStmts
+	if tds.IsAdd() {
+		stmts = []string{toTableInfo.CreateStmt}
+	} else if tds.IsDrop() {
+		stmts = []string{sqlfmt.DropTableStmt(fromTableInfo.Name)}
+	}
+
 	for _, stmt := range stmts {
-		err := j.schemaDiffWriter.WriteSchemaDiff(ctx, stmt)
+		if len(stmt) == 0 {
+			continue
+		}
+		err = jsonSchDiffWriter.WriteSchemaDiff(stmt)
 		if err != nil {
 			return err
 		}
 	}
 
-	return nil
+	return jsonSchDiffWriter.Close()
 }
 
-func (j *jsonDiffWriter) RowWriter(ctx context.Context, td diff.TableDelta, unionSch sql.Schema) (diff.SqlRowDiffWriter, error) {
-	// close off the schema diff block, start the data block
+func (j *jsonDiffWriter) RowWriter(fromTableInfo, toTableInfo *diff.TableInfo, tds diff.TableDeltaSummary, unionSch sql.Schema) (diff.SqlRowDiffWriter, error) {
 	err := iohelp.WriteAll(j.wr, []byte(jsonDiffDataDiffHeader))
 	if err != nil {
 		return nil, err
@@ -460,9 +423,66 @@ func (j *jsonDiffWriter) RowWriter(ctx context.Context, td diff.TableDelta, unio
 		return nil, err
 	}
 
-	j.rowDiffWriter, err = json.NewJsonDiffWriter(iohelp.NopWrCloser(cli.CliOut), sch)
-	return j.rowDiffWriter, err
+	jsonRowDiffWriter, err := json.NewJSONRowDiffWriter(iohelp.NopWrCloser(cli.CliOut), sch)
+	if err != nil {
+		return nil, err
+	}
+
+	return jsonRowDiffWriter, nil
 }
+
+const jsonDiffEventsHeader = `"events":[`
+
+func (j *jsonDiffWriter) WriteEventDiff(ctx context.Context, eventName, oldDefn, newDefn string) error {
+	err := j.beginDocumentIfNecessary()
+	if err != nil {
+		return err
+	}
+
+	if j.eventsWritten == 0 {
+		// end the table if necessary
+		if j.tablesWritten > 0 {
+			// close off table object and tables array, and indicate start of views array
+			_, err = j.wr.Write([]byte(jsonDiffTableFooter + jsonDiffFooter + ","))
+			if err != nil {
+				return err
+			}
+		}
+		_, err = j.wr.Write([]byte(jsonDiffEventsHeader))
+	} else {
+		_, err = j.wr.Write([]byte(","))
+	}
+
+	if err != nil {
+		return err
+	}
+
+	eventNameBytes, err := ejson.Marshal(eventName)
+	if err != nil {
+		return err
+	}
+
+	oldDefnBytes, err := ejson.Marshal(oldDefn)
+	if err != nil {
+		return err
+	}
+
+	newDefnBytes, err := ejson.Marshal(newDefn)
+	if err != nil {
+		return err
+	}
+
+	_, err = j.wr.Write([]byte(fmt.Sprintf(`{"name":%s,"from_definition":%s,"to_definition":%s}`,
+		eventNameBytes, oldDefnBytes, newDefnBytes)))
+	if err != nil {
+		return err
+	}
+
+	j.eventsWritten++
+	return nil
+}
+
+const jsonDiffTriggersHeader = `"triggers":[`
 
 func (j *jsonDiffWriter) WriteTriggerDiff(ctx context.Context, triggerName, oldDefn, newDefn string) error {
 	err := j.beginDocumentIfNecessary()
@@ -471,23 +491,23 @@ func (j *jsonDiffWriter) WriteTriggerDiff(ctx context.Context, triggerName, oldD
 	}
 
 	if j.triggersWritten == 0 {
-		// end the table if necessary
-		if j.tablesWritten > 0 {
-			_, err := j.wr.Write([]byte(jsonDataDiffFooter + ","))
-			if err != nil {
-				return err
-			}
+		// end the previous block if necessary
+		if j.tablesWritten > 0 && j.eventsWritten == 0 {
+			// close off table object and tables array, and indicate start of views array
+			_, err = j.wr.Write([]byte(jsonDiffTableFooter + jsonDiffFooter + ","))
+		} else if j.eventsWritten > 0 {
+			_, err = j.wr.Write([]byte("],"))
 		}
-
-		_, err := j.wr.Write([]byte(`"triggers":[`))
 		if err != nil {
 			return err
 		}
+		_, err = j.wr.Write([]byte(jsonDiffTriggersHeader))
 	} else {
-		_, err := j.wr.Write([]byte(","))
-		if err != nil {
-			return err
-		}
+		_, err = j.wr.Write([]byte(","))
+	}
+
+	if err != nil {
+		return err
 	}
 
 	triggerNameBytes, err := ejson.Marshal(triggerName)
@@ -515,6 +535,8 @@ func (j *jsonDiffWriter) WriteTriggerDiff(ctx context.Context, triggerName, oldD
 	return nil
 }
 
+const jsonDiffViewsHeader = `"views":[`
+
 func (j *jsonDiffWriter) WriteViewDiff(ctx context.Context, viewName, oldDefn, newDefn string) error {
 	err := j.beginDocumentIfNecessary()
 	if err != nil {
@@ -523,29 +545,22 @@ func (j *jsonDiffWriter) WriteViewDiff(ctx context.Context, viewName, oldDefn, n
 
 	if j.viewsWritten == 0 {
 		// end the previous block if necessary
-		if j.tablesWritten > 0 && j.triggersWritten == 0 {
-			_, err := j.wr.Write([]byte(jsonDataDiffFooter + ","))
-			if err != nil {
-				return err
-			}
-		} else if j.triggersWritten > 0 {
-			_, err := j.wr.Write([]byte("],"))
-			if err != nil {
-				return err
-			}
+		if j.tablesWritten > 0 && j.eventsWritten == 0 && j.triggersWritten == 0 {
+			// close off table object and tables array, and indicate start of views array
+			_, err = j.wr.Write([]byte(jsonDiffTableFooter + jsonDiffFooter + ","))
+		} else if j.eventsWritten > 0 || j.triggersWritten > 0 {
+			_, err = j.wr.Write([]byte("],"))
 		}
+		if err != nil {
+			return err
+		}
+		_, err = j.wr.Write([]byte(jsonDiffViewsHeader))
+	} else {
+		_, err = j.wr.Write([]byte(","))
 	}
 
-	if j.viewsWritten == 0 {
-		_, err := j.wr.Write([]byte(`"views":[`))
-		if err != nil {
-			return err
-		}
-	} else {
-		_, err := j.wr.Write([]byte(","))
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		return err
 	}
 
 	viewNameBytes, err := ejson.Marshal(viewName)
@@ -563,8 +578,8 @@ func (j *jsonDiffWriter) WriteViewDiff(ctx context.Context, viewName, oldDefn, n
 		return err
 	}
 
-	_, err = j.wr.Write([]byte(fmt.Sprintf(`{"name":%s,"from_definition":%s,"to_definition":%s}`,
-		viewNameBytes, oldDefnBytes, newDefnBytes)))
+	viewStmt := fmt.Sprintf(`{"name":%s,"from_definition":%s,"to_definition":%s}`, viewNameBytes, oldDefnBytes, newDefnBytes)
+	_, err = j.wr.Write([]byte(viewStmt))
 	if err != nil {
 		return err
 	}
@@ -573,29 +588,60 @@ func (j *jsonDiffWriter) WriteViewDiff(ctx context.Context, viewName, oldDefn, n
 	return nil
 }
 
+const jsonDiffStatsHeader = `"stats":{`
+const jsonDiffStatsFooter = `}`
+
+func (j *jsonDiffWriter) WriteTableDiffStats(diffStats []diffStatistics, oldColLen, newColLen int, areTablesKeyless bool) error {
+	acc := diff.DiffStatProgress{}
+	for _, diffStat := range diffStats {
+		acc.Adds += diffStat.RowsAdded
+		acc.Removes += diffStat.RowsDeleted
+		acc.Changes += diffStat.RowsModified
+		acc.CellChanges += diffStat.CellsModified
+		acc.NewRowSize += diffStat.NewRowCount
+		acc.OldRowSize += diffStat.OldRowCount
+		acc.NewCellSize += diffStat.NewCellCount
+		acc.OldCellSize += diffStat.OldCellCount
+	}
+	j.wr.Write([]byte(jsonDiffStatsHeader))
+	if (acc.Adds+acc.Removes+acc.Changes) == 0 && (acc.OldCellSize-acc.NewCellSize) == 0 {
+		j.wr.Write([]byte(jsonDiffStatsFooter))
+		return nil
+	}
+
+	j.wr.Write([]byte(fmt.Sprintf(`"rows_added":%d,`, acc.Adds)))
+	j.wr.Write([]byte(fmt.Sprintf(`"rows_deleted":%d,`, acc.Removes)))
+	j.wr.Write([]byte(fmt.Sprintf(`"rows_modified":%d,`, acc.Changes)))
+	rowsUnmodified := acc.OldRowSize - acc.Changes - acc.Removes
+	j.wr.Write([]byte(fmt.Sprintf(`"rows_unmodified":%d,`, rowsUnmodified)))
+
+	cellAdds, cellDeletes := sqle.GetCellsAddedAndDeleted(acc, newColLen)
+	j.wr.Write([]byte(fmt.Sprintf(`"cells_added":%d,`, cellAdds)))
+	j.wr.Write([]byte(fmt.Sprintf(`"cells_deleted":%d,`, cellDeletes)))
+	j.wr.Write([]byte(fmt.Sprintf(`"cells_modified":%d`, acc.CellChanges)))
+
+	j.wr.Write([]byte(jsonDiffStatsFooter))
+	return nil
+}
+
 func (j *jsonDiffWriter) Close(ctx context.Context) error {
-	if j.tablesWritten > 0 || j.triggersWritten > 0 || j.viewsWritten > 0 {
-		// We only need to close off the "tables" array if we didn't also write a view / trigger
-		// (which also closes that array)
-		if j.triggersWritten == 0 && j.viewsWritten == 0 {
-			_, err := j.wr.Write([]byte(jsonDataDiffFooter))
-			if err != nil {
-				return err
-			}
-		} else {
-			// if we did write a trigger or view, we need to close off that array
-			_, err := j.wr.Write([]byte("]"))
+	if j.tablesWritten > 0 || j.triggersWritten > 0 || j.viewsWritten > 0 || j.eventsWritten > 0 {
+		// close off tables object
+		if j.triggersWritten == 0 && j.viewsWritten == 0 && j.eventsWritten == 0 {
+			_, err := j.wr.Write([]byte(jsonDiffTableFooter))
 			if err != nil {
 				return err
 			}
 		}
 
-		err := iohelp.WriteLine(j.wr, "}")
+		// close off last block
+		_, err := j.wr.Write([]byte(jsonDiffFooter))
 		if err != nil {
 			return err
 		}
-	} else {
-		err := iohelp.WriteLine(j.wr, "")
+
+		// end document
+		_, err = j.wr.Write([]byte("}"))
 		if err != nil {
 			return err
 		}

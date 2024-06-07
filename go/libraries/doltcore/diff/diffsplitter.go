@@ -15,14 +15,10 @@
 package diff
 
 import (
-	"context"
 	"errors"
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
-
-	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
-	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 )
 
 const (
@@ -118,9 +114,6 @@ func mapQuerySchemaToTargetSchema(query, target sql.Schema) (mapping []int, err 
 		} else {
 			return nil, errors.New("expected column prefix of 'to_' or 'from_' (" + col.Name + ")")
 		}
-		if mapping[i] < 0 { // sanity check
-			return nil, errors.New("failed to map diff column: " + col.Name)
-		}
 	}
 	return
 }
@@ -163,6 +156,10 @@ func (ds DiffSplitter) SplitDiffResultRow(row sql.Row) (from, to RowDiff, err er
 		from.RowDiff = Removed
 		for i := 0; i < ds.splitIdx; i++ {
 			j := ds.queryToTarget[i]
+			// skip any columns that aren't mapped
+			if j < 0 {
+				continue
+			}
 			from.Row[j] = row[i]
 			from.ColDiffs[j] = Removed
 		}
@@ -172,6 +169,10 @@ func (ds DiffSplitter) SplitDiffResultRow(row sql.Row) (from, to RowDiff, err er
 		to.RowDiff = Added
 		for i := ds.splitIdx; i < len(row); i++ {
 			j := ds.queryToTarget[i]
+			// skip any columns that aren't mapped
+			if j < 0 {
+				continue
+			}
 			to.Row[j] = row[i]
 			to.ColDiffs[j] = Added
 		}
@@ -181,6 +182,10 @@ func (ds DiffSplitter) SplitDiffResultRow(row sql.Row) (from, to RowDiff, err er
 		from.RowDiff = ModifiedOld
 		for i := 0; i < ds.splitIdx; i++ {
 			j := ds.queryToTarget[i]
+			// skip any columns that aren't mapped
+			if j < 0 {
+				continue
+			}
 			from.Row[j] = row[i]
 		}
 		to.Row = make(sql.Row, len(ds.targetSch))
@@ -208,26 +213,4 @@ func (ds DiffSplitter) SplitDiffResultRow(row sql.Row) (from, to RowDiff, err er
 		panic("unknown diff type " + diffType.(string))
 	}
 	return
-}
-
-// MaybeResolveRoot returns a root value and true if the a commit exists for given spec string; nil and false if it does not exist.
-// todo: distinguish between non-existent CommitSpec and other errors, don't assume non-existent
-func MaybeResolveRoot(ctx context.Context, rsr env.RepoStateReader, doltDB *doltdb.DoltDB, spec string) (*doltdb.RootValue, bool) {
-	cs, err := doltdb.NewCommitSpec(spec)
-	if err != nil {
-		// it's non-existent CommitSpec
-		return nil, false
-	}
-
-	cm, err := doltDB.Resolve(ctx, cs, rsr.CWBHeadRef())
-	if err != nil {
-		return nil, false
-	}
-
-	root, err := cm.GetRootValue(ctx)
-	if err != nil {
-		return nil, false
-	}
-
-	return root, true
 }

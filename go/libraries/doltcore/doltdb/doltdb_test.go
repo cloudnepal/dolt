@@ -120,12 +120,20 @@ func TestIsValidTableName(t *testing.T) {
 	assert.True(t, IsValidTableName("_a1"))
 	assert.True(t, IsValidTableName("a1_b_c------1"))
 	assert.True(t, IsValidTableName("Add-098234_lkjasdf0p98"))
-	assert.False(t, IsValidTableName("1"))
-	assert.False(t, IsValidTableName("-"))
-	assert.False(t, IsValidTableName("-a"))
+	assert.True(t, IsValidTableName("1"))
+	assert.True(t, IsValidTableName("-"))
+	assert.True(t, IsValidTableName("-a"))
+	assert.True(t, IsValidTableName("a1-"))
+	assert.True(t, IsValidTableName("ab!!c"))
+	assert.True(t, IsValidTableName("           space"))
+	assert.True(t, IsValidTableName("this     is     ok"))
+	assert.True(t, IsValidTableName(" ~!@#$%^&*()_+`-=[]{}|;':\",./<>?"))
+	assert.True(t, IsValidTableName("あえいおう"))
+	assert.True(t, IsValidTableName("might/be/problematic"))
 	assert.False(t, IsValidTableName(""))
-	assert.False(t, IsValidTableName("a1-"))
-	assert.False(t, IsValidTableName("ab!!c"))
+	assert.False(t, IsValidTableName(string(rune(0))))
+	assert.False(t, IsValidTableName("𐌃𐌏𐌋𐌕"))
+	assert.False(t, IsValidTableName("space            "))
 }
 
 // DO NOT CHANGE THIS TEST
@@ -184,6 +192,7 @@ func TestEmptyInMemoryRepoCreation(t *testing.T) {
 	if err != nil {
 		t.Fatal("Failed to load db")
 	}
+	defer ddb.Close()
 
 	err = ddb.WriteEmptyRepo(context.Background(), "master", "Bill Billerson", "bigbillieb@fake.horse")
 
@@ -192,11 +201,12 @@ func TestEmptyInMemoryRepoCreation(t *testing.T) {
 	}
 
 	cs, _ := NewCommitSpec("master")
-	commit, err := ddb.Resolve(context.Background(), cs, nil)
-
+	optCmt, err := ddb.Resolve(context.Background(), cs, nil)
 	if err != nil {
 		t.Fatal("Could not find commit")
 	}
+	commit, ok := optCmt.ToCommit()
+	assert.True(t, ok)
 
 	h, err := commit.HashOf()
 	assert.NoError(t, err)
@@ -267,11 +277,12 @@ func TestLDNoms(t *testing.T) {
 	{
 		ddb, _ := LoadDoltDB(context.Background(), types.Format_Default, LocalDirDoltDB, filesys.LocalFS)
 		cs, _ := NewCommitSpec("master")
-		commit, err := ddb.Resolve(context.Background(), cs, nil)
-
+		optCmt, err := ddb.Resolve(context.Background(), cs, nil)
 		if err != nil {
 			t.Fatal("Couldn't find commit")
 		}
+		commit, ok := optCmt.ToCommit()
+		assert.True(t, ok)
 
 		meta, err := commit.GetCommitMeta(context.Background())
 		assert.NoError(t, err)
@@ -284,7 +295,7 @@ func TestLDNoms(t *testing.T) {
 
 		assert.NoError(t, err)
 
-		names, err := root.GetTableNames(context.Background())
+		names, err := root.GetTableNames(context.Background(), DefaultSchemaName)
 		assert.NoError(t, err)
 		if len(names) != 0 {
 			t.Fatal("There should be no tables in empty db")
@@ -302,7 +313,7 @@ func TestLDNoms(t *testing.T) {
 			t.Fatal("Failed to create test table with data")
 		}
 
-		root, err = root.PutTable(context.Background(), "test", tbl)
+		root, err = root.PutTable(context.Background(), TableName{Name: "test"}, tbl)
 		assert.NoError(t, err)
 
 		root, valHash, err = ddb.WriteRootValue(context.Background(), root)
@@ -339,7 +350,7 @@ func TestLDNoms(t *testing.T) {
 		root, err = commit.GetRootValue(context.Background())
 		assert.NoError(t, err)
 
-		readTable, ok, err := root.GetTable(context.Background(), "test")
+		readTable, ok, err := root.GetTable(context.Background(), TableName{Name: "test"})
 		assert.NoError(t, err)
 
 		if !ok {

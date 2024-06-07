@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/dolthub/go-mysql-server/sql"
+
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands"
 	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
@@ -60,7 +62,7 @@ func (cmd StashPopCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd StashPopCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 1)
 	return ap
 }
 
@@ -70,7 +72,7 @@ func (cmd StashPopCmd) EventType() eventsapi.ClientEventType {
 }
 
 // Exec executes the command
-func (cmd StashPopCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd StashPopCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	if !dEnv.DoltDB.Format().UsesFlatbuffers() {
 		cli.PrintErrln(ErrStashNotSupportedForOldFormat.Error())
 		return 1
@@ -78,17 +80,15 @@ func (cmd StashPopCmd) Exec(ctx context.Context, commandStr string, args []strin
 	ap := cmd.ArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, stashPopDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
-	if dEnv.IsLocked() {
-		return commands.HandleVErrAndExitCode(errhand.VerboseErrorFromError(env.ErrActiveServerLock.New(dEnv.LockFile())), help)
-	}
 
-	if apr.NArg() > 1 {
-		usage()
+	_, sqlCtx, closer, err := cliCtx.QueryEngine(ctx)
+	if err != nil {
+		cli.PrintErrln(err.Error())
 		return 1
 	}
+	defer closer()
 
 	var idx = 0
-	var err error
 	if apr.NArg() == 1 {
 		stashName := apr.Args[0]
 		stashName = strings.TrimSuffix(strings.TrimPrefix(stashName, "stash@{"), "}")
@@ -99,24 +99,24 @@ func (cmd StashPopCmd) Exec(ctx context.Context, commandStr string, args []strin
 		}
 	}
 
-	workingRoot, err := dEnv.WorkingRoot(ctx)
+	workingRoot, err := dEnv.WorkingRoot(sqlCtx)
 	if err != nil {
 		return handleStashPopErr(usage, err)
 	}
 
-	success, err := applyStashAtIdx(ctx, dEnv, workingRoot, idx)
+	success, err := applyStashAtIdx(sqlCtx, dEnv, workingRoot, idx)
 	if err != nil {
 		return handleStashPopErr(usage, err)
 	}
 
-	ret := commands.StatusCmd{}.Exec(ctx, "status", []string{}, dEnv)
+	ret := commands.StatusCmd{}.Exec(sqlCtx, "status", []string{}, dEnv, cliCtx)
 	if ret != 0 || !success {
 		cli.Println("The stash entry is kept in case you need it again.")
 		return 1
 	}
 
 	cli.Println()
-	err = dropStashAtIdx(ctx, dEnv, idx)
+	err = dropStashAtIdx(sqlCtx, dEnv, idx)
 	if err != nil {
 		return handleStashPopErr(usage, err)
 	}
@@ -124,7 +124,7 @@ func (cmd StashPopCmd) Exec(ctx context.Context, commandStr string, args []strin
 	return 0
 }
 
-func applyStashAtIdx(ctx context.Context, dEnv *env.DoltEnv, curWorkingRoot *doltdb.RootValue, idx int) (bool, error) {
+func applyStashAtIdx(ctx *sql.Context, dEnv *env.DoltEnv, curWorkingRoot doltdb.RootValue, idx int) (bool, error) {
 	stashRoot, headCommit, meta, err := dEnv.DoltDB.GetStashRootAndHeadCommitAtIdx(ctx, idx)
 	if err != nil {
 		return false, err
@@ -138,10 +138,21 @@ func applyStashAtIdx(ctx context.Context, dEnv *env.DoltEnv, curWorkingRoot *dol
 	if err != nil {
 		return false, err
 	}
-	parentCommit, err := dEnv.DoltDB.Resolve(ctx, headCommitSpec, dEnv.RepoStateReader().CWBHeadRef())
+	headRef, err := dEnv.RepoStateReader().CWBHeadRef()
 	if err != nil {
 		return false, err
 	}
+	optCmt, err := dEnv.DoltDB.Resolve(ctx, headCommitSpec, headRef)
+	if err != nil {
+		return false, err
+	}
+	parentCommit, ok := optCmt.ToCommit()
+	if !ok {
+		// Should not be possible to get into this situation. The parent of the stashed commit
+		// Must have been present at the time it was created
+		return false, doltdb.ErrGhostCommitEncountered
+	}
+
 	parentRoot, err := parentCommit.GetRootValue(ctx)
 	if err != nil {
 		return false, err
@@ -153,14 +164,14 @@ func applyStashAtIdx(ctx context.Context, dEnv *env.DoltEnv, curWorkingRoot *dol
 	}
 
 	opts := editor.Options{Deaf: dEnv.BulkDbEaFactory(), Tempdir: tmpDir}
-	mergedRoot, mergeStats, err := merge.MergeRoots(ctx, curWorkingRoot, stashRoot, parentRoot, stashRoot, parentCommit, opts, merge.MergeOpts{IsCherryPick: false})
+	result, err := merge.MergeRoots(ctx, curWorkingRoot, stashRoot, parentRoot, stashRoot, parentCommit, opts, merge.MergeOpts{IsCherryPick: false})
 	if err != nil {
 		return false, err
 	}
 
 	var tablesWithConflict []string
-	for tbl, stats := range mergeStats {
-		if stats.Conflicts > 0 {
+	for tbl, stats := range result.Stats {
+		if stats.HasConflicts() {
 			tablesWithConflict = append(tablesWithConflict, tbl)
 		}
 	}
@@ -173,7 +184,7 @@ func applyStashAtIdx(ctx context.Context, dEnv *env.DoltEnv, curWorkingRoot *dol
 		return false, nil
 	}
 
-	err = dEnv.UpdateWorkingRoot(ctx, mergedRoot)
+	err = dEnv.UpdateWorkingRoot(ctx, result.Root)
 	if err != nil {
 		return false, err
 	}
@@ -184,7 +195,8 @@ func applyStashAtIdx(ctx context.Context, dEnv *env.DoltEnv, curWorkingRoot *dol
 	}
 
 	// added tables need to be staged
-	roots, err = actions.StageTables(ctx, roots, meta.TablesToStage)
+	// since these tables are coming from a stash, don't filter for ignored table names.
+	roots, err = actions.StageTables(ctx, roots, doltdb.ToTableNames(meta.TablesToStage, doltdb.DefaultSchemaName), false)
 	if err != nil {
 		return false, err
 	}

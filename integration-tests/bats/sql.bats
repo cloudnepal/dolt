@@ -3,6 +3,7 @@ load $BATS_TEST_DIRNAME/helper/common.bash
 
 setup() {
     setup_common
+    export DOLT_DBNAME_REPLACE="true"
     dolt sql <<SQL
 CREATE TABLE one_pk (
   pk BIGINT NOT NULL,
@@ -39,43 +40,21 @@ teardown() {
     teardown_common
 }
 
-@test "sql: --user option changes superuser" {
-    # remove config
-    rm -rf .doltcfg
-
-    # default is root@localhost
-    run dolt sql -q "select user, host from mysql.user"
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "root" ]] || false
-    ! [[ "$output" =~ "dolt" ]] || false
-    [[ "$output" =~ "localhost" ]] || false
-
-    # make it dolt@localhost
-    run dolt sql --user=dolt -q "select user, host from mysql.user"
-    [ "$status" -eq 0 ]
-    ! [[ "$output" =~ "root" ]] || false
-    [[ "$output" =~ "dolt" ]] || false
-    [[ "$output" =~ "localhost" ]] || false
-
-    # remove config
-    rm -rf .doltcfg
-}
-
 @test "sql: --user don't create superuser if using an existing user" {
     rm -rf .doltcfg
 
     # default user is root
     run dolt sql -q "select user from mysql.user"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "root" ]]
+    [[ "$output" =~ "root" ]] || false
 
     # create user
     run dolt sql -q "create user new_user@'localhost'"
     [ "$status" -eq 0 ]
 
-    run dolt sql --user=new_user -q "select user from mysql.user"
+    run dolt --user=new_user sql -q "select user from mysql.user"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "Access denied for user" ]]
+    [[ "$output" =~ "command denied to user" ]] || false
 
     rm -rf .doltcfg
 }
@@ -143,14 +122,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir -q "show databases;"
+    run dolt --data-dir=db_dir sql -q "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -162,11 +141,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir -q "create user new_user"
+    run dolt --data-dir=db_dir sql -q "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -210,7 +189,7 @@ teardown() {
     rm -rf doltcfgdir
 
     # show users, expect just root user
-    run dolt sql --doltcfg-dir=doltcfgdir -q "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -220,11 +199,11 @@ teardown() {
     ! [[ "$output" =~ "doltcfgdir" ]] || false
 
     # create new_user
-    run dolt sql --doltcfg-dir=doltcfgdir -q "create user new_user"
+    run dolt --doltcfg-dir=doltcfgdir sql -q "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --doltcfg-dir=doltcfgdir -q "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -247,7 +226,7 @@ teardown() {
     rm -f privs.db
 
     # show users, expect just root user
-    run dolt sql --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --privilege-file=privs.db sql -q "select user from mysql.user;"
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
 
@@ -255,11 +234,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new_user
-    run dolt sql --privilege-file=privs.db -q "create user new_user"
+    run dolt --privilege-file=privs.db sql -q "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --privilege-file=privs.db sql -q "select user from mysql.user;"
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
 
@@ -306,14 +285,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir -q "show databases;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql -q "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -326,11 +305,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir -q "create user new_user"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql -q "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -364,7 +343,7 @@ teardown() {
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --doltcfg-dir=../doltcfgdir -q "select user from mysql.user"
+    run dolt --doltcfg-dir=../doltcfgdir sql -q "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -406,14 +385,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db -q "show databases;"
+    run dolt --data-dir=db_dir --privilege-file=privs.db sql -q "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir --privilege-file=privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -425,11 +404,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db -q "create user new_user"
+    run dolt --data-dir=db_dir --privilege-file=privs.db sql -q "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir --privilege-file=privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -462,7 +441,7 @@ teardown() {
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --privilege-file=../privs.db -q "select user from mysql.user"
+    run dolt --privilege-file=../privs.db sql -q "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -482,7 +461,7 @@ teardown() {
     rm -rf privs.db
 
     # show users, expect just root user
-    run dolt sql --doltcfg-dir=doltcfgdir --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -492,11 +471,11 @@ teardown() {
     ! [[ "$output" =~ "doltcfgdir" ]] || false
 
     # create new_user
-    run dolt sql --doltcfg-dir=doltcfgdir --privilege-file=privs.db -q "create user new_user"
+    run dolt --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql -q "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --doltcfg-dir=doltcfgdir --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -548,14 +527,14 @@ teardown() {
     cd ..
 
     # show databases, expect all
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db -q "show databases;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql -q "show databases;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "db1" ]] || false
     [[ "$output" =~ "db2" ]] || false
     [[ "$output" =~ "db3" ]] || false
 
     # show users, expect just root user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
@@ -569,11 +548,11 @@ teardown() {
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
     # create new user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db -q "create user new_user"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql -q "create user new_user"
     [ "$status" -eq 0 ]
 
     # show users, expect root user and new_user
-    run dolt sql --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --data-dir=db_dir --doltcfg-dir=doltcfgdir --privilege-file=privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -609,13 +588,13 @@ teardown() {
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --doltcfg-dir=../doltcfgdir -q "select user from mysql.user"
+    run dolt --doltcfg-dir=../doltcfgdir sql -q "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     ! [[ "$output" =~ "new_user" ]] || false
 
     # show users, expect root and new_user
-    run dolt sql --privilege-file=../privs.db -q "select user from mysql.user"
+    run dolt --privilege-file=../privs.db sql -q "select user from mysql.user"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -635,20 +614,20 @@ teardown() {
     rm -rf inner_db
     rm -f privs.db
 
-    run dolt sql --privilege-file=privs.db -q "create database inner_db;"
+    run dolt --privilege-file=privs.db sql -q "create database inner_db;"
     [ "$status" -eq 0 ]
 
-    run dolt sql --privilege-file=privs.db -q "create user new_user;"
+    run dolt --privilege-file=privs.db sql -q "create user new_user;"
     [ "$status" -eq 0 ]
 
-    run dolt sql --privilege-file=privs.db -q "select user from mysql.user;"
+    run dolt --privilege-file=privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
 
     cd inner_db
 
-    run dolt sql --privilege-file=../privs.db -q "select user from mysql.user;"
+    run dolt --privilege-file=../privs.db sql -q "select user from mysql.user;"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "root" ]] || false
     [[ "$output" =~ "new_user" ]] || false
@@ -676,7 +655,7 @@ teardown() {
     [[ "$output" =~ "multiple .doltcfg directories detected" ]] || false
 
     # specifying datadir, resolves issue
-    run dolt sql --data-dir=. -q "show databases;"
+    run dolt --data-dir=. sql -q "show databases;"
     [ "$status" -eq 0 ]
 
     # remove existing directories
@@ -750,24 +729,24 @@ teardown() {
     mkdir new_repo
     cd new_repo
 
-    run dolt sql --data-dir=$DATADIR -q "show databases"
+    run dolt --data-dir=$DATADIR sql -q "show databases"
     [ $status -eq 0 ]
     [[ $output =~ "db1" ]] || false
     [[ $output =~ "db2" ]] || false
     [[ $output =~ "db3" ]] || false
 
-    run dolt sql --data-dir=$DATADIR -q "create user new_user"
+    run dolt --data-dir=$DATADIR sql -q "create user new_user"
     [ $status -eq 0 ]
 
-    run dolt sql --data-dir=$DATADIR -q "use db1; select user from mysql.user"
-    [ $status -eq 0 ]
-    [[ $output =~ "new_user" ]] || false
-
-    run dolt sql --data-dir=$DATADIR -q "use db2; select user from mysql.user"
+    run dolt --data-dir=$DATADIR sql -q "use db1; select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ "new_user" ]] || false
 
-    run dolt sql --data-dir=$DATADIR -q "use db3; select user from mysql.user"
+    run dolt --data-dir=$DATADIR sql -q "use db2; select user from mysql.user"
+    [ $status -eq 0 ]
+    [[ $output =~ "new_user" ]] || false
+
+    run dolt --data-dir=$DATADIR sql -q "use db3; select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ "new_user" ]] || false
 
@@ -1031,7 +1010,7 @@ SQL
     run dolt sql -r csv -q "select @@character_set_client"
     [ $status -eq 0 ]
     [[ "$output" =~ "utf8mb4" ]] || false
-    
+
     run dolt sql -r json -q "select * from test order by a"
     [ $status -eq 0 ]
     [ "$output" == '{"rows": [{"a":1,"b":1.5,"c":"1","d":"2020-01-01 00:00:00"},{"a":2,"b":2.5,"c":"2","d":"2020-02-02 00:00:00"},{"a":3,"c":"3","d":"2020-03-03 00:00:00"},{"a":4,"b":4.5,"d":"2020-04-04 00:00:00"},{"a":5,"b":5.5,"c":"5"}]}' ]
@@ -1039,9 +1018,23 @@ SQL
     run dolt sql -r json -q "select @@character_set_client"
     [ $status -eq 0 ]
     [[ "$output" =~ "utf8mb4" ]] || false
+
+    dolt sql -r parquet -q "select * from test order by a" > out.parquet
+    run parquet cat out.parquet
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ '{"a": 1, "b": 1.5, "c": "1", "d": 1577836800000000}' ]] || false
+    [[ "$output" =~ '{"a": 2, "b": 2.5, "c": "2", "d": 1580601600000000}' ]] || false
+    [[ "$output" =~ '{"a": 3, "b": null, "c": "3", "d": 1583193600000000}' ]] || false
+    [[ "$output" =~ '{"a": 4, "b": 4.5, "c": null, "d": 1585958400000000}' ]] || false
+    [[ "$output" =~ '{"a": 5, "b": 5.5, "c": "5", "d": null}' ]] || false
+    [ "${#lines[@]}" -eq 5 ]
+
+    run dolt sql -r parquet -q "select @@character_set_client"
+    [ $status -eq 0 ]
+    [[ "$output" =~ "utf8mb4" ]] || false
 }
 
-@test "sql: empty JSON output format" {
+@test "sql: empty output exports properly" {
     dolt sql <<SQL
     CREATE TABLE test (
     a int primary key,
@@ -1054,6 +1047,11 @@ SQL
     run dolt sql -r json -q "select * from test order by a"
     [ $status -eq 0 ]
     [[ "$output" =~ "{}" ]] || false
+
+    dolt sql -r parquet -q "select * from test order by a" > out.parquet
+    run parquet cat out.parquet
+    [ "$status" -eq 0 ]
+    [ "${#lines[@]}" -eq 0 ]
 }
 
 @test "sql: output for escaped longtext exports properly" {
@@ -1077,12 +1075,18 @@ SQL
     [[ "$output" =~ "a,v" ]] || false
     [[ "$output" =~ '1,"{""key"": ""value""}"' ]] || false
     [[ "$output" =~ '2,"""Hello"""' ]] || false
+
+    dolt sql -r parquet -q "select * from test order by a" > out.parquet
+    run parquet cat out.parquet
+    [ $status -eq 0 ]
+    [[ "$output" =~ '{"a": 1, "v": "{\"key\": \"value\"}"}' ]] || false
+    [[ "$output" =~ '{"a": 2, "v": "\"Hello\""}' ]] || false
 }
 
 @test "sql: ambiguous column name" {
     run dolt sql -q "select pk,pk1,pk2 from one_pk,two_pk where c1=0"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "ambiguous column name \"c1\", it's present in all these tables: one_pk, two_pk" ]] || false
+    [[ "$output" =~ "ambiguous column name \"c1\", it's present in all these tables: [two_pk one_pk]" ]] || false
 }
 
 @test "sql: select with and and or clauses" {
@@ -1143,7 +1147,6 @@ SQL
 
 @test "sql: non unique table alias" {
     run dolt sql -q "select pk from one_pk,one_pk"
-    skip "This should be an error. MySQL gives: Not unique table/alias: 'one_pk'"
     [ $status -eq 1 ]
 }
 
@@ -1627,7 +1630,8 @@ SQL
     # switching to a branch that doesn't exist should be an error
     run dolt sql -q "set @@dolt_repo_$$_head_ref = 'does-not-exist';"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ 'branch not found' ]] || false
+    # TODO: this error message could be improved
+    [[ "$output" =~ "database not found: dolt_repo_$$/does-not-exist" ]] || false
 }
 
 @test "sql: branch qualified DB name in select" {
@@ -1782,7 +1786,6 @@ SQL
 }
 
 @test "sql: USE tag doesn't create duplicate commit DB name" {
-    skip "unrelated panic when dolt_checkout is called after using a read-only revision db https://github.com/dolthub/dolt/issues/4067"
     dolt add .; dolt commit -m 'commit tables'
     dolt checkout -b feature-branch
 
@@ -1796,6 +1799,24 @@ CALL DOLT_TAG("v1");
 USE \`dolt_repo_$$/v1\`;
 CALL dolt_checkout('feature-branch');
 SQL
+}
+
+@test "sql: USE fake hash throws error" {
+    dolt add .; dolt commit -m 'commit tables'
+
+    # get the last commit hash
+    hash=`dolt log | grep commit | cut -d" " -f2 | tail -n+1 | head -n1`
+
+    # no error for this hash
+    dolt sql  <<SQL
+USE \`dolt_repo_$$/$hash\`;
+SQL
+
+    # try with a fake hash
+    hash='h4jks5lomp9u41r6902knn0pfr7lsgth'
+    run dolt sql -q "use \`dolt_repo_$$/$hash\`"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "database not found" ]] || false
 }
 
 @test "sql: tag qualified DB name in delete" {
@@ -2083,7 +2104,6 @@ SQL
 }
 
 @test "sql: date_format function" {
-    skip "date_format() not supported"
     dolt sql -q "select date_format(date_created, '%Y-%m-%d') from has_datetimes"
 }
 
@@ -2241,7 +2261,11 @@ SQL
     [ $status -eq 0 ]
     [[ "$output" =~ "c,2,2" ]] || false
 
-    dolt sql -b -q "INSERT INTO test VALUES ('d','d','d');DELETE FROM test WHERE col_a='d';INSERT INTO test VALUES ('d', '1', '1') ON DUPLICATE KEY UPDATE col_b = '2', col_c='2';"
+    dolt sql <<SQL
+INSERT INTO test VALUES ('d','d','d');
+DELETE FROM test WHERE col_a='d';
+INSERT INTO test VALUES ('d', '1', '1') ON DUPLICATE KEY UPDATE col_b = '2', col_c='2';
+SQL
     run dolt sql -r csv -q "SELECT * from test where col_a = 'd'"
     [ $status -eq 0 ]
     [[ "$output" =~ "d,1,1" ]] || false
@@ -2258,52 +2282,6 @@ SQL
     run dolt sql -r csv -q "SELECT * from test"
     [ $status -eq 0 ]
     [[ "$output" =~ "0,0,99" ]] || false
-}
-
-@test "sql: at commit" {
-  skip "zachmu broke this, needs to fix"
-
-  dolt add .
-  dolt commit -m "seed initial values"
-  dolt checkout -b one
-  dolt sql -q "UPDATE one_pk SET c1 = 100 WHERE pk = 0"
-  dolt add .
-  dolt commit -m "100"
-  dolt checkout -b two
-  dolt sql -q "UPDATE one_pk SET c1 = 200 WHERE pk = 0"
-  dolt add .
-  dolt commit -m "200"
-
-  EXPECTED=$( echo -e "c1\n200" )
-  run dolt sql -r csv -q "SELECT c1 FROM one_pk WHERE pk=0"
-  [ $status -eq 0 ]
-  [[ "$output" = "$EXPECTED" ]] || false
-  run dolt sql -r csv -q "SELECT c1 FROM one_pk WHERE pk=0" HEAD
-  [ $status -eq 0 ]
-  [[ "$output" = "$EXPECTED" ]] || false
-  run dolt sql -r csv -q "SELECT c1 FROM one_pk WHERE pk=0" two
-  [ $status -eq 0 ]
-  [[ "$output" = "$EXPECTED" ]] || false
-
-  EXPECTED=$( echo -e "c1\n100" )
-  run dolt sql -r csv -q "SELECT c1 FROM one_pk WHERE pk=0" HEAD~
-  [ $status -eq 0 ]
-  [[ "$output" = "$EXPECTED" ]] || false
-  run dolt sql -r csv -q "SELECT c1 FROM one_pk WHERE pk=0" one
-  [ $status -eq 0 ]
-  [[ "$output" = "$EXPECTED" ]] || false
-
-  EXPECTED=$( echo -e "c1\n0" )
-  run dolt sql -r csv -q "SELECT c1 FROM one_pk WHERE pk=0" HEAD~2
-  [ $status -eq 0 ]
-  [[ "$output" = "$EXPECTED" ]] || false
-  run dolt sql -r csv -q "SELECT c1 FROM one_pk WHERE pk=0" main
-  [ $status -eq 0 ]
-  [[ "$output" = "$EXPECTED" ]] || false
-
-  #writes should fail if commit is specified
-  run dolt sql -q "UPDATE one_pk SET c1 = 200 WHERE pk = 0" HEAD~
-  [ $status -ne 0 ]
 }
 
 @test "sql: select with json output supports datetime" {
@@ -2367,13 +2345,13 @@ SQL
     [[ "$output" =~ "name,create_stmt,created_at,modified_at" ]] || false
     [[ "$output" =~ 'p1,CREATE PROCEDURE p1() SELECT 5*5' ]] || false
     [[ "$output" =~ 'p2,CREATE PROCEDURE p2() SELECT 6*6' ]] || false
-    [[ "${#lines[@]}" = "4" ]] || false
+
     run dolt sql -b -q "SET @@show_external_procedures = 0;SHOW PROCEDURE STATUS" -r=csv
     [ "$status" -eq "0" ]
     [[ "$output" =~ "Db,Name,Type,Definer,Modified,Created,Security_type,Comment,character_set_client,collation_connection,Database Collation" ]] || false
     [[ "$output" =~ ',p1,PROCEDURE,' ]] || false
     [[ "$output" =~ ',p2,PROCEDURE,' ]] || false
-    [[ "${#lines[@]}" = "4" ]] || false
+
     # Drop p2
     dolt sql -q "DROP PROCEDURE p2"
     run dolt sql -b -q "SET @@show_external_procedures = 0;SELECT * FROM dolt_procedures" -r=csv
@@ -2381,17 +2359,18 @@ SQL
     [[ "$output" =~ "name,create_stmt,created_at,modified_at" ]] || false
     [[ "$output" =~ 'p1,CREATE PROCEDURE p1() SELECT 5*5' ]] || false
     [[ ! "$output" =~ 'p2,CREATE PROCEDURE p2() SELECT 6*6' ]] || false
-    [[ "${#lines[@]}" = "3" ]] || false
+
     run dolt sql -b -q "SET @@show_external_procedures = 0;SHOW PROCEDURE STATUS" -r=csv
     [ "$status" -eq "0" ]
     [[ "$output" =~ "Db,Name,Type,Definer,Modified,Created,Security_type,Comment,character_set_client,collation_connection,Database Collation" ]] || false
     [[ "$output" =~ ',p1,PROCEDURE,' ]] || false
     [[ ! "$output" =~ ',p2,PROCEDURE,' ]] || false
-    [[ "${#lines[@]}" = "3" ]] || false
+
     # Drop p2 again and error
     run dolt sql -q "DROP PROCEDURE p2"
     [ "$status" -eq "1" ]
     [[ "$output" =~ '"p2" does not exist' ]] || false
+
     # Drop p1 using if exists
     dolt sql -q "DROP PROCEDURE IF EXISTS p1"
     run dolt sql -b -q "SET @@show_external_procedures = 0;SELECT * FROM dolt_procedures" -r=csv
@@ -2399,13 +2378,12 @@ SQL
     [[ "$output" =~ "name,create_stmt,created_at,modified_at" ]] || false
     [[ ! "$output" =~ 'p1,CREATE PROCEDURE p1() SELECT 5*5' ]] || false
     [[ ! "$output" =~ 'p2,CREATE PROCEDURE p2() SELECT 6*6' ]] || false
-    [[ "${#lines[@]}" = "2" ]] || false
+
     run dolt sql -b -q "SET @@show_external_procedures = 0;SHOW PROCEDURE STATUS" -r=csv
     [ "$status" -eq "0" ]
     [[ "$output" =~ "Db,Name,Type,Definer,Modified,Created,Security_type,Comment,character_set_client,collation_connection,Database Collation" ]] || false
     [[ ! "$output" =~ ',p1,PROCEDURE,' ]] || false
     [[ ! "$output" =~ ',p2,PROCEDURE,' ]] || false
-    [[ "${#lines[@]}" = "2" ]] || false
 }
 
 @test "sql: check info_schema routines and parameters tables for stored procedures" {
@@ -2508,8 +2486,6 @@ SQL
 }
 
 @test "sql: found_row works with update properly in batch mode" {
-    skip "the auto commit semantics of batch mode make this fail"
-
     run dolt sql <<SQL
 CREATE TABLE tbl(pk int primary key, v1 int);
 INSERT INTO tbl VALUES (1,1), (2,1);
@@ -2591,7 +2567,7 @@ SQL
     [ "$status" -eq 0 ]
     [[ "$output" =~ "3" ]] || false
 
-    run dolt sql -q "SELECT COUNT(*) from dolt_diff_t where to_commit_date < now()"
+    run dolt sql -q "SELECT COUNT(*) from dolt_diff_t where to_commit_date < UTC_TIMESTAMP(6)"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "3" ]] || false
 }
@@ -2725,6 +2701,7 @@ SQL
     [[ "$output" =~ "*************************** 14. row ***************************" ]] || false
 }
 
+# bats test_tags=no_lambda
 @test "sql: vertical query format in sql shell" {
     skiponwindows "Need to install expect and make this script work on windows."
 
@@ -2822,4 +2799,112 @@ SQL
 [[ "$output" =~ "Query OK, 1 row affected (1".*" sec)" ]] || false
 [[ "$output" =~ "Query OK, 1 row affected (2".*" sec)" ]] || false
 [[ "$output" =~ "Query OK, 1 row affected (3".*" sec)" ]] || false
+}
+
+
+@test "sql: check --data-dir used from a completely different location and still resolve DB names" {
+    # remove config files
+    rm -rf .doltcfg
+    rm -rf db_dir
+
+    mkdir db_dir
+    cd db_dir
+    ROOT_DIR=$(pwd)
+
+    # create an alternate database, without the table
+    mkdir dba
+    cd dba
+    dolt init
+    cd ..
+    dolt sql -q "create table dba_tbl (id int)"
+
+    mkdir dbb
+    cd dbb
+    dolt init
+    dolt sql -q "create table dbb_tbl (id int)"
+
+    # Ensure --data-dir flag is really used by changing the cwd.
+    cd /tmp
+
+    run dolt --data-dir="$ROOT_DIR/dbb" sql -q "show tables"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "dbb_tbl" ]] || false
+
+    run dolt --data-dir="$ROOT_DIR/dba" sql -q "show tables"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "dba_tbl" ]] || false
+
+    # Default to first DB alphabetically.
+    run dolt --data-dir="$ROOT_DIR" sql -q "show tables"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "dba_tbl" ]] || false
+
+    # --use-db arg can be used to be specific.
+    run dolt --data-dir="$ROOT_DIR" --use-db=dbb sql -q "show tables"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "dbb_tbl" ]] || false
+
+    # Redundant use of the flag is OK.
+    run dolt --data-dir="$ROOT_DIR/dbb" --use-db=dbb sql -q "show tables"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "dbb_tbl" ]] || false
+
+    # Use of the use-db flag when we have a different DB specified by data-dir should error.
+    run dolt --data-dir="$ROOT_DIR/dbb" --use-db=dba sql -q "show tables"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "provided --use-db dba does not exist" ]] || false
+}
+
+@test "sql: USE information schema and mysql databases" {
+    run dolt sql <<SQL
+USE information_schema;
+show tables;
+SQL
+
+    # spot check result
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Database changed" ]] || false
+    [[ "$output" =~ "columns" ]] || false
+
+    run dolt sql <<SQL
+USE mysql;
+show tables;
+SQL
+
+    # spot check result
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Database changed" ]] || false
+    [[ "$output" =~ "role_edges" ]] || false
+
+}
+
+@test "sql: prevent LOAD_FILE() from accessing files outside of working directory" {
+    echo "should not be able to read this" > ../dont_read.txt
+    echo "should be able to read this" > ./do_read.txt
+
+    run dolt sql -q "select load_file('../dont_read.txt')";
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "NULL" ]] || false
+    [[ "$output" != "should not be able to read this" ]] || false
+
+    run dolt sql -q "select load_file('./do_read.txt')";
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "should be able to read this" ]] || false
+}
+
+@test "sql: ignore an empty .dolt directory" {
+    mkdir empty_dir
+    cd empty_dir
+
+    mkdir .dolt
+    dolt sql -q "select 1"
+}
+
+@test "sql: handle importing files with bom headers" {
+    dolt sql < $BATS_TEST_DIRNAME/helper/with_utf8_bom.sql
+    dolt table rm t1
+    dolt sql < $BATS_TEST_DIRNAME/helper/with_utf16le_bom.sql
+    dolt table rm t1
+    dolt sql < $BATS_TEST_DIRNAME/helper/with_utf16be_bom.sql
+    dolt table rm t1
 }

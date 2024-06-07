@@ -20,12 +20,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqlserver"
+
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 )
 
 var DoltBinlogReplicaController = newDoltBinlogReplicaController()
+
+// binlogApplierUser is the locked, super user account that is used to execute replicated SQL statements.
+// We cannot always assume the root account will exist, so we automatically create this account that is
+// specific to binlog replication and lock it so that it cannot be used to login.
+const binlogApplierUser = "dolt-binlog-applier"
 
 // ErrServerNotConfiguredAsReplica is returned when replication is started without enough configuration provided.
 var ErrServerNotConfiguredAsReplica = fmt.Errorf(
@@ -123,8 +130,53 @@ func (d *doltBinlogReplicaController) StartReplica(ctx *sql.Context) error {
 		return fmt.Errorf("no execution context set for the replica controller")
 	}
 
+	err = d.configureReplicationUser(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Set execution context's user to the binlog replication user
+	d.ctx.SetClient(sql.Client{
+		User:    binlogApplierUser,
+		Address: "localhost",
+	})
+
 	ctx.GetLogger().Info("starting binlog replication...")
 	d.applier.Go(d.ctx)
+	return nil
+}
+
+// configureReplicationUser creates or configures the super user account needed to apply replication
+// changes and execute DDL statements on the running server. If the account doesn't exist, it will be
+// created and locked to disable log ins, and if it does exist, but is missing super privs or is not
+// locked, it will be given super user privs and locked.
+func (d *doltBinlogReplicaController) configureReplicationUser(ctx *sql.Context) error {
+	server := sqlserver.GetRunningServer()
+	if server == nil {
+		return fmt.Errorf("unable to access a running SQL server")
+	}
+	mySQLDb := server.Engine.Analyzer.Catalog.MySQLDb
+	ed := mySQLDb.Editor()
+	defer ed.Close()
+
+	replicationUser := mySQLDb.GetUser(ed, binlogApplierUser, "localhost", false)
+	if replicationUser == nil {
+		// If the replication user doesn't exist yet, create it and lock it
+		mySQLDb.AddSuperUser(ed, binlogApplierUser, "localhost", "")
+		replicationUser := mySQLDb.GetUser(ed, binlogApplierUser, "localhost", false)
+		if replicationUser == nil {
+			return fmt.Errorf("unable to load replication user")
+		}
+		// Make sure this account is locked so that it cannot be used to log in
+		replicationUser.Locked = true
+		ed.PutUser(replicationUser)
+	} else if replicationUser.IsSuperUser == false || replicationUser.Locked == false {
+		// Fix the replication user if it has been modified
+		replicationUser.IsSuperUser = true
+		replicationUser.Locked = true
+		ed.PutUser(replicationUser)
+	}
+
 	return nil
 }
 
@@ -201,6 +253,14 @@ func (d *doltBinlogReplicaController) SetReplicationSourceOptions(ctx *sql.Conte
 				return err
 			}
 			replicaSourceInfo.ConnectRetryCount = uint64(intValue)
+		case "SOURCE_AUTO_POSITION":
+			intValue, err := getOptionValueAsInt(option)
+			if err != nil {
+				return err
+			}
+			if intValue < 1 {
+				return fmt.Errorf("SOURCE_AUTO_POSITION cannot be disabled")
+			}
 		default:
 			return fmt.Errorf("unknown replication source option: %s", option.Name)
 		}
@@ -387,7 +447,7 @@ func getOptionValueAsTableNames(option binlogreplication.ReplicationOption) ([]s
 
 func verifyAllTablesAreQualified(urts []sql.UnresolvedTable) error {
 	for _, urt := range urts {
-		if urt.Database() == "" {
+		if urt.Database().Name() == "" {
 			return fmt.Errorf("no database specified for table '%s'; "+
 				"all filter table names must be qualified with a database name", urt.Name())
 		}

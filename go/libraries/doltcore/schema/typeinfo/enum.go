@@ -43,7 +43,7 @@ func CreateEnumTypeFromParams(params map[string]string) (TypeInfo, error) {
 	var collation sql.CollationID
 	var err error
 	if collationStr, ok := params[enumTypeParam_Collation]; ok {
-		collation, err = sql.ParseCollation(nil, &collationStr, false)
+		collation, err = sql.ParseCollation("", collationStr, false)
 		if err != nil {
 			return nil, err
 		}
@@ -64,7 +64,11 @@ func CreateEnumTypeFromParams(params map[string]string) (TypeInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &enumType{sqlEnumType}, nil
+	return CreateEnumTypeFromSqlEnumType(sqlEnumType), nil
+}
+
+func CreateEnumTypeFromSqlEnumType(sqlEnumType sql.EnumType) TypeInfo {
+	return &enumType{sqlEnumType}
 }
 
 // ConvertNomsValueToValue implements TypeInfo interface.
@@ -96,7 +100,7 @@ func (ti *enumType) ConvertValueToNomsValue(ctx context.Context, vrw types.Value
 	if v == nil {
 		return types.NullValue, nil
 	}
-	val, err := ti.sqlEnumType.Convert(v)
+	val, _, err := ti.sqlEnumType.Convert(v)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +222,7 @@ func enumTypeConverter(ctx context.Context, src *enumType, destTi TypeInfo) (tc 
 			if !ok {
 				return nil, fmt.Errorf("%s does not contain an equivalent value of %d", src.sqlEnumType.String(), val)
 			}
-			newVal, err := dest.sqlEnumType.Convert(valStr)
+			newVal, _, err := dest.sqlEnumType.Convert(valStr)
 			if err != nil {
 				return nil, err
 			}

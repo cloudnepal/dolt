@@ -190,12 +190,11 @@ CREATE TABLE test (
 SQL
     run dolt schema show
     [ "$status" -eq "0" ]
-    [[ "$output" =~ "\`v\` tinyint" ]] || false
+    [[ "$output" =~ "\`v\` tinyint(1)" ]] || false
 
     # check information_schema.COLUMNS table
-    # TODO : 'column_type' should be 'tinyint(1)'
     run dolt sql -q "select * from information_schema.COLUMNS where table_name = 'test' and column_name = 'v';" -r csv
-    [[ "$output" =~ 'test,v,2,,YES,tinyint,,,3,0,,,,tinyint,"","","insert,references,select,update","","",' ]] || false
+    [[ "$output" =~ 'test,v,2,,YES,tinyint,,,3,0,,,,tinyint(1),"","","insert,references,select,update","","",' ]] || false
 }
 
 @test "types: BOOLEAN" {
@@ -208,7 +207,7 @@ CREATE TABLE test (
 SQL
     run dolt schema show
     [ "$status" -eq "0" ]
-    [[ "$output" =~ "\`v\` tinyint" ]] || false
+    [[ "$output" =~ "\`v\` tinyint(1)" ]] || false
     dolt sql -q "INSERT INTO test VALUES (1, true);"
     run dolt sql -q "SELECT * FROM test"
     [ "$status" -eq "0" ]
@@ -219,9 +218,8 @@ SQL
     [[ "${lines[3]}" =~ " 0 " ]] || false
 
     # check information_schema.COLUMNS table
-    # TODO : 'column_type' should be 'tinyint(1)'
     run dolt sql -q "select * from information_schema.COLUMNS where table_name = 'test' and column_name = 'v';" -r csv
-    [[ "$output" =~ 'test,v,2,,YES,tinyint,,,3,0,,,,tinyint,"","","insert,references,select,update","","",' ]] || false
+    [[ "$output" =~ 'test,v,2,,YES,tinyint,,,3,0,,,,tinyint(1),"","","insert,references,select,update","","",' ]] || false
 }
 
 @test "types: CHAR(10)" {
@@ -338,13 +336,13 @@ SQL
     dolt sql <<SQL
 CREATE TABLE test (
   pk BIGINT NOT NULL,
-  v DATETIME,
+  v DATETIME(6),
   PRIMARY KEY (pk)
 );
 SQL
     run dolt schema show
     [ "$status" -eq "0" ]
-    [[ "$output" =~ "\`v\` datetime" ]] || false
+    [[ "$output" =~ "\`v\` datetime(6)" ]] || false
     dolt sql -q "INSERT INTO test VALUES (1, '2020-02-10 11:12:13.456789');"
     run dolt sql -q "SELECT * FROM test"
     [ "$status" -eq "0" ]
@@ -380,7 +378,24 @@ SQL
 
     # check information_schema.COLUMNS table
     run dolt sql -q "select * from information_schema.COLUMNS where table_name = 'test' and column_name = 'v';" -r csv
-    [[ "$output" =~ 'test,v,2,,YES,datetime,,,,,0,,,datetime,"","","insert,references,select,update","","",' ]] || false
+    [[ "$output" =~ 'test,v,2,,YES,datetime,,,,,0,,,datetime(6),"","","insert,references,select,update","","",' ]] || false
+
+    dolt sql <<SQL
+drop table test;
+CREATE TABLE test (
+  pk BIGINT NOT NULL,
+  v DATETIME,
+  PRIMARY KEY (pk)
+);
+SQL
+    run dolt schema show
+    [ "$status" -eq "0" ]
+    [[ "$output" =~ "\`v\` datetime" ]] || false
+    dolt sql -q "INSERT INTO test VALUES (1, '2020-02-10 11:12:13.456789');"
+    run dolt sql -q "SELECT * FROM test"
+    [ "$status" -eq "0" ]
+    [[ "${lines[3]}" =~ " 2020-02-10 11:12:13 " ]] || false
+
 }
 
 @test "types: DEC" {
@@ -1333,7 +1348,7 @@ SQL
     dolt sql <<SQL
 CREATE TABLE test (
   pk BIGINT NOT NULL,
-  v TIMESTAMP,
+  v TIMESTAMP(6),
   PRIMARY KEY (pk)
 );
 SQL
@@ -1359,7 +1374,23 @@ SQL
 
     # check information_schema.COLUMNS table
     run dolt sql -q "select * from information_schema.COLUMNS where table_name = 'test' and column_name = 'v';" -r csv
-    [[ "$output" =~ 'test,v,2,,YES,timestamp,,,,,0,,,timestamp,"","","insert,references,select,update","","",' ]] || false
+    [[ "$output" =~ 'test,v,2,,YES,timestamp,,,,,0,,,timestamp(6),"","","insert,references,select,update","","",' ]] || false
+
+    dolt sql <<SQL
+drop table test;
+CREATE TABLE test (
+  pk BIGINT NOT NULL,
+  v TIMESTAMP,
+  PRIMARY KEY (pk)
+);
+SQL
+    run dolt schema show
+    [ "$status" -eq "0" ]
+    [[ "$output" =~ "\`v\` timestamp" ]] || false
+    dolt sql -q "INSERT INTO test VALUES (1, '2020-02-10 11:12:13.456789');"
+    run dolt sql -q "SELECT * FROM test"
+    [ "$status" -eq "0" ]
+    [[ "${lines[3]}" =~ " 2020-02-10 11:12:13 " ]] || false
 }
 
 @test "types: TINYBLOB" {

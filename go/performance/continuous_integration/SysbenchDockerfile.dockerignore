@@ -2,6 +2,6 @@
 **
 
 # Except for the following
+!mysqld.cnf
 !go
-!config.json
 !sysbench-runner-tests-entrypoint.sh

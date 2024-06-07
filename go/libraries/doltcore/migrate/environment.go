@@ -96,18 +96,18 @@ func initMigrationDB(ctx context.Context, existing *env.DoltEnv, src, dest files
 	}
 
 	ierr := src.Iter(doltDir, true, func(path string, size int64, isDir bool) (stop bool) {
+		path, err = filepath.Rel(base, path)
+		if err != nil {
+			stop = true
+			return
+		}
+
 		if isDir {
 			err = dest.MkDirs(path)
 			stop = err != nil
 			return
 		}
 		if strings.Contains(path, nomsDir) {
-			return
-		}
-
-		path, err = filepath.Rel(base, path)
-		if err != nil {
-			stop = true
 			return
 		}
 
@@ -158,14 +158,13 @@ func initMigrationDB(ctx context.Context, existing *env.DoltEnv, src, dest files
 	if err != nil {
 		return err
 	}
-	nv := doltdb.HackNomsValuesFromRootValues(rv)
 
 	ds, err := db.GetDataset(ctx, ref.NewInternalRef(migrationRef).String())
 	if err != nil {
 		return err
 	}
 
-	_, err = db.Commit(ctx, ds, nv, datas.CommitOptions{Meta: meta})
+	_, err = db.Commit(ctx, ds, rv.NomsValue(), datas.CommitOptions{Meta: meta})
 	return nil
 }
 

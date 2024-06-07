@@ -21,10 +21,15 @@ import (
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
+const JournalFileID = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+
 // TableFile is an interface for working with an existing table file
 type TableFile interface {
 	// FileID gets the id of the file
 	FileID() string
+
+	// LocationPrefix
+	LocationPrefix() string
 
 	// NumChunks returns the number of chunks in a table file
 	NumChunks() int

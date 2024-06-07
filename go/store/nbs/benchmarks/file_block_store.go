@@ -58,12 +58,16 @@ func (fb fileBlockStore) HasMany(ctx context.Context, hashes hash.HashSet) (pres
 	panic("not impl")
 }
 
-func (fb fileBlockStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCb) error {
+func (fb fileBlockStore) Put(ctx context.Context, c chunks.Chunk, _ chunks.GetAddrsCurry) error {
 	_, err := io.Copy(fb.bw, bytes.NewReader(c.Data()))
 	return err
 }
 
 func (fb fileBlockStore) Version() string {
+	panic("not impl")
+}
+
+func (fb fileBlockStore) AccessMode() chunks.ExclusiveAccessMode {
 	panic("not impl")
 }
 
@@ -91,4 +95,8 @@ func (fb fileBlockStore) Root(ctx context.Context) (hash.Hash, error) {
 func (fb fileBlockStore) Commit(ctx context.Context, current, last hash.Hash) (bool, error) {
 	err := fb.bw.Flush()
 	return true, err
+}
+
+func (fb fileBlockStore) PersistGhostHashes(ctx context.Context, refs hash.HashSet) error {
+	panic("not impl")
 }

@@ -35,6 +35,7 @@ func TestDoltTransactionCommitOneClient(t *testing.T) {
 	// In this test, we're setting only one client to match transaction commits to dolt commits.
 	// Autocommit is disabled for the enabled client, as it's the recommended way to use this feature.
 	harness := newDoltHarness(t)
+	defer harness.Close()
 	harness.Setup(setup.MydbData)
 	enginetest.TestTransactionScript(t, harness, queries.TransactionTest{
 		Name: "dolt commit on transaction commit one client",
@@ -144,6 +145,22 @@ func TestDoltTransactionCommitOneClient(t *testing.T) {
 				Query:    "/* client c */ SELECT * FROM x ORDER BY y;",
 				Expected: []sql.Row{{1, 1}, {2, 2}, {3, 3}},
 			},
+			{
+				Query:    "/* client a */ SET @@dolt_transaction_commit_message='Commit Message 42';",
+				Expected: []sql.Row{{}},
+			},
+			{
+				Query:    "/* client a */ create table newTable(pk int primary key);",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "/* client a */ COMMIT;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "/* client a */ SELECT message from dolt_log ORDER BY date DESC LIMIT 1;",
+				Expected: []sql.Row{{"Commit Message 42"}},
+			},
 		},
 	})
 	_, err := harness.NewEngine(t)
@@ -157,16 +174,32 @@ func TestDoltTransactionCommitOneClient(t *testing.T) {
 	require.NoError(t, err)
 	headRefs, err := db.GetHeadRefs(context.Background())
 	require.NoError(t, err)
-	commit, err := db.Resolve(context.Background(), cs, headRefs[0])
+	optCmt, err := db.Resolve(context.Background(), cs, headRefs[0])
 	require.NoError(t, err)
+	commit, ok := optCmt.ToCommit()
+	require.True(t, ok)
 	cm, err := commit.GetCommitMeta(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, cm.Description, "Commit Message 42")
+
+	cs, err = doltdb.NewCommitSpec("HEAD~1")
+	require.NoError(t, err)
+	headRefs, err = db.GetHeadRefs(context.Background())
+	require.NoError(t, err)
+	optCmt, err = db.Resolve(context.Background(), cs, headRefs[0])
+	require.NoError(t, err)
+	commit, ok = optCmt.ToCommit()
+	require.True(t, ok)
+	cm, err = commit.GetCommitMeta(context.Background())
 	require.NoError(t, err)
 	require.Contains(t, cm.Description, "Transaction commit")
 
 	as, err := doltdb.NewAncestorSpec("~1")
 	require.NoError(t, err)
-	initialCommit, err := commit.GetAncestor(context.Background(), as)
+	optCmt, err = commit.GetAncestor(context.Background(), as)
 	require.NoError(t, err)
+	initialCommit, ok := optCmt.ToCommit()
+	require.True(t, ok)
 	icm, err := initialCommit.GetCommitMeta(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "checkpoint enginetest database mydb", icm.Description)
@@ -176,6 +209,7 @@ func TestDoltTransactionCommitTwoClients(t *testing.T) {
 	// In this test, we're setting both clients to match transaction commits to dolt commits.
 	// Autocommit is disabled, as it's the recommended way to use this feature.
 	harness := newDoltHarness(t)
+	defer harness.Close()
 	enginetest.TestTransactionScript(t, harness, queries.TransactionTest{
 		Name: "dolt commit on transaction commit two clients",
 		SetUpScript: []string{
@@ -257,12 +291,20 @@ func TestDoltTransactionCommitTwoClients(t *testing.T) {
 				Expected: []sql.Row{{true}},
 			},
 			{
+				Query:    "/* client b */ SET @@dolt_transaction_commit_message='ClientB Commit';",
+				Expected: []sql.Row{{}},
+			},
+			{
 				Query:    "/* client b */ COMMIT;",
 				Expected: []sql.Row{},
 			},
 			{
 				Query:    "/* client a */ SELECT @@mydb_head like @initial_head;",
 				Expected: []sql.Row{{true}},
+			},
+			{
+				Query:    "/* client a */ SET @@dolt_transaction_commit_message='ClientA Commit';",
+				Expected: []sql.Row{{}},
 			},
 			{
 				Query:    "/* client a */ COMMIT;",
@@ -311,22 +353,28 @@ func TestDoltTransactionCommitTwoClients(t *testing.T) {
 	require.NoError(t, err)
 	headRefs, err := db.GetHeadRefs(context.Background())
 	require.NoError(t, err)
-	commit2, err := db.Resolve(context.Background(), cs, headRefs[0])
+	optCmt, err := db.Resolve(context.Background(), cs, headRefs[0])
 	require.NoError(t, err)
+	commit2, ok := optCmt.ToCommit()
+	require.True(t, ok)
 	cm2, err := commit2.GetCommitMeta(context.Background())
 	require.NoError(t, err)
-	require.Contains(t, cm2.Description, "Transaction commit")
+	require.Contains(t, cm2.Description, "ClientA Commit")
 
 	as, err := doltdb.NewAncestorSpec("~1")
 	require.NoError(t, err)
-	commit1, err := commit2.GetAncestor(context.Background(), as)
+	optCmt, err = commit2.GetAncestor(context.Background(), as)
 	require.NoError(t, err)
+	commit1, ok := optCmt.ToCommit()
+	require.True(t, ok)
 	cm1, err := commit1.GetCommitMeta(context.Background())
 	require.NoError(t, err)
-	require.Contains(t, cm1.Description, "Transaction commit")
+	require.Contains(t, cm1.Description, "ClientB Commit")
 
-	commit0, err := commit1.GetAncestor(context.Background(), as)
+	optCmt, err = commit1.GetAncestor(context.Background(), as)
 	require.NoError(t, err)
+	commit0, ok := optCmt.ToCommit()
+	require.True(t, ok)
 	cm0, err := commit0.GetCommitMeta(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "checkpoint enginetest database mydb", cm0.Description)
@@ -336,6 +384,7 @@ func TestDoltTransactionCommitAutocommit(t *testing.T) {
 	// In this test, each insertion from both clients cause a commit as autocommit is enabled.
 	// Not the recommended way to use the feature, but it's permitted.
 	harness := newDoltHarness(t)
+	defer harness.Close()
 	enginetest.TestTransactionScript(t, harness, queries.TransactionTest{
 		Name: "dolt commit with autocommit",
 		SetUpScript: []string{
@@ -350,6 +399,10 @@ func TestDoltTransactionCommitAutocommit(t *testing.T) {
 			},
 			{
 				Query:    "/* client b */ SET @@dolt_transaction_commit=1;",
+				Expected: []sql.Row{{}},
+			},
+			{
+				Query:    "/* client b */ SET @@dolt_transaction_commit_message='ClientB Commit';",
 				Expected: []sql.Row{{}},
 			},
 			{
@@ -381,39 +434,41 @@ func TestDoltTransactionCommitAutocommit(t *testing.T) {
 	if !ok {
 		t.Fatal("'mydb' database not found")
 	}
-	cs, err := doltdb.NewCommitSpec("HEAD")
+
+	headSpec, err := doltdb.NewCommitSpec("HEAD")
 	require.NoError(t, err)
 	headRefs, err := db.GetHeadRefs(context.Background())
 	require.NoError(t, err)
-	commit3, err := db.Resolve(context.Background(), cs, headRefs[0])
+	optCmt, err := db.Resolve(context.Background(), headSpec, headRefs[0])
 	require.NoError(t, err)
-	cm3, err := commit3.GetCommitMeta(context.Background())
+	head, ok := optCmt.ToCommit()
+	require.True(t, ok)
+	headMeta, err := head.GetCommitMeta(context.Background())
 	require.NoError(t, err)
-	require.Contains(t, cm3.Description, "Transaction commit")
+	require.Contains(t, headMeta.Description, "ClientB Commit")
 
-	as, err := doltdb.NewAncestorSpec("~1")
+	ancestorSpec, err := doltdb.NewAncestorSpec("~1")
 	require.NoError(t, err)
-	commit2, err := commit3.GetAncestor(context.Background(), as)
+	optCmt, err = head.GetAncestor(context.Background(), ancestorSpec)
 	require.NoError(t, err)
-	cm2, err := commit2.GetCommitMeta(context.Background())
+	parent, ok := optCmt.ToCommit()
+	require.True(t, ok)
+	parentMeta, err := parent.GetCommitMeta(context.Background())
 	require.NoError(t, err)
-	require.Contains(t, cm2.Description, "Transaction commit")
+	require.Contains(t, parentMeta.Description, "Transaction commit")
 
-	commit1, err := commit2.GetAncestor(context.Background(), as)
+	optCmt, err = parent.GetAncestor(context.Background(), ancestorSpec)
 	require.NoError(t, err)
-	cm1, err := commit1.GetCommitMeta(context.Background())
+	grandParent, ok := optCmt.ToCommit()
+	require.True(t, ok)
+	grandparentMeta, err := grandParent.GetCommitMeta(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, "Transaction commit", cm1.Description)
-
-	commit0, err := commit1.GetAncestor(context.Background(), as)
-	require.NoError(t, err)
-	cm0, err := commit0.GetCommitMeta(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "checkpoint enginetest database mydb", cm0.Description)
+	require.Equal(t, "checkpoint enginetest database mydb", grandparentMeta.Description)
 }
 
 func TestDoltTransactionCommitLateFkResolution(t *testing.T) {
 	harness := newDoltHarness(t)
+	defer harness.Close()
 	enginetest.TestTransactionScript(t, harness, queries.TransactionTest{
 		Name: "delayed foreign key resolution with transaction commits",
 		SetUpScript: []string{

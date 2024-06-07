@@ -33,6 +33,7 @@ import (
 func TestHistoryTable(t *testing.T) {
 	SkipByDefaultInCI(t)
 	dEnv := setupHistoryTests(t)
+	defer dEnv.DoltDB.Close()
 	for _, test := range historyTableTests() {
 		t.Run(test.name, func(t *testing.T) {
 			testHistoryTable(t, test, dEnv)
@@ -180,7 +181,7 @@ func historyTableTests() []historyTableTest {
 		},
 		{
 			name:  "commit is not null",
-			query: fmt.Sprintf("select pk, c0, commit_hash from dolt_history_test where commit_hash is not null;"),
+			query: "select pk, c0, commit_hash from dolt_history_test where commit_hash is not null;",
 			rows: []sql.Row{
 				{int32(0), int32(10), HEAD},
 				{int32(1), int32(1), HEAD},
@@ -211,8 +212,11 @@ var INIT = ""   // HEAD~4
 func setupHistoryTests(t *testing.T) *env.DoltEnv {
 	ctx := context.Background()
 	dEnv := dtestutils.CreateTestEnv()
+	cliCtx, verr := cmd.NewArgFreeCliContext(ctx, dEnv)
+	require.NoError(t, verr)
+
 	for _, c := range setupCommon {
-		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv)
+		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 		require.Equal(t, 0, exitCode)
 	}
 
@@ -235,8 +239,11 @@ func setupHistoryTests(t *testing.T) *env.DoltEnv {
 
 func testHistoryTable(t *testing.T, test historyTableTest, dEnv *env.DoltEnv) {
 	ctx := context.Background()
+	cliCtx, verr := cmd.NewArgFreeCliContext(ctx, dEnv)
+	require.NoError(t, verr)
+
 	for _, c := range test.setup {
-		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv)
+		exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 		require.Equal(t, 0, exitCode)
 	}
 

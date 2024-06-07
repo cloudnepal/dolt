@@ -19,24 +19,32 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 
 	gms "github.com/dolthub/go-mysql-server"
+	"github.com/dolthub/go-mysql-server/eventscheduler"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/analyzer"
 	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
+	"github.com/dolthub/go-mysql-server/sql/rowexec"
 	_ "github.com/dolthub/go-mysql-server/sql/variables"
-	"github.com/dolthub/vitess/go/vt/sqlparser"
+	"github.com/sirupsen/logrus"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/servercfg"
 	dsqle "github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	dblr "github.com/dolthub/dolt/go/libraries/doltcore/sqle/binlogreplication"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/cluster"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/mysql_file_handler"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statsnoms"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statspro"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 	"github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/store/types"
 )
@@ -47,11 +55,12 @@ type SqlEngine struct {
 	contextFactory contextFactory
 	dsessFactory   sessionFactory
 	engine         *gms.Engine
-	resultFormat   PrintResultFormat
 }
 
 type sessionFactory func(mysqlSess *sql.BaseSession, pro sql.DatabaseProvider) (*dsess.DoltSession, error)
 type contextFactory func(ctx context.Context, session sql.Session) (*sql.Context, error)
+
+type SystemVariables map[string]interface{}
 
 type SqlEngineConfig struct {
 	IsReadOnly              bool
@@ -63,23 +72,21 @@ type SqlEngineConfig struct {
 	ServerPass              string
 	ServerHost              string
 	Autocommit              bool
+	DoltTransactionCommit   bool
 	Bulk                    bool
-	JwksConfig              []JwksConfig
+	JwksConfig              []servercfg.JwksConfig
+	SystemVariables         SystemVariables
 	ClusterController       *cluster.Controller
 	BinlogReplicaController binlogreplication.BinlogReplicaController
+	EventSchedulerStatus    eventscheduler.SchedulerStatus
 }
 
 // NewSqlEngine returns a SqlEngine
 func NewSqlEngine(
 	ctx context.Context,
 	mrEnv *env.MultiRepoEnv,
-	format PrintResultFormat,
 	config *SqlEngineConfig,
 ) (*SqlEngine, error) {
-	if ok, _ := mrEnv.IsLocked(); ok {
-		config.IsServerLocked = true
-	}
-
 	dbs, locations, err := CollectDBs(ctx, mrEnv, config.Bulk)
 	if err != nil {
 		return nil, err
@@ -107,11 +114,16 @@ func NewSqlEngine(
 		return nil, err
 	}
 
-	all := append(dbs)
+	err = applySystemVariables(sql.SystemVariables, config.SystemVariables)
+	if err != nil {
+		return nil, err
+	}
+
+	all := dbs[:]
 
 	clusterDB := config.ClusterController.ClusterDatabase()
 	if clusterDB != nil {
-		all = append(all, clusterDB.(dsqle.SqlDatabase))
+		all = append(all, clusterDB.(dsess.SqlDatabase))
 		locations = append(locations, nil)
 	}
 
@@ -123,41 +135,79 @@ func NewSqlEngine(
 	pro = pro.WithRemoteDialer(mrEnv.RemoteDialProvider())
 
 	config.ClusterController.RegisterStoredProcedures(pro)
-	pro.InitDatabaseHook = cluster.NewInitDatabaseHook(config.ClusterController, bThreads, pro.InitDatabaseHook)
-	config.ClusterController.ManageDatabaseProvider(pro)
+	if config.ClusterController != nil {
+		pro.InitDatabaseHooks = append(pro.InitDatabaseHooks, cluster.NewInitDatabaseHook(config.ClusterController, bThreads))
+		pro.DropDatabaseHooks = append(pro.DropDatabaseHooks, config.ClusterController.DropDatabaseHook())
+		config.ClusterController.SetDropDatabase(pro.DropDatabase)
+	}
+
+	sqlEngine := &SqlEngine{}
+
+	// Create the engine
+	engine := gms.New(analyzer.NewBuilder(pro).WithParallelism(parallelism).Build(), &gms.Config{
+		IsReadOnly:     config.IsReadOnly,
+		IsServerLocked: config.IsServerLocked,
+	}).WithBackgroundThreads(bThreads)
+
+	config.ClusterController.SetIsStandbyCallback(func(isStandby bool) {
+		pro.SetIsStandby(isStandby)
+
+		// Standbys are read only, primarys are not.
+		// We only change this here if the server was not forced read
+		// only by its startup config.
+		if !config.IsReadOnly {
+			engine.ReadOnly.Store(isStandby)
+		}
+	})
 
 	// Load in privileges from file, if it exists
-	persister := mysql_file_handler.NewPersister(config.PrivFilePath, config.DoltCfgDirPath)
-	data, err := persister.LoadData()
+	var persister cluster.MySQLDbPersister
+	persister = mysql_file_handler.NewPersister(config.PrivFilePath, config.DoltCfgDirPath)
+
+	persister = config.ClusterController.HookMySQLDbPersister(persister, engine.Analyzer.Catalog.MySQLDb)
+	data, err := persister.LoadData(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// Load the branch control permissions, if they exist
 	var bcController *branch_control.Controller
-	if bcController, err = branch_control.LoadData(config.BranchCtrlFilePath, config.DoltCfgDirPath); err != nil {
+	if bcController, err = branch_control.LoadData(ctx, config.BranchCtrlFilePath, config.DoltCfgDirPath); err != nil {
 		return nil, err
 	}
+	config.ClusterController.HookBranchControlPersistence(bcController, mrEnv.FileSystem())
 
-	// Set up engine
-	engine := gms.New(analyzer.NewBuilder(pro).WithParallelism(parallelism).Build(), &gms.Config{
-		IsReadOnly:     config.IsReadOnly,
-		IsServerLocked: config.IsServerLocked,
-	}).WithBackgroundThreads(bThreads)
+	// Setup the engine.
 	engine.Analyzer.Catalog.MySQLDb.SetPersister(persister)
 
 	engine.Analyzer.Catalog.MySQLDb.SetPlugins(map[string]mysql_db.PlaintextAuthPlugin{
 		"authentication_dolt_jwt": NewAuthenticateDoltJWTPlugin(config.JwksConfig),
 	})
 
+	statsPro := statspro.NewProvider(pro, statsnoms.NewNomsStatsFactory(mrEnv.RemoteDialProvider()))
+	engine.Analyzer.Catalog.StatsProvider = statsPro
+
+	engine.Analyzer.ExecBuilder = rowexec.DefaultBuilder
+	sessFactory := doltSessionFactory(pro, statsPro, mrEnv.Config(), bcController, config.Autocommit)
+	sqlEngine.provider = pro
+	sqlEngine.contextFactory = sqlContextFactory()
+	sqlEngine.dsessFactory = sessFactory
+	sqlEngine.engine = engine
+
+	// configuring stats depends on sessionBuilder
+	// sessionBuilder needs ref to statsProv
+	if err = statsPro.Configure(ctx, sqlEngine.NewDefaultContext, bThreads, dbs); err != nil {
+		fmt.Fprintln(cli.CliErr, err)
+	}
+
 	// Load MySQL Db information
 	if err = engine.Analyzer.Catalog.MySQLDb.LoadData(sql.NewEmptyContext(), data); err != nil {
 		return nil, err
 	}
 
-	if dbg, ok := os.LookupEnv("DOLT_SQL_DEBUG_LOG"); ok && strings.ToLower(dbg) == "true" {
+	if dbg, ok := os.LookupEnv(dconfig.EnvSqlDebugLog); ok && strings.ToLower(dbg) == "true" {
 		engine.Analyzer.Debug = true
-		if verbose, ok := os.LookupEnv("DOLT_SQL_DEBUG_LOG_VERBOSE"); ok && strings.ToLower(verbose) == "true" {
+		if verbose, ok := os.LookupEnv(dconfig.EnvSqlDebugLogVerbose); ok && strings.ToLower(verbose) == "true" {
 			engine.Analyzer.Verbose = true
 		}
 	}
@@ -167,10 +217,20 @@ func NewSqlEngine(
 		db.DbData().Ddb.SetCommitHookLogger(ctx, cli.CliOut)
 	}
 
-	sessionFactory := doltSessionFactory(pro, mrEnv.Config(), bcController, config.Autocommit)
+	err = sql.SystemVariables.SetGlobal(dsess.DoltCommitOnTransactionCommit, config.DoltTransactionCommit)
+	if err != nil {
+		return nil, err
+	}
+
+	if engine.EventScheduler == nil {
+		err = configureEventScheduler(config, engine, sessFactory, pro)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	if config.BinlogReplicaController != nil {
-		binLogSession, err := sessionFactory(sql.NewBaseSession(), pro)
+		binLogSession, err := sessFactory(sql.NewBaseSession(), pro)
 		if err != nil {
 			return nil, err
 		}
@@ -181,29 +241,30 @@ func NewSqlEngine(
 		}
 	}
 
-	return &SqlEngine{
-		provider:       pro,
-		contextFactory: sqlContextFactory(),
-		dsessFactory:   sessionFactory,
-		engine:         engine,
-		resultFormat:   format,
-	}, nil
+	return sqlEngine, nil
 }
 
 // NewRebasedSqlEngine returns a smalled rebased engine primarily used in filterbranch.
 // TODO: migrate to provider
-func NewRebasedSqlEngine(engine *gms.Engine, dbs map[string]dsqle.SqlDatabase) *SqlEngine {
+func NewRebasedSqlEngine(engine *gms.Engine, dbs map[string]dsess.SqlDatabase) *SqlEngine {
 	return &SqlEngine{
 		engine: engine,
 	}
 }
 
+func applySystemVariables(vars sql.SystemVariableRegistry, cfg SystemVariables) error {
+	if cfg != nil {
+		return vars.AssignValues(cfg)
+	}
+	return nil
+}
+
 // Databases returns a slice of all databases in the engine
-func (se *SqlEngine) Databases(ctx *sql.Context) []dsqle.SqlDatabase {
+func (se *SqlEngine) Databases(ctx *sql.Context) []dsess.SqlDatabase {
 	databases := se.provider.AllDatabases(ctx)
-	dbs := make([]dsqle.SqlDatabase, len(databases))
+	dbs := make([]dsess.SqlDatabase, len(databases))
 	for i := range databases {
-		dbs[i] = databases[i].(dsqle.SqlDatabase)
+		dbs[i] = databases[i].(dsess.SqlDatabase)
 	}
 
 	return nil
@@ -239,12 +300,6 @@ func (se *SqlEngine) NewDoltSession(_ context.Context, mysqlSess *sql.BaseSessio
 	return se.dsessFactory(mysqlSess, se.provider)
 }
 
-// GetResultFormat returns the printing format of the engine. The format isn't used by the engine internally, only
-// stored for reference by clients who wish to use it to print results.
-func (se *SqlEngine) GetResultFormat() PrintResultFormat {
-	return se.resultFormat
-}
-
 // Query execute a SQL statement and return values for printing.
 func (se *SqlEngine) Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, error) {
 	return se.engine.Query(ctx, query)
@@ -253,39 +308,6 @@ func (se *SqlEngine) Query(ctx *sql.Context, query string) (sql.Schema, sql.RowI
 // Analyze analyzes a node.
 func (se *SqlEngine) Analyze(ctx *sql.Context, n sql.Node) (sql.Node, error) {
 	return se.engine.Analyzer.Analyze(ctx, n, nil)
-}
-
-// TODO: All of this logic should be moved to the engine...
-func (se *SqlEngine) Dbddl(ctx *sql.Context, dbddl *sqlparser.DBDDL, query string) (sql.Schema, sql.RowIter, error) {
-	action := strings.ToLower(dbddl.Action)
-	var rowIter sql.RowIter = nil
-	var err error = nil
-
-	if action != sqlparser.CreateStr && action != sqlparser.DropStr {
-		return nil, nil, fmt.Errorf("Unhandled DBDDL action %v in Query %v", action, query)
-	}
-
-	if action == sqlparser.DropStr {
-		// Should not be allowed to delete repo name and information schema
-		if dbddl.DBName == sql.InformationSchemaDatabaseName {
-			return nil, nil, fmt.Errorf("DROP DATABASE isn't supported for database %s", sql.InformationSchemaDatabaseName)
-		}
-	}
-
-	sch, rowIter, err := se.Query(ctx, query)
-
-	if rowIter != nil {
-		err = rowIter.Close(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return sch, nil, nil
 }
 
 func (se *SqlEngine) GetUnderlyingEngine() *gms.Engine {
@@ -301,21 +323,68 @@ func (se *SqlEngine) Close() error {
 
 // configureBinlogReplicaController configures the binlog replication controller with the |engine|.
 func configureBinlogReplicaController(config *SqlEngineConfig, engine *gms.Engine, session *dsess.DoltSession) error {
-	contextFactory := sqlContextFactory()
-
-	executionCtx, err := contextFactory(context.Background(), session)
+	ctxFactory := sqlContextFactory()
+	executionCtx, err := ctxFactory(context.Background(), session)
 	if err != nil {
 		return err
 	}
-	executionCtx.SetClient(sql.Client{
-		User:    "root",
-		Address: "localhost",
-	})
-
 	dblr.DoltBinlogReplicaController.SetExecutionContext(executionCtx)
-	engine.Analyzer.BinlogReplicaController = config.BinlogReplicaController
+	engine.Analyzer.Catalog.BinlogReplicaController = config.BinlogReplicaController
 
 	return nil
+}
+
+// configureEventScheduler configures the event scheduler with the |engine| for executing events, a |sessFactory|
+// for creating sessions, and a DoltDatabaseProvider, |pro|.
+func configureEventScheduler(config *SqlEngineConfig, engine *gms.Engine, sessFactory sessionFactory, pro *dsqle.DoltDatabaseProvider) error {
+	// need to give correct user, use the definer as user to run the event definition queries
+	ctxFactory := sqlContextFactory()
+
+	// getCtxFunc is used to create new session context for event scheduler.
+	// It starts a transaction that needs to be committed using the function returned.
+	getCtxFunc := func() (*sql.Context, func() error, error) {
+		sess, err := sessFactory(sql.NewBaseSession(), pro)
+		if err != nil {
+			return nil, func() error { return nil }, err
+		}
+
+		newCtx, err := ctxFactory(context.Background(), sess)
+		if err != nil {
+			return nil, func() error { return nil }, err
+		}
+
+		ts, ok := newCtx.Session.(sql.TransactionSession)
+		if !ok {
+			return nil, func() error { return nil }, nil
+		}
+
+		tr, err := sess.StartTransaction(newCtx, sql.ReadWrite)
+		if err != nil {
+			return nil, func() error { return nil }, err
+		}
+
+		ts.SetTransaction(tr)
+
+		return newCtx, func() error {
+			return ts.CommitTransaction(newCtx, tr)
+		}, nil
+	}
+
+	// A hidden env var allows overriding the event scheduler period for testing. This option is not
+	// exposed via configuration because we do not want to encourage customers to use it. If the value
+	// is equal to or less than 0, then the period is ignored and the default period, 30s, is used.
+	eventSchedulerPeriod := 0
+	eventSchedulerPeriodEnvVar := "DOLT_EVENT_SCHEDULER_PERIOD"
+	if s, ok := os.LookupEnv(eventSchedulerPeriodEnvVar); ok {
+		i, err := strconv.Atoi(s)
+		if err != nil {
+			logrus.Warnf("unable to parse value '%s' from env var '%s' as an integer", s, eventSchedulerPeriodEnvVar)
+		} else {
+			logrus.Warnf("overriding Dolt event scheduler period to %d seconds", i)
+			eventSchedulerPeriod = i
+		}
+	}
+	return engine.InitializeEventScheduler(getCtxFunc, config.EventSchedulerStatus, eventSchedulerPeriod)
 }
 
 // sqlContextFactory returns a contextFactory that creates a new sql.Context with the initial database provided
@@ -327,28 +396,28 @@ func sqlContextFactory() contextFactory {
 }
 
 // doltSessionFactory returns a sessionFactory that creates a new DoltSession
-func doltSessionFactory(pro dsqle.DoltDatabaseProvider, config config.ReadWriteConfig, bc *branch_control.Controller, autocommit bool) sessionFactory {
+func doltSessionFactory(pro *dsqle.DoltDatabaseProvider, statsPro sql.StatsProvider, config config.ReadWriteConfig, bc *branch_control.Controller, autocommit bool) sessionFactory {
 	return func(mysqlSess *sql.BaseSession, provider sql.DatabaseProvider) (*dsess.DoltSession, error) {
-		dsess, err := dsess.NewDoltSession(mysqlSess, pro, config, bc)
+		doltSession, err := dsess.NewDoltSession(mysqlSess, pro, config, bc, statsPro, writer.NewWriteSession)
 		if err != nil {
 			return nil, err
 		}
 
 		// nil ctx is actually fine in this context, not used in setting a session variable. Creating a new context isn't
 		// free, and would be throwaway work, since we need to create a session before creating a sql.Context for user work.
-		err = dsess.SetSessionVariable(nil, sql.AutoCommitSessionVar, autocommit)
+		err = doltSession.SetSessionVariable(nil, sql.AutoCommitSessionVar, autocommit)
 		if err != nil {
 			return nil, err
 		}
 
-		return dsess, nil
+		return doltSession, nil
 	}
 }
 
 // NewSqlEngineForEnv returns a SqlEngine configured for the environment provided, with a single root user.
 // Returns the new engine, the first database name, and any error that occurred.
 func NewSqlEngineForEnv(ctx context.Context, dEnv *env.DoltEnv) (*SqlEngine, string, error) {
-	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	if err != nil {
 		return nil, "", err
 	}
@@ -356,7 +425,6 @@ func NewSqlEngineForEnv(ctx context.Context, dEnv *env.DoltEnv) (*SqlEngine, str
 	engine, err := NewSqlEngine(
 		ctx,
 		mrEnv,
-		FormatCsv,
 		&SqlEngineConfig{
 			ServerUser: "root",
 			ServerHost: "localhost",

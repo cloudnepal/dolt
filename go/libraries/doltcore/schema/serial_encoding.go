@@ -17,13 +17,30 @@ package schema
 import (
 	"fmt"
 
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/dolthub/go-mysql-server/sql/types"
 	"github.com/dolthub/vitess/go/vt/proto/query"
 
 	"github.com/dolthub/dolt/go/gen/fb/serial"
 )
 
-// EncodingFromSqlType returns a serial.Encoding for a query.Type.
-func EncodingFromSqlType(typ query.Type) serial.Encoding {
+// EncodingFromSqlType returns a serial.Encoding for a sql.Type.
+func EncodingFromSqlType(typ sql.Type) serial.Encoding {
+	if extendedType, ok := typ.(types.ExtendedType); ok {
+		switch extendedType.MaxSerializedWidth() {
+		case types.ExtendedTypeSerializedWidth_64K:
+			return serial.EncodingExtended
+		case types.ExtendedTypeSerializedWidth_Unbounded:
+			return serial.EncodingExtendedAddr
+		default:
+			panic(fmt.Errorf("unknown serialization width"))
+		}
+	}
+	return EncodingFromQueryType(typ.Type())
+}
+
+// EncodingFromQueryType returns a serial.Encoding for a query.Type.
+func EncodingFromQueryType(typ query.Type) serial.Encoding {
 	switch typ {
 	case query.Type_INT8:
 		return serial.EncodingInt8
@@ -76,7 +93,7 @@ func EncodingFromSqlType(typ query.Type) serial.Encoding {
 	case query.Type_VARCHAR:
 		return serial.EncodingString
 	case query.Type_GEOMETRY:
-		return serial.EncodingGeometry
+		return serial.EncodingGeomAddr
 	case query.Type_JSON:
 		return serial.EncodingJSONAddr
 	case query.Type_BLOB:

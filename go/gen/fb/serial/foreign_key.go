@@ -19,7 +19,7 @@ package serial
 import (
 	"strconv"
 
-	flatbuffers "github.com/google/flatbuffers/go"
+	flatbuffers "github.com/dolthub/flatbuffers/v23/go"
 )
 
 type ForeignKeyReferentialAction byte
@@ -61,11 +61,7 @@ type ForeignKeyCollection struct {
 
 func InitForeignKeyCollectionRoot(o *ForeignKeyCollection, buf []byte, offset flatbuffers.UOffsetT) error {
 	n := flatbuffers.GetUOffsetT(buf[offset:])
-	o.Init(buf, n+offset)
-	if ForeignKeyCollectionNumFields < o.Table().NumFields() {
-		return flatbuffers.ErrTableHasUnknownFields
-	}
-	return nil
+	return o.Init(buf, n+offset)
 }
 
 func TryGetRootAsForeignKeyCollection(buf []byte, offset flatbuffers.UOffsetT) (*ForeignKeyCollection, error) {
@@ -73,42 +69,22 @@ func TryGetRootAsForeignKeyCollection(buf []byte, offset flatbuffers.UOffsetT) (
 	return x, InitForeignKeyCollectionRoot(x, buf, offset)
 }
 
-func GetRootAsForeignKeyCollection(buf []byte, offset flatbuffers.UOffsetT) *ForeignKeyCollection {
-	x := &ForeignKeyCollection{}
-	InitForeignKeyCollectionRoot(x, buf, offset)
-	return x
-}
-
 func TryGetSizePrefixedRootAsForeignKeyCollection(buf []byte, offset flatbuffers.UOffsetT) (*ForeignKeyCollection, error) {
 	x := &ForeignKeyCollection{}
 	return x, InitForeignKeyCollectionRoot(x, buf, offset+flatbuffers.SizeUint32)
 }
 
-func GetSizePrefixedRootAsForeignKeyCollection(buf []byte, offset flatbuffers.UOffsetT) *ForeignKeyCollection {
-	x := &ForeignKeyCollection{}
-	InitForeignKeyCollectionRoot(x, buf, offset+flatbuffers.SizeUint32)
-	return x
-}
-
-func (rcv *ForeignKeyCollection) Init(buf []byte, i flatbuffers.UOffsetT) {
+func (rcv *ForeignKeyCollection) Init(buf []byte, i flatbuffers.UOffsetT) error {
 	rcv._tab.Bytes = buf
 	rcv._tab.Pos = i
+	if ForeignKeyCollectionNumFields < rcv.Table().NumFields() {
+		return flatbuffers.ErrTableHasUnknownFields
+	}
+	return nil
 }
 
 func (rcv *ForeignKeyCollection) Table() flatbuffers.Table {
 	return rcv._tab
-}
-
-func (rcv *ForeignKeyCollection) ForeignKeys(obj *ForeignKey, j int) bool {
-	o := flatbuffers.UOffsetT(rcv._tab.Offset(4))
-	if o != 0 {
-		x := rcv._tab.Vector(o)
-		x += flatbuffers.UOffsetT(j) * 4
-		x = rcv._tab.Indirect(x)
-		obj.Init(rcv._tab.Bytes, x)
-		return true
-	}
-	return false
 }
 
 func (rcv *ForeignKeyCollection) TryForeignKeys(obj *ForeignKey, j int) (bool, error) {
@@ -155,11 +131,7 @@ type ForeignKey struct {
 
 func InitForeignKeyRoot(o *ForeignKey, buf []byte, offset flatbuffers.UOffsetT) error {
 	n := flatbuffers.GetUOffsetT(buf[offset:])
-	o.Init(buf, n+offset)
-	if ForeignKeyNumFields < o.Table().NumFields() {
-		return flatbuffers.ErrTableHasUnknownFields
-	}
-	return nil
+	return o.Init(buf, n+offset)
 }
 
 func TryGetRootAsForeignKey(buf []byte, offset flatbuffers.UOffsetT) (*ForeignKey, error) {
@@ -167,26 +139,18 @@ func TryGetRootAsForeignKey(buf []byte, offset flatbuffers.UOffsetT) (*ForeignKe
 	return x, InitForeignKeyRoot(x, buf, offset)
 }
 
-func GetRootAsForeignKey(buf []byte, offset flatbuffers.UOffsetT) *ForeignKey {
-	x := &ForeignKey{}
-	InitForeignKeyRoot(x, buf, offset)
-	return x
-}
-
 func TryGetSizePrefixedRootAsForeignKey(buf []byte, offset flatbuffers.UOffsetT) (*ForeignKey, error) {
 	x := &ForeignKey{}
 	return x, InitForeignKeyRoot(x, buf, offset+flatbuffers.SizeUint32)
 }
 
-func GetSizePrefixedRootAsForeignKey(buf []byte, offset flatbuffers.UOffsetT) *ForeignKey {
-	x := &ForeignKey{}
-	InitForeignKeyRoot(x, buf, offset+flatbuffers.SizeUint32)
-	return x
-}
-
-func (rcv *ForeignKey) Init(buf []byte, i flatbuffers.UOffsetT) {
+func (rcv *ForeignKey) Init(buf []byte, i flatbuffers.UOffsetT) error {
 	rcv._tab.Bytes = buf
 	rcv._tab.Pos = i
+	if ForeignKeyNumFields < rcv.Table().NumFields() {
+		return flatbuffers.ErrTableHasUnknownFields
+	}
+	return nil
 }
 
 func (rcv *ForeignKey) Table() flatbuffers.Table {
@@ -343,7 +307,41 @@ func (rcv *ForeignKey) UnresolvedParentColumnsLength() int {
 	return 0
 }
 
-const ForeignKeyNumFields = 11
+func (rcv *ForeignKey) ChildTableDatabaseSchema(j int) []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(26))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.ByteVector(a + flatbuffers.UOffsetT(j*4))
+	}
+	return nil
+}
+
+func (rcv *ForeignKey) ChildTableDatabaseSchemaLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(26))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+func (rcv *ForeignKey) ParentTableDatabaseSchema(j int) []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(28))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.ByteVector(a + flatbuffers.UOffsetT(j*4))
+	}
+	return nil
+}
+
+func (rcv *ForeignKey) ParentTableDatabaseSchemaLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(28))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+const ForeignKeyNumFields = 13
 
 func ForeignKeyStart(builder *flatbuffers.Builder) {
 	builder.StartObject(ForeignKeyNumFields)
@@ -391,6 +389,18 @@ func ForeignKeyAddUnresolvedParentColumns(builder *flatbuffers.Builder, unresolv
 	builder.PrependUOffsetTSlot(10, flatbuffers.UOffsetT(unresolvedParentColumns), 0)
 }
 func ForeignKeyStartUnresolvedParentColumnsVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(4, numElems, 4)
+}
+func ForeignKeyAddChildTableDatabaseSchema(builder *flatbuffers.Builder, childTableDatabaseSchema flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(11, flatbuffers.UOffsetT(childTableDatabaseSchema), 0)
+}
+func ForeignKeyStartChildTableDatabaseSchemaVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(4, numElems, 4)
+}
+func ForeignKeyAddParentTableDatabaseSchema(builder *flatbuffers.Builder, parentTableDatabaseSchema flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(12, flatbuffers.UOffsetT(parentTableDatabaseSchema), 0)
+}
+func ForeignKeyStartParentTableDatabaseSchemaVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(4, numElems, 4)
 }
 func ForeignKeyEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {

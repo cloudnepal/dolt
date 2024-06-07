@@ -30,7 +30,9 @@ import (
 	srv "github.com/dolthub/dolt/go/cmd/dolt/commands/sqlserver"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/servercfg"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+	"github.com/dolthub/dolt/go/libraries/utils/svcs"
 	"github.com/dolthub/dolt/go/store/types"
 )
 
@@ -75,7 +77,7 @@ func BenchmarkServerExample(b *testing.B) {
 
 func benchmarkServer(b *testing.B, test serverTest) {
 	var dEnv *env.DoltEnv
-	var cfg srv.ServerConfig
+	var cfg servercfg.ServerConfig
 	ctx := context.Background()
 
 	// setup
@@ -109,7 +111,7 @@ const (
 	email = "name@fake.horse"
 )
 
-func getEnvAndConfig(ctx context.Context, b *testing.B) (dEnv *env.DoltEnv, cfg srv.ServerConfig) {
+func getEnvAndConfig(ctx context.Context, b *testing.B) (dEnv *env.DoltEnv, cfg servercfg.ServerConfig) {
 	tmp := b.TempDir()
 	//b.Logf("db directory: %s", tmp)
 	dbDir := path.Join(tmp, database)
@@ -156,7 +158,7 @@ listener:
  write_timeout_millis: 28800000
 `, database, dbDir, port))
 
-	cfg, err = srv.NewYamlConfig(yaml)
+	cfg, err = servercfg.NewYamlConfig(yaml)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -174,14 +176,14 @@ func getProfFile(b *testing.B) *os.File {
 	return f
 }
 
-func executeServerQueries(ctx context.Context, b *testing.B, dEnv *env.DoltEnv, cfg srv.ServerConfig, queries []query) {
-	serverController := srv.NewServerController()
+func executeServerQueries(ctx context.Context, b *testing.B, dEnv *env.DoltEnv, cfg servercfg.ServerConfig, queries []query) {
+	sc := svcs.NewController()
 
 	eg, ctx := errgroup.WithContext(ctx)
 
 	//b.Logf("Starting server with Config %v\n", srv.ConfigInfo(cfg))
 	eg.Go(func() (err error) {
-		startErr, closeErr := srv.Serve(ctx, "", cfg, serverController, dEnv)
+		startErr, closeErr := srv.Serve(ctx, "", cfg, sc, dEnv)
 		if startErr != nil {
 			return startErr
 		}
@@ -190,7 +192,7 @@ func executeServerQueries(ctx context.Context, b *testing.B, dEnv *env.DoltEnv, 
 		}
 		return nil
 	})
-	if err := serverController.WaitForStart(); err != nil {
+	if err := sc.WaitForStart(); err != nil {
 		b.Fatal(err)
 	}
 
@@ -200,8 +202,8 @@ func executeServerQueries(ctx context.Context, b *testing.B, dEnv *env.DoltEnv, 
 		}
 	}
 
-	serverController.StopServer()
-	if err := serverController.WaitForClose(); err != nil {
+	sc.Stop()
+	if err := sc.WaitForStop(); err != nil {
 		b.Fatal(err)
 	}
 	if err := eg.Wait(); err != nil {
@@ -209,8 +211,8 @@ func executeServerQueries(ctx context.Context, b *testing.B, dEnv *env.DoltEnv, 
 	}
 }
 
-func executeQuery(cfg srv.ServerConfig, q query) error {
-	cs := srv.ConnectionString(cfg, database)
+func executeQuery(cfg servercfg.ServerConfig, q query) error {
+	cs := servercfg.ConnectionString(cfg, database)
 	conn, err := dbr.Open("mysql", cs, nil)
 	if err != nil {
 		return err

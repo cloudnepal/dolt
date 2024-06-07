@@ -64,7 +64,7 @@ func (ms *MemoryStorage) NewViewWithFormat(nbf string) ChunkStore {
 	return v
 }
 
-// NewViewWithVersion vends a MemoryStoreView backed by this MemoryStorage. It's
+// NewViewWithDefaultFormat vends a MemoryStoreView backed by this MemoryStorage. It's
 // initialized with the currently "persisted" root. Uses the default format.
 func (ms *MemoryStorage) NewViewWithDefaultFormat() ChunkStore {
 	v := &MemoryStoreView{storage: ms, rootHash: ms.rootHash, version: constants.FormatDefaultString}
@@ -202,6 +202,10 @@ func (ms *MemoryStoreView) Version() string {
 	return ms.version
 }
 
+func (ms *MemoryStoreView) AccessMode() ExclusiveAccessMode {
+	return ExclusiveAccessMode_Shared
+}
+
 func (ms *MemoryStoreView) errorIfDangling(ctx context.Context, addrs hash.HashSet) error {
 	absent := hash.NewHashSet()
 	for h := range addrs {
@@ -221,11 +225,13 @@ func (ms *MemoryStoreView) errorIfDangling(ctx context.Context, addrs hash.HashS
 	return nil
 }
 
-func (ms *MemoryStoreView) Put(ctx context.Context, c Chunk, getAddrs GetAddrsCb) error {
+func (ms *MemoryStoreView) Put(ctx context.Context, c Chunk, getAddrs GetAddrsCurry) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	addrs, err := getAddrs(ctx, c)
+
+	addrs := hash.NewHashSet()
+	err := getAddrs(c)(ctx, addrs, NoopPendingRefExists)
 	if err != nil {
 		return err
 	}
@@ -382,6 +388,10 @@ func (ms *MemoryStoreView) Stats() interface{} {
 
 func (ms *MemoryStoreView) StatsSummary() string {
 	return "Unsupported"
+}
+
+func (ms *MemoryStoreView) PersistGhostHashes(ctx context.Context, refs hash.HashSet) error {
+	panic("not implemented")
 }
 
 func (ms *MemoryStoreView) Close() error {

@@ -28,6 +28,8 @@ import (
 	"github.com/dolthub/dolt/go/libraries/utils/set"
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/types"
+
+	"github.com/dolthub/go-mysql-server/sql"
 )
 
 // ForeignKeyCollection represents the collection of foreign keys for a root value.
@@ -124,7 +126,86 @@ func (fk ForeignKey) EqualDefs(other ForeignKey) bool {
 		fk.OnDelete == other.OnDelete
 }
 
-// DeepEquals compares all attributes of a foreign key to another, including name and table names.
+// Equals compares this ForeignKey to |other| and returns true if they are equal. Foreign keys can either be in
+// a "resolved" state, where the referenced columns in the parent and child tables are identified by column tags,
+// or in an "unresolved" state where the reference columns in the parent and child are still identified by strings.
+// If one foreign key is resolved and one is unresolved, the logic for comparing them requires resolving the string
+// column names to column tags, which is why |fkSchemasByName| and |otherSchemasByName| are passed in. Each of these
+// is a map of table schemas for |fk| and |other|, where the child table and every parent table referenced in the
+// foreign key is present in the map.
+func (fk ForeignKey) Equals(other ForeignKey, fkSchemasByName, otherSchemasByName map[TableName]schema.Schema) bool {
+	// If both FKs are resolved or unresolved, we can just deeply compare them
+	if fk.IsResolved() == other.IsResolved() {
+		return fk.DeepEquals(other)
+	}
+
+	// Otherwise, one FK is resolved and one is not, so we need to work a little harder
+	// to calculate equality since their referenced columns are represented differently.
+	// First check the attributes that don't change when an FK is resolved or unresolved.
+	if fk.Name != other.Name &&
+		fk.TableName != other.TableName &&
+		fk.ReferencedTableName != other.ReferencedTableName &&
+		fk.TableIndex != other.TableIndex &&
+		fk.ReferencedTableIndex != other.ReferencedTableIndex &&
+		fk.OnUpdate == other.OnUpdate &&
+		fk.OnDelete == other.OnDelete {
+		return false
+	}
+
+	// Sort out which FK is resolved and which is not
+	var resolvedFK, unresolvedFK ForeignKey
+	var resolvedSchemasByName map[TableName]schema.Schema
+	if fk.IsResolved() {
+		resolvedFK, unresolvedFK, resolvedSchemasByName = fk, other, fkSchemasByName
+	} else {
+		resolvedFK, unresolvedFK, resolvedSchemasByName = other, fk, otherSchemasByName
+	}
+
+	// Check the columns on the child table
+	if len(resolvedFK.TableColumns) != len(unresolvedFK.UnresolvedFKDetails.TableColumns) {
+		return false
+	}
+	for i, tag := range resolvedFK.TableColumns {
+		unresolvedColName := unresolvedFK.UnresolvedFKDetails.TableColumns[i]
+		resolvedSch, ok := resolvedSchemasByName[TableName{Name: resolvedFK.TableName}]
+		if !ok {
+			return false
+		}
+		resolvedCol, ok := resolvedSch.GetAllCols().GetByTag(tag)
+		if !ok {
+			return false
+		}
+		if resolvedCol.Name != unresolvedColName {
+			return false
+		}
+	}
+
+	// Check the columns on the parent table
+	if len(resolvedFK.ReferencedTableColumns) != len(unresolvedFK.UnresolvedFKDetails.ReferencedTableColumns) {
+		return false
+	}
+	for i, tag := range resolvedFK.ReferencedTableColumns {
+		unresolvedColName := unresolvedFK.UnresolvedFKDetails.ReferencedTableColumns[i]
+		resolvedSch, ok := resolvedSchemasByName[TableName{Name: unresolvedFK.ReferencedTableName}]
+		if !ok {
+			return false
+		}
+		resolvedCol, ok := resolvedSch.GetAllCols().GetByTag(tag)
+		if !ok {
+			return false
+		}
+		if resolvedCol.Name != unresolvedColName {
+			return false
+		}
+	}
+
+	return true
+}
+
+// DeepEquals compares all attributes of a foreign key to another, including name and
+// table names. Note that if one foreign key is resolved and the other is NOT resolved,
+// then this function will not calculate equality correctly. When comparing a resolved
+// FK with an unresolved FK, the ForeignKey.Equals() function should be used instead.
 func (fk ForeignKey) DeepEquals(other ForeignKey) bool {
 	if !fk.EqualDefs(other) {
 		return false
@@ -137,28 +218,62 @@ func (fk ForeignKey) DeepEquals(other ForeignKey) bool {
 }
 
 // HashOf returns the Noms hash of a ForeignKey.
-func (fk ForeignKey) HashOf() hash.Hash {
-	var bb bytes.Buffer
-	bb.Write([]byte(fk.Name))
-	bb.Write([]byte(fk.TableName))
-	bb.Write([]byte(fk.TableIndex))
+func (fk ForeignKey) HashOf() (hash.Hash, error) {
+	var fields []interface{}
+	fields = append(fields, fk.Name, fk.TableName, fk.TableIndex)
 	for _, t := range fk.TableColumns {
-		_ = binary.Write(&bb, binary.LittleEndian, t)
+		fields = append(fields, t)
 	}
-	bb.Write([]byte(fk.ReferencedTableName))
-	bb.Write([]byte(fk.ReferencedTableIndex))
+	fields = append(fields, fk.ReferencedTableName, fk.ReferencedTableIndex)
 	for _, t := range fk.ReferencedTableColumns {
-		_ = binary.Write(&bb, binary.LittleEndian, t)
+		fields = append(fields, t)
 	}
-	bb.Write([]byte{byte(fk.OnUpdate), byte(fk.OnDelete)})
+	fields = append(fields, []byte{byte(fk.OnUpdate), byte(fk.OnDelete)})
 	for _, col := range fk.UnresolvedFKDetails.TableColumns {
-		_ = binary.Write(&bb, binary.LittleEndian, col)
+		fields = append(fields, col)
 	}
 	for _, col := range fk.UnresolvedFKDetails.ReferencedTableColumns {
-		_ = binary.Write(&bb, binary.LittleEndian, col)
+		fields = append(fields, col)
 	}
 
-	return hash.Of(bb.Bytes())
+	var bb bytes.Buffer
+	for _, field := range fields {
+		var err error
+		switch t := field.(type) {
+		case string:
+			_, err = bb.Write([]byte(t))
+		case []byte:
+			_, err = bb.Write(t)
+		case uint64:
+			err = binary.Write(&bb, binary.LittleEndian, t)
+		default:
+			return hash.Hash{}, fmt.Errorf("unsupported type %T", t)
+		}
+		if err != nil {
+			return hash.Hash{}, err
+		}
+	}
+
+	return hash.Of(bb.Bytes()), nil
+}
+
+// CombinedHash returns a combined hash value for all foreign keys in the slice provided.
+// An empty slice has a zero hash.
+func CombinedHash(fks []ForeignKey) (hash.Hash, error) {
+	if len(fks) == 0 {
+		return hash.Hash{}, nil
+	}
+
+	var bb bytes.Buffer
+	for _, fk := range fks {
+		h, err := fk.HashOf()
+		if err != nil {
+			return hash.Hash{}, err
+		}
+		bb.Write(h[:])
+	}
+
+	return hash.Of(bb.Bytes()), nil
 }
 
 // IsSelfReferential returns whether the table declaring the foreign key is also referenced by the foreign key.
@@ -230,29 +345,18 @@ func NewForeignKeyCollection(keys ...ForeignKey) (*ForeignKeyCollection, error) 
 // both column counts are equal. All other validation should occur before being added to the collection.
 func (fkc *ForeignKeyCollection) AddKeys(fks ...ForeignKey) error {
 	for _, key := range fks {
-		if key.Name == "" {
-			// assign a name based on the hash
-			// 8 char = 5 base32 bytes, should be collision resistant
-			// TODO: constraint names should be unique, and this isn't guaranteed to be.
-			//  This logic needs to live at the table / DB level.
-			key.Name = key.HashOf().String()[:8]
-		}
-
 		if _, ok := fkc.GetByNameCaseInsensitive(key.Name); ok {
-			return fmt.Errorf("a foreign key with the name `%s` already exists", key.Name)
+			return sql.ErrForeignKeyDuplicateName.New(key.Name)
 		}
 		if len(key.TableColumns) != len(key.ReferencedTableColumns) {
 			return fmt.Errorf("foreign keys must have the same number of columns declared and referenced")
 		}
-		if key.IsResolved() {
-			if _, ok := fkc.GetByTags(key.TableColumns, key.ReferencedTableColumns); ok {
-				// this differs from MySQL's logic
-				return fmt.Errorf("a foreign key over columns %v and referenced columns %v already exists",
-					key.TableColumns, key.ReferencedTableColumns)
-			}
-		}
 
-		fkc.foreignKeys[key.HashOf().String()] = key
+		fkHash, err := key.HashOf()
+		if err != nil {
+			return err
+		}
+		fkc.foreignKeys[fkHash.String()] = key
 	}
 	return nil
 }
@@ -275,6 +379,16 @@ func (fkc *ForeignKeyCollection) AllKeys() []ForeignKey {
 func (fkc *ForeignKeyCollection) Contains(foreignKeyName string) bool {
 	_, ok := fkc.GetByNameCaseInsensitive(foreignKeyName)
 	return ok
+}
+
+// HashOf returns the hash of the serialized form of this foreign key collection
+func (fkc *ForeignKeyCollection) HashOf(ctx context.Context, vrw types.ValueReadWriter) (hash.Hash, error) {
+	serialized, err := SerializeForeignKeys(ctx, vrw, fkc)
+	if err != nil {
+		return hash.Hash{}, err
+	}
+
+	return serialized.Hash(vrw.Format())
 }
 
 // Count returns the number of indexes in this collection.
@@ -464,13 +578,13 @@ func (fkc *ForeignKeyCollection) Iter(cb func(fk ForeignKey) (stop bool, err err
 // declaredFk contains all foreign keys in which this table declared the foreign key. The array referencedByFk contains
 // all foreign keys in which this table is the referenced table. If the table contains a self-referential foreign key,
 // it will be present in both declaresFk and referencedByFk. Each array is sorted by name ascending.
-func (fkc *ForeignKeyCollection) KeysForTable(tableName string) (declaredFk, referencedByFk []ForeignKey) {
-	lowercaseTblName := strings.ToLower(tableName)
+func (fkc *ForeignKeyCollection) KeysForTable(tableName TableName) (declaredFk, referencedByFk []ForeignKey) {
+	lowercaseTblName := tableName.ToLower()
 	for _, foreignKey := range fkc.foreignKeys {
-		if strings.ToLower(foreignKey.TableName) == lowercaseTblName {
+		if strings.ToLower(foreignKey.TableName) == lowercaseTblName.Name {
 			declaredFk = append(declaredFk, foreignKey)
 		}
-		if strings.ToLower(foreignKey.ReferencedTableName) == lowercaseTblName {
+		if strings.ToLower(foreignKey.ReferencedTableName) == lowercaseTblName.Name {
 			referencedByFk = append(referencedByFk, foreignKey)
 		}
 	}
@@ -517,16 +631,21 @@ func (fkc *ForeignKeyCollection) RemoveKeyByName(foreignKeyName string) bool {
 
 // RemoveTables removes all foreign keys associated with the given tables, if permitted. The operation assumes that ALL
 // tables to be removed are in a single call, as splitting tables into different calls may result in unintended errors.
-func (fkc *ForeignKeyCollection) RemoveTables(ctx context.Context, tables ...string) error {
-	outgoing := set.NewStrSet(tables)
+func (fkc *ForeignKeyCollection) RemoveTables(ctx context.Context, tables ...TableName) error {
+	outgoing := NewTableNameSet(tables)
 	for _, fk := range fkc.foreignKeys {
-		dropChild := outgoing.Contains(fk.TableName)
-		dropParent := outgoing.Contains(fk.ReferencedTableName)
+		// TODO: schema names
+		dropChild := outgoing.Contains(TableName{Name: fk.TableName})
+		dropParent := outgoing.Contains(TableName{Name: fk.ReferencedTableName})
 		if dropParent && !dropChild {
 			return fmt.Errorf("unable to remove `%s` since it is referenced from table `%s`", fk.ReferencedTableName, fk.TableName)
 		}
 		if dropChild {
-			delete(fkc.foreignKeys, fk.HashOf().String())
+			fkHash, err := fk.HashOf()
+			if err != nil {
+				return err
+			}
+			delete(fkc.foreignKeys, fkHash.String())
 		}
 	}
 	return nil
@@ -535,21 +654,26 @@ func (fkc *ForeignKeyCollection) RemoveTables(ctx context.Context, tables ...str
 // RemoveAndUnresolveTables removes all foreign keys associated with the given tables. If a parent is dropped without
 // its child, then the foreign key goes to an unresolved state. The operation assumes that ALL tables to be removed are
 // in a single call, as splitting tables into different calls may result in unintended errors.
-func (fkc *ForeignKeyCollection) RemoveAndUnresolveTables(ctx context.Context, root *RootValue, tables ...string) error {
-	outgoing := set.NewStrSet(tables)
+func (fkc *ForeignKeyCollection) RemoveAndUnresolveTables(ctx context.Context, root RootValue, tables ...TableName) error {
+	outgoing := NewTableNameSet(tables)
 	for _, fk := range fkc.foreignKeys {
-		dropChild := outgoing.Contains(fk.TableName)
-		dropParent := outgoing.Contains(fk.ReferencedTableName)
+		dropChild := outgoing.Contains(TableName{Name: fk.TableName})
+		dropParent := outgoing.Contains(TableName{Name: fk.ReferencedTableName})
 		if dropParent && !dropChild {
 			if !fk.IsResolved() {
 				continue
 			}
-			delete(fkc.foreignKeys, fk.HashOf().String())
+
+			fkHash, err := fk.HashOf()
+			if err != nil {
+				return err
+			}
+			delete(fkc.foreignKeys, fkHash.String())
 
 			fk.UnresolvedFKDetails.TableColumns = make([]string, len(fk.TableColumns))
 			fk.UnresolvedFKDetails.ReferencedTableColumns = make([]string, len(fk.ReferencedTableColumns))
 
-			tbl, ok, err := root.GetTable(ctx, fk.TableName)
+			tbl, ok, err := root.GetTable(ctx, TableName{Name: fk.TableName})
 			if err != nil {
 				return err
 			}
@@ -570,7 +694,7 @@ func (fkc *ForeignKeyCollection) RemoveAndUnresolveTables(ctx context.Context, r
 				fk.UnresolvedFKDetails.TableColumns[i] = col.Name
 			}
 
-			refTbl, ok, err := root.GetTable(ctx, fk.ReferencedTableName)
+			refTbl, ok, err := root.GetTable(ctx, TableName{Name: fk.ReferencedTableName})
 			if err != nil {
 				return err
 			}
@@ -595,42 +719,22 @@ func (fkc *ForeignKeyCollection) RemoveAndUnresolveTables(ctx context.Context, r
 			fk.ReferencedTableColumns = nil
 			fk.TableIndex = ""
 			fk.ReferencedTableIndex = ""
-			fkc.foreignKeys[fk.HashOf().String()] = fk
+
+			fkHash, err = fk.HashOf()
+			if err != nil {
+				return err
+			}
+			fkc.foreignKeys[fkHash.String()] = fk
 		}
 		if dropChild {
-			delete(fkc.foreignKeys, fk.HashOf().String())
+			fkHash, err := fk.HashOf()
+			if err != nil {
+				return err
+			}
+			delete(fkc.foreignKeys, fkHash.String())
 		}
 	}
 	return nil
-}
-
-// RenameTable updates all foreign key entries in the collection with the updated table name. Does not check for name
-// collisions. Additionally, any unresolved foreign keys will still update their referenced names as this matches
-// MySQL's behavior.
-func (fkc *ForeignKeyCollection) RenameTable(oldTableName, newTableName string) {
-	updated := make(map[string]ForeignKey, len(fkc.foreignKeys))
-	for _, fk := range fkc.foreignKeys {
-		if fk.TableName == oldTableName {
-			fk.TableName = newTableName
-		}
-		if fk.ReferencedTableName == oldTableName {
-			fk.ReferencedTableName = newTableName
-		}
-		updated[fk.HashOf().String()] = fk
-	}
-	fkc.foreignKeys = updated
-}
-
-// Stage takes the keys to add and remove and updates the current collection. Does not perform any key validation nor
-// name uniqueness verification, as this is intended for use in commit staging. Adding a foreign key and updating (such
-// as a table rename) an existing one are functionally the same.
-func (fkc *ForeignKeyCollection) Stage(ctx context.Context, fksToAdd []ForeignKey, fksToRemove []ForeignKey) {
-	for _, fk := range fksToAdd {
-		fkc.foreignKeys[fk.HashOf().String()] = fk
-	}
-	for _, fk := range fksToRemove {
-		delete(fkc.foreignKeys, fk.HashOf().String())
-	}
 }
 
 // Tables returns the set of all tables that either declare a foreign key or are referenced by a foreign key.
@@ -691,9 +795,9 @@ func (fkc *ForeignKeyCollection) ColumnHasFkRelationship(tag uint64) (ForeignKey
 	return ForeignKey{}, false
 }
 
-// copy returns an exact copy of the calling collection. As collections are meant to be modified in-place, this ensures
+// Copy returns an exact copy of the calling collection. As collections are meant to be modified in-place, this ensures
 // that the original collection is not affected by any operations applied to the copied collection.
-func (fkc *ForeignKeyCollection) copy() *ForeignKeyCollection {
+func (fkc *ForeignKeyCollection) Copy() *ForeignKeyCollection {
 	copiedForeignKeys := make(map[string]ForeignKey)
 	for hashOf, key := range fkc.foreignKeys {
 		copiedForeignKeys[hashOf] = key

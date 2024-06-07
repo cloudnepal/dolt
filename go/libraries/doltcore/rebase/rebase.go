@@ -1,4 +1,4 @@
-// Copyright 2020 Dolthub, Inc.
+// Copyright 2023 Dolthub, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,243 +15,199 @@
 package rebase
 
 import (
-	"context"
 	"fmt"
+	"io"
+
+	"github.com/dolthub/go-mysql-server/sql"
+	"github.com/shopspring/decimal"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
-	"github.com/dolthub/dolt/go/libraries/doltcore/env"
-	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
+	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions/commitwalk"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
-type visitedSet map[hash.Hash]*doltdb.Commit
+const (
+	RebaseActionPick   = "pick"
+	RebaseActionSquash = "squash"
+	RebaseActionFixup  = "fixup"
+	RebaseActionDrop   = "drop"
+	RebaseActionReword = "reword"
+)
 
-type NeedsRebaseFn func(ctx context.Context, cm *doltdb.Commit) (bool, error)
+// ErrInvalidRebasePlanSquashFixupWithoutPick is returned when a rebase plan attempts to squash or
+// fixup a commit without first picking or rewording a commit.
+var ErrInvalidRebasePlanSquashFixupWithoutPick = fmt.Errorf("invalid rebase plan: squash and fixup actions must appear after a pick or reword action")
 
-// EntireHistory returns a |NeedsRebaseFn| that rebases the entire commit history.
-func EntireHistory() NeedsRebaseFn {
-	return func(_ context.Context, cm *doltdb.Commit) (bool, error) {
-		return cm.NumParents() != 0, nil
-	}
+// RebasePlanDatabase is a database that can save and load a rebase plan.
+type RebasePlanDatabase interface {
+	// SaveRebasePlan saves the given rebase plan to the database.
+	SaveRebasePlan(ctx *sql.Context, plan *RebasePlan) error
+	// LoadRebasePlan loads the rebase plan from the database.
+	LoadRebasePlan(ctx *sql.Context) (*RebasePlan, error)
 }
 
-// StopAtCommit returns a |NeedsRebaseFn| that rebases the commit history until
-// |stopCommit| is reached. It will error if |stopCommit| is not reached.
-func StopAtCommit(stopCommit *doltdb.Commit) NeedsRebaseFn {
-	return func(ctx context.Context, cm *doltdb.Commit) (bool, error) {
-		h, err := cm.HashOf()
-		if err != nil {
-			return false, err
-		}
-
-		sh, err := stopCommit.HashOf()
-		if err != nil {
-			return false, err
-		}
-
-		if h.Equal(sh) {
-			return false, nil
-		}
-
-		if cm.NumParents() == 0 {
-			return false, fmt.Errorf("commit %s is missing from the commit history of at least one rebase head", sh)
-		}
-
-		return true, nil
-	}
+// RebasePlan describes the plan for a rebase operation, where commits are reordered,
+// or adjusted, and then replayed on top of a base commit to form a new commit history.
+type RebasePlan struct {
+	Steps []RebasePlanStep
 }
 
-type ReplayRootFn func(ctx context.Context, root, parentRoot, rebasedParentRoot *doltdb.RootValue) (rebaseRoot *doltdb.RootValue, err error)
+// RebasePlanStep describes a single step in a rebase plan, such as dropping a
+// commit, squashing a commit into the previous commit, etc.
+type RebasePlanStep struct {
+	RebaseOrder decimal.Decimal
+	Action      string
+	CommitHash  string
+	CommitMsg   string
+}
 
-type ReplayCommitFn func(ctx context.Context, commit, parent, rebasedParent *doltdb.Commit) (rebaseRoot *doltdb.RootValue, err error)
+// CreateDefaultRebasePlan creates and returns the default rebase plan for the commits between
+// |startCommit| and |upstreamCommit|, equivalent to the log of startCommit..upstreamCommit. The
+// default plan includes each of those commits, in the same order they were originally applied, and
+// each step in the plan will have the default, pick, action. If the plan cannot be generated for
+// any reason, such as disconnected or invalid commits specified, then an error is returned.
+func CreateDefaultRebasePlan(ctx *sql.Context, startCommit, upstreamCommit *doltdb.Commit) (*RebasePlan, error) {
+	commits, err := findRebaseCommits(ctx, startCommit, upstreamCommit)
+	if err != nil {
+		return nil, err
+	}
 
-// wrapReplayRootFn converts a |ReplayRootFn| to a |ReplayCommitFn|
-func wrapReplayRootFn(fn ReplayRootFn) ReplayCommitFn {
-	return func(ctx context.Context, commit, parent, rebasedParent *doltdb.Commit) (rebaseRoot *doltdb.RootValue, err error) {
-		root, err := commit.GetRootValue(ctx)
+	if len(commits) == 0 {
+		return nil, fmt.Errorf("didn't identify any commits!")
+	}
+
+	plan := RebasePlan{}
+	for idx := len(commits) - 1; idx >= 0; idx-- {
+		commit := commits[idx]
+		hash, err := commit.HashOf()
+		if err != nil {
+			return nil, err
+		}
+		meta, err := commit.GetCommitMeta(ctx)
 		if err != nil {
 			return nil, err
 		}
 
-		parentRoot, err := parent.GetRootValue(ctx)
-		if err != nil {
-			return nil, err
+		plan.Steps = append(plan.Steps, RebasePlanStep{
+			RebaseOrder: decimal.NewFromFloat32(float32(len(commits) - idx)),
+			Action:      RebaseActionPick,
+			CommitHash:  hash.String(),
+			CommitMsg:   meta.Description,
+		})
+	}
+
+	return &plan, nil
+}
+
+// ValidateRebasePlan returns a validation error for invalid states in a rebase plan, such as
+// squash or fixup actions appearing in the plan before a pick or reword action.
+func ValidateRebasePlan(ctx *sql.Context, plan *RebasePlan) error {
+	seenPick := false
+	seenReword := false
+	for i, step := range plan.Steps {
+		// As a sanity check, make sure the rebase order is ascending. This shouldn't EVER happen because the
+		// results are sorted from the database query, but double check while we're validating the plan.
+		if i > 0 && plan.Steps[i-1].RebaseOrder.GreaterThanOrEqual(step.RebaseOrder) {
+			return fmt.Errorf("invalid rebase plan: rebase order must be ascending")
 		}
 
-		rebasedParentRoot, err := rebasedParent.GetRootValue(ctx)
-		if err != nil {
-			return nil, err
+		switch step.Action {
+		case RebaseActionPick:
+			seenPick = true
+
+		case RebaseActionReword:
+			seenReword = true
+
+		case RebaseActionFixup, RebaseActionSquash:
+			if !seenPick && !seenReword {
+				return ErrInvalidRebasePlanSquashFixupWithoutPick
+			}
 		}
 
-		return fn(ctx, root, parentRoot, rebasedParentRoot)
-	}
-}
-
-// AllBranchesAndTags rewrites the history of all branches and tags in the repo using the |replay| function.
-func AllBranchesAndTags(ctx context.Context, dEnv *env.DoltEnv, replay ReplayCommitFn, nerf NeedsRebaseFn) error {
-	branches, err := dEnv.DoltDB.GetBranches(ctx)
-	if err != nil {
-		return err
-	}
-
-	tags, err := dEnv.DoltDB.GetTags(ctx)
-	if err != nil {
-		return err
-	}
-	return rebaseRefs(ctx, dEnv.DbData(), replay, nerf, append(branches, tags...)...)
-}
-
-// AllBranches rewrites the history of all branches in the repo using the |replay| function.
-func AllBranches(ctx context.Context, dEnv *env.DoltEnv, replay ReplayCommitFn, nerf NeedsRebaseFn) error {
-	branches, err := dEnv.DoltDB.GetBranches(ctx)
-	if err != nil {
-		return err
-	}
-
-	return rebaseRefs(ctx, dEnv.DbData(), replay, nerf, branches...)
-}
-
-// CurrentBranch rewrites the history of the current branch using the |replay| function.
-func CurrentBranch(ctx context.Context, dEnv *env.DoltEnv, replay ReplayCommitFn, nerf NeedsRebaseFn) error {
-	return rebaseRefs(ctx, dEnv.DbData(), replay, nerf, dEnv.RepoStateReader().CWBHeadRef())
-}
-
-// AllBranchesByRoots rewrites the history of all branches in the repo using the |replay| function.
-func AllBranchesByRoots(ctx context.Context, dEnv *env.DoltEnv, replay ReplayRootFn, nerf NeedsRebaseFn) error {
-	branches, err := dEnv.DoltDB.GetBranches(ctx)
-	if err != nil {
-		return err
-	}
-
-	replayCommit := wrapReplayRootFn(replay)
-	return rebaseRefs(ctx, dEnv.DbData(), replayCommit, nerf, branches...)
-}
-
-// CurrentBranchByRoot rewrites the history of the current branch using the |replay| function.
-func CurrentBranchByRoot(ctx context.Context, dEnv *env.DoltEnv, replay ReplayRootFn, nerf NeedsRebaseFn) error {
-	replayCommit := wrapReplayRootFn(replay)
-	return rebaseRefs(ctx, dEnv.DbData(), replayCommit, nerf, dEnv.RepoStateReader().CWBHeadRef())
-}
-
-func rebaseRefs(ctx context.Context, dbData env.DbData, replay ReplayCommitFn, nerf NeedsRebaseFn, refs ...ref.DoltRef) error {
-	ddb := dbData.Ddb
-	heads := make([]*doltdb.Commit, len(refs))
-	for i, dRef := range refs {
-		var err error
-		heads[i], err = ddb.ResolveCommitRef(ctx, dRef)
-		if err != nil {
+		if err := validateCommit(ctx, step.CommitHash); err != nil {
 			return err
 		}
 	}
 
-	newHeads, err := rebase(ctx, ddb, replay, nerf, heads...)
-	if err != nil {
-		return err
-	}
-
-	for i, r := range refs {
-		switch dRef := r.(type) {
-		case ref.BranchRef:
-			err = ddb.NewBranchAtCommit(ctx, dRef, newHeads[i])
-
-		case ref.TagRef:
-			// rewrite tag with new commit
-			var tag *doltdb.Tag
-			if tag, err = ddb.ResolveTag(ctx, dRef); err != nil {
-				return err
-			}
-			if err = ddb.DeleteTag(ctx, dRef); err != nil {
-				return err
-			}
-			err = ddb.NewTagAtCommit(ctx, dRef, newHeads[i], tag.Meta)
-
-		default:
-			return fmt.Errorf("cannot rebase ref: %s", ref.String(dRef))
-		}
-		if err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-func rebase(ctx context.Context, ddb *doltdb.DoltDB, replay ReplayCommitFn, nerf NeedsRebaseFn, origins ...*doltdb.Commit) ([]*doltdb.Commit, error) {
-	var rebasedCommits []*doltdb.Commit
-	vs := make(visitedSet)
-	for _, cm := range origins {
-		rc, err := rebaseRecursive(ctx, ddb, replay, nerf, vs, cm)
+// validateCommit returns an error if the specified |commit| is not able to be resolved.
+func validateCommit(ctx *sql.Context, commit string) error {
+	doltSession := dsess.DSessFromSess(ctx.Session)
 
-		if err != nil {
-			return nil, err
-		}
-
-		rebasedCommits = append(rebasedCommits, rc)
+	ddb, ok := doltSession.GetDoltDB(ctx, ctx.GetCurrentDatabase())
+	if !ok {
+		return fmt.Errorf("unable to load dolt db")
 	}
 
-	return rebasedCommits, nil
+	if !doltdb.IsValidCommitHash(commit) {
+		return fmt.Errorf("invalid commit hash: %s", commit)
+	}
+
+	commitSpec, err := doltdb.NewCommitSpec(commit)
+	if err != nil {
+		return err
+	}
+	_, err = ddb.Resolve(ctx, commitSpec, nil)
+	if err != nil {
+		return fmt.Errorf("unable to resolve commit hash %s: %w", commit, err)
+	}
+
+	return nil
 }
 
-func rebaseRecursive(ctx context.Context, ddb *doltdb.DoltDB, replay ReplayCommitFn, nerf NeedsRebaseFn, vs visitedSet, commit *doltdb.Commit) (*doltdb.Commit, error) {
-	commitHash, err := commit.HashOf()
+// findRebaseCommits returns the commits that should be included in the default rebase plan when
+// rebasing |upstreamBranchCommit| onto the current branch (specified by commit |currentBranchCommit|).
+// This is defined as the log of |currentBranchCommit|..|upstreamBranchCommit|, or in other words, the
+// commits that are reachable from the current branch HEAD, but are NOT reachable from
+// |upstreamBranchCommit|. Additionally, any merge commits in that range are NOT included.
+func findRebaseCommits(ctx *sql.Context, currentBranchCommit, upstreamBranchCommit *doltdb.Commit) (commits []*doltdb.Commit, err error) {
+	doltSession := dsess.DSessFromSess(ctx.Session)
+
+	ddb, ok := doltSession.GetDoltDB(ctx, ctx.GetCurrentDatabase())
+	if !ok {
+		return nil, fmt.Errorf("unable to load dolt db")
+	}
+
+	currentBranchCommitHash, err := currentBranchCommit.HashOf()
+	if err != nil {
+		return
+	}
+
+	upstreamBranchCommitHash, err := upstreamBranchCommit.HashOf()
+	if err != nil {
+		return
+	}
+
+	// We use the dot-dot revision iterator because it gives us the behavior we want for rebase – it finds all
+	// commits reachable from |currentBranchCommit| but NOT reachable by |upstreamBranchCommit|.
+	commitItr, err := commitwalk.GetDotDotRevisionsIterator(ctx,
+		ddb, []hash.Hash{currentBranchCommitHash},
+		ddb, []hash.Hash{upstreamBranchCommitHash}, nil)
 	if err != nil {
 		return nil, err
 	}
-	visitedCommit, found := vs[commitHash]
-	if found {
-		// base case: reached previously rebased node
-		return visitedCommit, nil
-	}
 
-	needToRebase, err := nerf(ctx, commit)
-	if err != nil {
-		return nil, err
-	}
-	if !needToRebase {
-		// base case: reached bottom of DFS,
-		return commit, nil
-	}
-
-	allParents, err := ddb.ResolveAllParents(ctx, commit)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(allParents) < 1 {
-		panic(fmt.Sprintf("commit: %s has no parents", commitHash.String()))
-	}
-
-	var allRebasedParents []*doltdb.Commit
-	for _, p := range allParents {
-		rp, err := rebaseRecursive(ctx, ddb, replay, nerf, vs, p)
-
-		if err != nil {
+	// Drain the iterator into a slice so that we can easily reverse the order of the commits
+	// so that the oldest commit is first in the generated rebase plan.
+	for {
+		_, optCmt, err := commitItr.Next(ctx)
+		if err == io.EOF {
+			return commits, nil
+		} else if err != nil {
 			return nil, err
 		}
 
-		allRebasedParents = append(allRebasedParents, rp)
-	}
+		commit, ok := optCmt.ToCommit()
+		if !ok {
+			return nil, doltdb.ErrGhostCommitEncountered // Not sure if we can get this far. commit walk is going to be a bear.
+		}
 
-	rebasedRoot, err := replay(ctx, commit, allParents[0], allRebasedParents[0])
-	if err != nil {
-		return nil, err
+		// Don't include merge commits in the rebase plan
+		if commit.NumParents() == 1 {
+			commits = append(commits, commit)
+		}
 	}
-
-	r, valueHash, err := ddb.WriteRootValue(ctx, rebasedRoot)
-	if err != nil {
-		return nil, err
-	}
-	rebasedRoot = r
-
-	oldMeta, err := commit.GetCommitMeta(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	rebasedCommit, err := ddb.CommitDanglingWithParentCommits(ctx, valueHash, allRebasedParents, oldMeta)
-	if err != nil {
-		return nil, err
-	}
-
-	vs[commitHash] = rebasedCommit
-	return rebasedCommit, nil
 }

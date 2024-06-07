@@ -27,7 +27,7 @@ import (
 	"errors"
 	"fmt"
 
-	flatbuffers "github.com/google/flatbuffers/go"
+	flatbuffers "github.com/dolthub/flatbuffers/v23/go"
 
 	"github.com/dolthub/dolt/go/gen/fb/serial"
 	"github.com/dolthub/dolt/go/store/chunks"
@@ -62,6 +62,7 @@ const (
 )
 
 var ErrCommitNotFound = errors.New("target commit not found")
+var ErrNotACommit = errors.New("value is not a commit")
 
 type Commit struct {
 	val    types.Value
@@ -71,6 +72,11 @@ type Commit struct {
 
 func (c *Commit) NomsValue() types.Value {
 	return c.val
+}
+
+func (c *Commit) IsGhost() bool {
+	_, ok := c.val.(types.GhostValue)
+	return ok
 }
 
 func (c *Commit) Height() uint64 {
@@ -303,7 +309,19 @@ func commitPtr(nbf *types.NomsBinFormat, v types.Value, r *types.Ref) (*Commit, 
 	}, nil
 }
 
-func commitFromValue(nbf *types.NomsBinFormat, v types.Value) (*Commit, error) {
+// CommitFromValue deserializes a types.Value into a Commit.
+func CommitFromValue(nbf *types.NomsBinFormat, v types.Value) (*Commit, error) {
+	if g, ok := v.(types.GhostValue); ok {
+		return &Commit{val: g}, nil
+	}
+
+	isCommit, err := IsCommit(v)
+	if err != nil {
+		return nil, err
+	}
+	if !isCommit {
+		return nil, ErrNotACommit
+	}
 	return commitPtr(nbf, v, nil)
 }
 
@@ -324,9 +342,9 @@ func LoadCommitAddr(ctx context.Context, vr types.ValueReader, addr hash.Hash) (
 		return nil, err
 	}
 	if v == nil {
-		return nil, errors.New("target commit not found")
+		return nil, ErrCommitNotFound
 	}
-	return commitFromValue(vr.Format(), v)
+	return CommitFromValue(vr.Format(), v)
 }
 
 func findCommonAncestorUsingParentsList(ctx context.Context, c1, c2 *Commit, vr1, vr2 types.ValueReader, ns1, ns2 tree.NodeStore) (hash.Hash, bool, error) {
@@ -439,6 +457,12 @@ func FindClosureCommonAncestor(ctx context.Context, cl CommitClosure, cm *Commit
 
 // GetCommitParents returns |Ref|s to the parents of the commit.
 func GetCommitParents(ctx context.Context, vr types.ValueReader, cv types.Value) ([]*Commit, error) {
+	_, ok := cv.(types.GhostValue)
+	if ok {
+		// Not using the common error here because they are in the doltdb package which results in a cycle.
+		return nil, fmt.Errorf("runtime exception. GetCommitParents called with GhostCommit.")
+	}
+
 	if sm, ok := cv.(types.SerialMessage); ok {
 		data := []byte(sm)
 		if serial.GetFileID(data) != serial.CommitFileID {
@@ -448,6 +472,7 @@ func GetCommitParents(ctx context.Context, vr types.ValueReader, cv types.Value)
 		if err != nil {
 			return nil, err
 		}
+
 		vals, err := vr.ReadManyValues(ctx, addrs)
 		if err != nil {
 			return nil, err
@@ -457,19 +482,28 @@ func GetCommitParents(ctx context.Context, vr types.ValueReader, cv types.Value)
 			if v == nil {
 				return nil, fmt.Errorf("GetCommitParents: Did not find parent Commit in ValueReader: %s", addrs[i].String())
 			}
-			var csm serial.Commit
-			err := serial.InitCommitRoot(&csm, []byte(v.(types.SerialMessage)), serial.MessagePrefixSz)
-			if err != nil {
-				return nil, err
-			}
-			res[i] = &Commit{
-				val:    v,
-				height: csm.Height(),
-				addr:   addrs[i],
+
+			if g, ok := v.(types.GhostValue); ok {
+				res[i] = &Commit{
+					val:  g,
+					addr: addrs[i],
+				}
+			} else {
+				var csm serial.Commit
+				err := serial.InitCommitRoot(&csm, []byte(v.(types.SerialMessage)), serial.MessagePrefixSz)
+				if err != nil {
+					return nil, err
+				}
+				res[i] = &Commit{
+					val:    v,
+					height: csm.Height(),
+					addr:   addrs[i],
+				}
 			}
 		}
 		return res, nil
 	}
+
 	c, ok := cv.(types.Struct)
 	if !ok {
 		return nil, errors.New("GetCommitParents: provided value is not a commit.")
@@ -597,13 +631,32 @@ func GetCommittedValue(ctx context.Context, vr types.ValueReader, cv types.Value
 	return v, err
 }
 
+func GetCommitRootHash(cv types.Value) (hash.Hash, error) {
+	if sm, ok := cv.(types.SerialMessage); ok {
+		data := []byte(sm)
+		if serial.GetFileID(data) != serial.CommitFileID {
+			return hash.Hash{}, errors.New("GetCommitRootHash: provided value is not a commit.")
+		}
+		var cmsg serial.Commit
+		err := serial.InitCommitRoot(&cmsg, data, serial.MessagePrefixSz)
+		if err != nil {
+			return hash.Hash{}, err
+		}
+		var roothash hash.Hash
+		copy(roothash[:], cmsg.RootBytes())
+		return roothash, nil
+	}
+
+	return hash.Hash{}, errors.New("GetCommitRootHash: Only supports modern storage formats.")
+}
+
 func parentsToQueue(ctx context.Context, commits []*Commit, q *CommitByHeightHeap, vr types.ValueReader) error {
-	seen := make(map[hash.Hash]bool)
+	seen := make(map[hash.Hash]struct{})
 	for _, c := range commits {
 		if _, ok := seen[c.Addr()]; ok {
 			continue
 		}
-		seen[c.Addr()] = true
+		seen[c.Addr()] = struct{}{}
 
 		parents, err := GetCommitParents(ctx, vr, c.NomsValue())
 		if err != nil {
@@ -695,9 +748,9 @@ func firstError(l, r error) error {
 	return r
 }
 
-func IsCommit(ctx context.Context, v types.Value) (bool, error) {
+func IsCommit(v types.Value) (bool, error) {
 	if s, ok := v.(types.Struct); ok {
-		return types.IsValueSubtypeOf(ctx, s.Format(), v, valueCommitType)
+		return types.IsValueSubtypeOf(s.Format(), v, valueCommitType)
 	} else if sm, ok := v.(types.SerialMessage); ok {
 		data := []byte(sm)
 		return serial.GetFileID(data) == serial.CommitFileID, nil

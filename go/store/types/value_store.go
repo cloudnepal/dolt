@@ -78,6 +78,7 @@ type ValueStore struct {
 	decodedChunks       *sizecache.SizeCache
 	nbf                 *NomsBinFormat
 	versOnce            sync.Once
+	skipWriteCaching    bool
 
 	gcMu       sync.Mutex
 	gcCond     *sync.Cond
@@ -95,8 +96,7 @@ const (
 	gcState_Finalizing
 )
 
-func AddrsFromNomsValue(ctx context.Context, c chunks.Chunk, nbf *NomsBinFormat) (addrs hash.HashSet, err error) {
-	addrs = hash.NewHashSet()
+func AddrsFromNomsValue(c chunks.Chunk, nbf *NomsBinFormat, addrs hash.HashSet) (err error) {
 	if NomsKind(c.Data()[0]) == SerialMessageKind {
 		err = SerialMessage(c.Data()).WalkAddrs(nbf, func(a hash.Hash) error {
 			addrs.Insert(a)
@@ -112,8 +112,10 @@ func AddrsFromNomsValue(ctx context.Context, c chunks.Chunk, nbf *NomsBinFormat)
 	return
 }
 
-func (lvs *ValueStore) getAddrs(ctx context.Context, c chunks.Chunk) (hash.HashSet, error) {
-	return AddrsFromNomsValue(ctx, c, lvs.nbf)
+func (lvs *ValueStore) getAddrs(c chunks.Chunk) chunks.GetAddrsCb {
+	return func(ctx context.Context, addrs hash.HashSet, _ chunks.PendingRefExists) error {
+		return AddrsFromNomsValue(c, lvs.nbf, addrs)
+	}
 }
 
 const (
@@ -197,6 +199,10 @@ func (lvs *ValueStore) ReadValue(ctx context.Context, h hash.Hash) (Value, error
 	if err != nil {
 		return nil, err
 	}
+	if chunk.IsGhost() {
+		return GhostValue{}, nil
+	}
+
 	if chunk.IsEmpty() {
 		return nil, nil
 	}
@@ -226,6 +232,10 @@ func (lvs *ValueStore) ReadValue(ctx context.Context, h hash.Hash) (Value, error
 func (lvs *ValueStore) ReadManyValues(ctx context.Context, hashes hash.HashSlice) (ValueSlice, error) {
 	lvs.versOnce.Do(lvs.expectVersion)
 	decode := func(h hash.Hash, chunk *chunks.Chunk) (Value, error) {
+		if chunk.IsGhost() {
+			return GhostValue{}, nil
+		}
+
 		v, ferr := DecodeValue(*chunk, lvs)
 
 		if ferr != nil {
@@ -323,9 +333,19 @@ func (lvs *ValueStore) WriteValue(ctx context.Context, v Value) (Ref, error) {
 		return Ref{}, err
 	}
 
+	finalize, err := lvs.waitForNotFinalizingGC(ctx)
+	if err != nil {
+		return Ref{}, err
+	}
+	defer finalize()
+
 	err = lvs.cs.Put(ctx, c, lvs.getAddrs)
 	if err != nil {
 		return Ref{}, err
+	}
+
+	if !lvs.skipWriteCaching {
+		lvs.decodedChunks.Add(c.Hash(), uint64(c.Size()), v)
 	}
 
 	return r, nil
@@ -370,11 +390,23 @@ func (lvs *ValueStore) waitForNoGC() {
 // will block with the lock held. While the lock is held, reads cannot
 // progress, and the GC process will not complete.
 
-func (lvs *ValueStore) waitForNotFinalizingGC() func() {
+func (lvs *ValueStore) waitForNotFinalizingGC(ctx context.Context) (func(), error) {
 	lvs.gcMu.Lock()
 	defer lvs.gcMu.Unlock()
-	for lvs.gcState == gcState_Finalizing {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			lvs.gcCond.Broadcast()
+		case <-stop:
+		}
+	}()
+	for lvs.gcState == gcState_Finalizing && ctx.Err() == nil {
 		lvs.gcCond.Wait()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	lvs.gcOut += 1
 	lvs.gcCond.Broadcast()
@@ -383,7 +415,7 @@ func (lvs *ValueStore) waitForNotFinalizingGC() func() {
 		defer lvs.gcMu.Unlock()
 		lvs.gcOut -= 1
 		lvs.gcCond.Broadcast()
-	}
+	}, nil
 }
 
 // Call without lvs.gcMu held. Puts the ValueStore into its initial GC state,
@@ -487,7 +519,10 @@ func (lvs *ValueStore) readAndResetNewGenToVisit() hash.HashSet {
 // the ValueStore will be visible to other readers of the underlying
 // ChunkStore.
 func (lvs *ValueStore) Commit(ctx context.Context, current, last hash.Hash) (bool, error) {
-	c := lvs.waitForNotFinalizingGC()
+	c, err := lvs.waitForNotFinalizingGC(ctx)
+	if err != nil {
+		return false, err
+	}
 	defer c()
 
 	success, err := lvs.cs.Commit(ctx, current, last)
@@ -563,7 +598,7 @@ func (lvs *ValueStore) GC(ctx context.Context, oldGenRefs, newGenRefs hash.HashS
 
 		newGenRefs.Insert(root)
 
-		err = lvs.gc(ctx, oldGenRefs, oldGen.HasMany, newGen, oldGen, func() hash.HashSet {
+		err = lvs.gc(ctx, oldGenRefs, oldGen.HasMany, newGen, oldGen, nil, func() hash.HashSet {
 			n := lvs.transitionToNewGenGC()
 			newGenRefs.InsertAll(n)
 			return make(hash.HashSet)
@@ -573,19 +608,12 @@ func (lvs *ValueStore) GC(ctx context.Context, oldGenRefs, newGenRefs hash.HashS
 			return err
 		}
 
-		if safepointF != nil {
-			err = safepointF()
-			if err != nil {
-				newGen.EndGC()
-				return err
-			}
-		}
-
-		err = lvs.gc(ctx, newGenRefs, oldGen.HasMany, newGen, newGen, lvs.transitionToFinalizingGC)
+		err = lvs.gc(ctx, newGenRefs, oldGen.HasMany, newGen, newGen, safepointF, lvs.transitionToFinalizingGC)
 		newGen.EndGC()
 		if err != nil {
 			return err
 		}
+
 	} else if collector, ok := lvs.cs.(chunks.ChunkStoreGarbageCollector); ok {
 		extraNewGenRefs := lvs.transitionToNewGenGC()
 		newGenRefs.InsertAll(extraNewGenRefs)
@@ -610,15 +638,7 @@ func (lvs *ValueStore) GC(ctx context.Context, oldGenRefs, newGenRefs hash.HashS
 
 		newGenRefs.Insert(root)
 
-		if safepointF != nil {
-			err = safepointF()
-			if err != nil {
-				collector.EndGC()
-				return err
-			}
-		}
-
-		err = lvs.gc(ctx, newGenRefs, unfilteredHashFunc, collector, collector, lvs.transitionToFinalizingGC)
+		err = lvs.gc(ctx, newGenRefs, unfilteredHashFunc, collector, collector, safepointF, lvs.transitionToFinalizingGC)
 		collector.EndGC()
 		if err != nil {
 			return err
@@ -642,6 +662,7 @@ func (lvs *ValueStore) gc(ctx context.Context,
 	toVisit hash.HashSet,
 	hashFilter HashFilterFunc,
 	src, dest chunks.ChunkStoreGarbageCollector,
+	safepointF func() error,
 	finalize func() hash.HashSet) error {
 	keepChunks := make(chan []hash.Hash, gcBuffSize)
 
@@ -668,7 +689,7 @@ func (lvs *ValueStore) gc(ctx context.Context,
 	eg.Go(func() error {
 		defer walker.Close()
 
-		err := lvs.gcProcessRefs(ctx, toVisit, keepHashes, walker, hashFilter, finalize)
+		err := lvs.gcProcessRefs(ctx, toVisit, keepHashes, walker, hashFilter, safepointF, finalize)
 		if err != nil {
 			return err
 		}
@@ -691,6 +712,7 @@ func (lvs *ValueStore) gc(ctx context.Context,
 func (lvs *ValueStore) gcProcessRefs(ctx context.Context,
 	initialToVisit hash.HashSet, keepHashes func(hs []hash.Hash) error,
 	walker *parallelRefWalker, hashFilter HashFilterFunc,
+	safepointF func() error,
 	finalize func() hash.HashSet) error {
 	visited := make(hash.HashSet)
 
@@ -775,7 +797,15 @@ func (lvs *ValueStore) gcProcessRefs(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	return process(final)
+	err = process(final)
+	if err != nil {
+		return err
+	}
+
+	if safepointF != nil {
+		return safepointF()
+	}
+	return nil
 }
 
 // Close closes the underlying ChunkStore

@@ -16,15 +16,14 @@ package commands
 
 import (
 	"context"
-	"errors"
 
-	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/gocraft/dbr/v2"
+	"github.com/gocraft/dbr/v2/dialect"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
 	eventsapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/eventsapi/v1alpha1"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
-	"github.com/dolthub/dolt/go/libraries/doltcore/merge"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
 )
 
@@ -54,8 +53,7 @@ func (cmd MergeBaseCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd MergeBaseCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
-	//ap.ArgListHelp = append(ap.ArgListHelp, [2]string{"start-point", "A commit that a new branch should point at."})
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 2)
 	return ap
 }
 
@@ -65,7 +63,7 @@ func (cmd MergeBaseCmd) EventType() eventsapi.ClientEventType {
 }
 
 // Exec executes the command
-func (cmd MergeBaseCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd MergeBaseCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 	help, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, mergeBaseDocs, ap))
 	apr := cli.ParseArgsOrDie(ap, args, help)
@@ -76,63 +74,25 @@ func (cmd MergeBaseCmd) Exec(ctx context.Context, commandStr string, args []stri
 		return HandleVErrAndExitCode(verr, usage)
 	}
 
-	if dEnv.IsLocked() {
-		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(env.ErrActiveServerLock.New(dEnv.LockFile())), help)
+	queryist, sqlCtx, closeFunc, err := cliCtx.QueryEngine(ctx)
+	if err != nil {
+		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
+	}
+	if closeFunc != nil {
+		defer closeFunc()
 	}
 
-	mergeBaseStr, verr := getMergeBaseFromStrings(ctx, dEnv, apr.Arg(0), apr.Arg(1))
-	if verr != nil {
-		return HandleVErrAndExitCode(verr, usage)
+	interpolatedQuery, err := dbr.InterpolateForDialect("SELECT DOLT_MERGE_BASE(?, ?)", []interface{}{apr.Arg(0), apr.Arg(1)}, dialect.MySQL)
+	if err != nil {
+		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
 	}
 
-	cli.Println(mergeBaseStr)
+	row, err := GetRowsForSql(queryist, sqlCtx, interpolatedQuery)
+	if err != nil {
+		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
+	}
+
+	cli.Println(row[0][0].(string))
 
 	return 0
-}
-
-// getMergeBaseFromStrings resolves two revisions and returns the merge base
-// commit hash string
-func getMergeBaseFromStrings(ctx context.Context, dEnv *env.DoltEnv, leftStr, rightStr string) (string, errhand.VerboseError) {
-	left, verr := ResolveCommitWithVErr(dEnv, leftStr)
-	if verr != nil {
-		return "", verr
-	}
-
-	right, verr := ResolveCommitWithVErr(dEnv, rightStr)
-	if verr != nil {
-		return "", verr
-	}
-
-	mergeBase, err := merge.MergeBase(ctx, left, right)
-	if err != nil {
-		verr = errhand.BuildDError("could not find merge-base for args %s %s", leftStr, rightStr).AddCause(err).Build()
-		return "", verr
-	}
-
-	return mergeBase.String(), nil
-}
-
-func ResolveCommitWithVErr(dEnv *env.DoltEnv, cSpecStr string) (*doltdb.Commit, errhand.VerboseError) {
-	cs, err := doltdb.NewCommitSpec(cSpecStr)
-
-	if err != nil {
-		return nil, errhand.BuildDError("'%s' is not a valid commit", cSpecStr).Build()
-	}
-
-	cm, err := dEnv.DoltDB.Resolve(context.TODO(), cs, dEnv.RepoStateReader().CWBHeadRef())
-	if err != nil {
-		if errors.Is(err, doltdb.ErrInvalidAncestorSpec) {
-			return nil, errhand.BuildDError("'%s' could not resolve ancestor spec", cSpecStr).Build()
-		} else if errors.Is(err, doltdb.ErrBranchNotFound) {
-			return nil, errhand.BuildDError("unknown ref in commit spec: '%s'", cSpecStr).Build()
-		} else if doltdb.IsNotFoundErr(err) {
-			return nil, errhand.BuildDError("'%s' not found", cSpecStr).Build()
-		} else if errors.Is(err, doltdb.ErrFoundHashNotACommit) {
-			return nil, errhand.BuildDError("'%s' is not a commit", cSpecStr).Build()
-		} else {
-			return nil, errhand.BuildDError("Unexpected error resolving '%s'", cSpecStr).AddCause(err).Build()
-		}
-	}
-
-	return cm, nil
 }

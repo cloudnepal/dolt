@@ -57,7 +57,7 @@ func RowIterForIndexLookup(ctx *sql.Context, t DoltTableable, lookup sql.IndexLo
 	}
 }
 
-func RowIterForProllyRange(ctx *sql.Context, idx DoltIndex, r prolly.Range, pkSch sql.PrimaryKeySchema, projections []uint64, durableState *durableIndexState) (sql.RowIter2, error) {
+func RowIterForProllyRange(ctx *sql.Context, idx DoltIndex, r prolly.Range, pkSch sql.PrimaryKeySchema, projections []uint64, durableState *durableIndexState) (sql.RowIter, error) {
 	if projections == nil {
 		projections = idx.Schema().GetAllCols().Tags
 	}
@@ -117,24 +117,18 @@ func NewRangePartitionIter(ctx *sql.Context, t DoltTableable, lookup sql.IndexLo
 		prollyRanges: prollyRanges,
 		curr:         0,
 		isDoltFmt:    isDoltFmt,
+		isReverse:    lookup.IsReverse,
 	}, nil
 }
 
 func newPointPartitionIter(ctx *sql.Context, lookup sql.IndexLookup, idx *doltIndex) (sql.PartitionIter, error) {
-	tb := idx.keyBld
-	rng := lookup.Ranges[0]
-	ns := idx.ns
-	for j, expr := range rng {
-		v, err := getRangeCutValue(expr.LowerBound, rng[j].Typ)
-		if err != nil {
-			return nil, err
-		}
-		if err = PutField(ctx, ns, tb, j, v); err != nil {
-			return nil, err
-		}
+	prollyRanges, err := idx.prollyRanges(ctx, idx.ns, lookup.Ranges[0])
+	if err != nil {
+		return nil, err
 	}
-	tup := tb.BuildPermissive(sharePool)
-	return &pointPartition{r: prolly.Range{Tup: tup, Desc: tb.Desc}}, nil
+	return &pointPartition{
+		r: prollyRanges[0],
+	}, nil
 }
 
 var _ sql.PartitionIter = (*pointPartition)(nil)
@@ -166,6 +160,7 @@ type rangePartitionIter struct {
 	prollyRanges []prolly.Range
 	curr         int
 	isDoltFmt    bool
+	isReverse    bool
 }
 
 // Close is required by the sql.PartitionIter interface. Does nothing.
@@ -194,6 +189,7 @@ func (itr *rangePartitionIter) nextProllyPartition() (sql.Partition, error) {
 	return rangePartition{
 		prollyRange: pr,
 		key:         bytes[:],
+		isReverse:   itr.isReverse,
 	}, nil
 }
 
@@ -210,6 +206,7 @@ func (itr *rangePartitionIter) nextNomsPartition() (sql.Partition, error) {
 	return rangePartition{
 		nomsRange: nr,
 		key:       bytes[:],
+		isReverse: itr.isReverse,
 	}, nil
 }
 
@@ -217,6 +214,7 @@ type rangePartition struct {
 	nomsRange   *noms.ReadRange
 	prollyRange prolly.Range
 	key         []byte
+	isReverse   bool
 }
 
 func (rp rangePartition) Key() []byte {
@@ -260,6 +258,7 @@ func NewLookupBuilder(
 		base.sec = durable.ProllyMapFromIndex(s.Secondary)
 		base.secKd, base.secVd = base.sec.Descriptors()
 		base.ns = base.sec.NodeStore()
+		base.prefDesc = base.secKd.PrefixDesc(len(di.columns))
 	}
 
 	switch {
@@ -275,8 +274,13 @@ func NewLookupBuilder(
 		}, nil
 	case idx.coversColumns(s, projections):
 		return newCoveringLookupBuilder(base), nil
+	case idx.ID() == "PRIMARY":
+		// If we are using the primary index, always use a covering lookup builder. In some cases, coversColumns
+		// can return false, for example if a column was modified in an older version and has a different tag than
+		// the current schema. In those cases, the primary index is still the best we have, so go ahead and use it.
+		return newCoveringLookupBuilder(base), nil
 	default:
-		return newNonCoveringLookupBuilder(s, base), nil
+		return newNonCoveringLookupBuilder(s, base)
 	}
 }
 
@@ -295,7 +299,17 @@ func newCoveringLookupBuilder(b *baseLookupBuilder) *coveringLookupBuilder {
 	}
 }
 
-func newNonCoveringLookupBuilder(s *durableIndexState, b *baseLookupBuilder) *nonCoveringLookupBuilder {
+// newNonCoveringLookupBuilder returns a LookupBuilder that uses the specified index state and
+// base lookup builder to create a nonCoveringLookupBuilder that uses the secondary index (from
+// |b|) to find the PK row identifier, and then uses that PK to look up the complete row from
+// the primary index (from |s|). If a baseLookupBuilder built on the primary index is passed in,
+// this function returns an error.
+func newNonCoveringLookupBuilder(s *durableIndexState, b *baseLookupBuilder) (*nonCoveringLookupBuilder, error) {
+	if b.idx.ID() == "PRIMARY" {
+		return nil, fmt.Errorf("incompatible index passed to newNonCoveringLookupBuilder: " +
+			"primary index passed, but only secondary indexes are supported")
+	}
+
 	primary := durable.ProllyMapFromIndex(s.Primary)
 	priKd, _ := primary.Descriptors()
 	tbBld := val.NewTupleBuilder(priKd)
@@ -310,7 +324,7 @@ func newNonCoveringLookupBuilder(s *durableIndexState, b *baseLookupBuilder) *no
 		keyMap:            keyProj,
 		valMap:            valProj,
 		ordMap:            ordProj,
-	}
+	}, nil
 }
 
 var _ LookupBuilder = (*baseLookupBuilder)(nil)
@@ -330,6 +344,7 @@ type baseLookupBuilder struct {
 
 	sec          prolly.Map
 	secKd, secVd val.TupleDesc
+	prefDesc     val.TupleDesc
 	ns           tree.NodeStore
 }
 
@@ -346,7 +361,7 @@ func (lb *baseLookupBuilder) NewRowIter(ctx *sql.Context, part sql.Partition) (s
 // every subsequent point lookup. Note that equality joins can have a mix of
 // point lookups on concrete values, and range lookups for null matches.
 func (lb *baseLookupBuilder) newPointLookup(ctx *sql.Context, rang prolly.Range) (iter prolly.MapIter, err error) {
-	err = lb.sec.Get(ctx, rang.Tup, func(key val.Tuple, value val.Tuple) (err error) {
+	err = lb.sec.GetPrefix(ctx, rang.Tup, lb.prefDesc, func(key val.Tuple, value val.Tuple) (err error) {
 		if key != nil && rang.Matches(key) {
 			iter = prolly.NewPointLookup(key, value)
 		} else {
@@ -362,7 +377,11 @@ func (lb *baseLookupBuilder) rangeIter(ctx *sql.Context, part sql.Partition) (pr
 	case pointPartition:
 		return lb.newPointLookup(ctx, p.r)
 	case rangePartition:
-		return lb.sec.IterRange(ctx, p.prollyRange)
+		if p.isReverse {
+			return lb.sec.IterRangeReverse(ctx, p.prollyRange)
+		} else {
+			return lb.sec.IterRange(ctx, p.prollyRange)
+		}
 	default:
 		panic(fmt.Sprintf("unexpected prolly partition type: %T", part))
 	}
@@ -386,21 +405,22 @@ func (lb *coveringLookupBuilder) NewRowIter(ctx *sql.Context, part sql.Partition
 		return nil, err
 	}
 	return prollyCoveringIndexIter{
-		idx:       lb.idx,
-		indexIter: rangeIter,
-		keyDesc:   lb.secKd,
-		valDesc:   lb.secVd,
-		keyMap:    lb.keyMap,
-		valMap:    lb.valMap,
-		ordMap:    lb.ordMap,
-		sqlSch:    lb.sch.Schema,
-		ns:        lb.ns,
+		idx:         lb.idx,
+		indexIter:   rangeIter,
+		keyDesc:     lb.secKd,
+		valDesc:     lb.secVd,
+		keyMap:      lb.keyMap,
+		valMap:      lb.valMap,
+		ordMap:      lb.ordMap,
+		sqlSch:      lb.sch.Schema,
+		projections: lb.projections,
+		ns:          lb.ns,
 	}, nil
 }
 
 // nonCoveringLookupBuilder constructs row iters for non-covering lookups,
 // where we need to seek on the secondary table for key identity, and then
-// the primary table to fill all requrested projections.
+// the primary table to fill all requested projections.
 type nonCoveringLookupBuilder struct {
 	*baseLookupBuilder
 
@@ -418,15 +438,16 @@ func (lb *nonCoveringLookupBuilder) NewRowIter(ctx *sql.Context, part sql.Partit
 		return nil, err
 	}
 	return prollyIndexIter{
-		idx:       lb.idx,
-		indexIter: rangeIter,
-		primary:   lb.pri,
-		pkBld:     lb.pkBld,
-		pkMap:     lb.pkMap,
-		keyMap:    lb.keyMap,
-		valMap:    lb.valMap,
-		ordMap:    lb.ordMap,
-		sqlSch:    lb.sch.Schema,
+		idx:         lb.idx,
+		indexIter:   rangeIter,
+		primary:     lb.pri,
+		pkBld:       lb.pkBld,
+		pkMap:       lb.pkMap,
+		keyMap:      lb.keyMap,
+		valMap:      lb.valMap,
+		ordMap:      lb.ordMap,
+		sqlSch:      lb.sch.Schema,
+		projections: lb.projections,
 	}, nil
 }
 

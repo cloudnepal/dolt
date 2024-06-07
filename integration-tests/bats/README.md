@@ -21,23 +21,25 @@ If you find a bug in `dolt`, we would love a skipped bats test PR in addition to
 ```
 npm install -g bats
 ```
-2. Install `dolt` and `noms`
+2. Install `dolt` and its utilities.
 ```
 cd go/cmd/dolt && go install . && cd -
 cd go/store/cmd/noms && go install . && cd -
+cd go/utils/remotesrv && go install . && cd -
 ````
 
 3. Make sure you have `python3` installed.
 
 This came with my Mac Developer Tools and was on my PATH.
 
-4. `pip install mysql-connector-python` and `pip install pyarrow`
+4. `pip install mysql-connector-python`, `pip install pyarrow` and  `pip install pandas`
 
 I also needed this specific version on the python mysql.connector. `pip install mysql.connector` mostly worked but caused some SSL errors.
 
 ```
 pip3 install mysql-connector-python
-pip install pyarrow
+pip3 install pyarrow
+pip3 install pandas
 ```
 
 5. Install `parquet` and its dependencies

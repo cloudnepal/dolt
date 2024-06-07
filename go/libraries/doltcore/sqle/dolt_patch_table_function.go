@@ -15,6 +15,7 @@
 package sqle
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"sort"
@@ -22,21 +23,47 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
-	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/rowexec"
 	sqltypes "github.com/dolthub/go-mysql-server/sql/types"
 	"github.com/dolthub/vitess/go/mysql"
+	"golang.org/x/exp/slices"
 
-	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlfmt"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	"github.com/dolthub/dolt/go/store/types"
 )
 
 var _ sql.TableFunction = (*PatchTableFunction)(nil)
+var _ sql.ExecSourceRel = (*PatchTableFunction)(nil)
+var _ sql.IndexAddressable = (*PatchTableFunction)(nil)
+var _ sql.IndexedTable = (*PatchTableFunction)(nil)
+var _ sql.TableNode = (*PatchTableFunction)(nil)
+
+const (
+	diffTypeSchema = "schema"
+	diffTypeData   = "data"
+)
+
+var schemaChangePartitionKey = []byte(diffTypeSchema)
+var dataChangePartitionKey = []byte(diffTypeData)
+var schemaAndDataChangePartitionKey = []byte("all")
+
+const (
+	orderColumnName           = "statement_order"
+	fromColumnName            = "from_commit_hash"
+	toColumnName              = "to_commit_hash"
+	tableNameColumnName       = "table_name"
+	diffTypeColumnName        = "diff_type"
+	statementColumnName       = "statement"
+	patchTableDefaultRowCount = 100
+)
 
 type PatchTableFunction struct {
 	ctx *sql.Context
@@ -48,13 +75,161 @@ type PatchTableFunction struct {
 	database       sql.Database
 }
 
+func (p *PatchTableFunction) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(p.Schema())
+	numRows, _, err := p.RowCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return numBytesPerRow * numRows, nil
+}
+
+func (p *PatchTableFunction) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return patchTableDefaultRowCount, false, nil
+}
+
+func (p *PatchTableFunction) CollationCoercibility(ctx *sql.Context) (collation sql.CollationID, coercibility byte) {
+	return sql.Collation_binary, 7
+}
+
+type Partition struct {
+	key []byte
+}
+
+func (p *Partition) Key() []byte { return p.key }
+
+// UnderlyingTable implements the plan.TableNode interface
+func (p *PatchTableFunction) UnderlyingTable() sql.Table {
+	return p
+}
+
+// Collation implements the sql.Table interface.
+func (p *PatchTableFunction) Collation() sql.CollationID {
+	return sql.Collation_Default
+}
+
+// Partitions is a sql.Table interface function that returns a partition of the data. This data has a single partition.
+func (p *PatchTableFunction) Partitions(ctx *sql.Context) (sql.PartitionIter, error) {
+	return dtables.NewSliceOfPartitionsItr([]sql.Partition{
+		&Partition{key: schemaAndDataChangePartitionKey},
+	}), nil
+}
+
+// PartitionRows is a sql.Table interface function that takes a partition and returns all rows in that partition.
+// This table has a partition for just schema changes, one for just data changes, and one for both.
+// TODO: schema names
+func (p *PatchTableFunction) PartitionRows(ctx *sql.Context, partition sql.Partition) (sql.RowIter, error) {
+	fromCommitVal, toCommitVal, dotCommitVal, tableName, err := p.evaluateArguments()
+	if err != nil {
+		return nil, err
+	}
+
+	sqledb, ok := p.database.(dsess.SqlDatabase)
+	if !ok {
+		return nil, fmt.Errorf("unable to get dolt database")
+	}
+
+	fromRefDetails, toRefDetails, err := loadDetailsForRefs(ctx, fromCommitVal, toCommitVal, dotCommitVal, sqledb)
+	if err != nil {
+		return nil, err
+	}
+
+	tableDeltas, err := diff.GetTableDeltas(ctx, fromRefDetails.root, toRefDetails.root)
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(tableDeltas, func(i, j int) bool {
+		return tableDeltas[i].ToName.Less(tableDeltas[j].ToName)
+	})
+
+	// If tableNameExpr defined, return a single table patch result
+	if p.tableNameExpr != nil {
+		fromTblExists, err := fromRefDetails.root.HasTable(ctx, doltdb.TableName{Name: tableName})
+		if err != nil {
+			return nil, err
+		}
+		toTblExists, err := toRefDetails.root.HasTable(ctx, doltdb.TableName{Name: tableName})
+		if err != nil {
+			return nil, err
+		}
+		if !fromTblExists && !toTblExists {
+			return nil, sql.ErrTableNotFound.New(tableName)
+		}
+
+		delta := findMatchingDelta(tableDeltas, tableName)
+		tableDeltas = []diff.TableDelta{delta}
+	}
+
+	includeSchemaDiff := bytes.Equal(partition.Key(), schemaAndDataChangePartitionKey) || bytes.Equal(partition.Key(), schemaChangePartitionKey)
+	includeDataDiff := bytes.Equal(partition.Key(), schemaAndDataChangePartitionKey) || bytes.Equal(partition.Key(), dataChangePartitionKey)
+
+	patches, err := getPatchNodes(ctx, sqledb.DbData(), tableDeltas, fromRefDetails, toRefDetails, includeSchemaDiff, includeDataDiff)
+	if err != nil {
+		return nil, err
+	}
+
+	return newPatchTableFunctionRowIter(patches, fromRefDetails.hashStr, toRefDetails.hashStr), nil
+}
+
+// LookupPartitions is a sql.IndexedTable interface function that takes an index lookup and returns the set of corresponding partitions.
+func (p *PatchTableFunction) LookupPartitions(context *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
+	if lookup.Index.ID() == diffTypeColumnName {
+		diffTypes, ok := index.LookupToPointSelectStr(lookup)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse commit lookup ranges: %s", sql.DebugString(lookup.Ranges))
+		}
+
+		includeSchemaDiff := slices.Contains(diffTypes, diffTypeSchema)
+		includeDataDiff := slices.Contains(diffTypes, diffTypeData)
+
+		if includeSchemaDiff && includeDataDiff {
+			return dtables.NewSliceOfPartitionsItr([]sql.Partition{
+				&Partition{key: schemaAndDataChangePartitionKey},
+			}), nil
+		}
+
+		if includeSchemaDiff {
+			return dtables.NewSliceOfPartitionsItr([]sql.Partition{
+				&Partition{key: schemaChangePartitionKey},
+			}), nil
+		}
+
+		if includeDataDiff {
+			return dtables.NewSliceOfPartitionsItr([]sql.Partition{
+				&Partition{key: dataChangePartitionKey},
+			}), nil
+		}
+
+		return dtables.NewSliceOfPartitionsItr([]sql.Partition{}), nil
+	}
+
+	return dtables.NewSliceOfPartitionsItr([]sql.Partition{
+		&Partition{key: schemaAndDataChangePartitionKey},
+	}), nil
+}
+
+func (p *PatchTableFunction) IndexedAccess(lookup sql.IndexLookup) sql.IndexedTable {
+	return p
+}
+
+func (p *PatchTableFunction) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
+	return []sql.Index{
+		index.MockIndex(p.database.Name(), p.Name(), diffTypeColumnName, types.StringKind, false),
+	}, nil
+}
+
+func (p *PatchTableFunction) PreciseMatch() bool {
+	return true
+}
+
 var patchTableSchema = sql.Schema{
-	&sql.Column{Name: "statement_order", Type: sqltypes.Uint64, PrimaryKey: true, Nullable: false},
-	&sql.Column{Name: "from_commit_hash", Type: sqltypes.LongText, Nullable: false},
-	&sql.Column{Name: "to_commit_hash", Type: sqltypes.LongText, Nullable: false},
-	&sql.Column{Name: "table_name", Type: sqltypes.LongText, Nullable: false},
-	&sql.Column{Name: "diff_type", Type: sqltypes.LongText, Nullable: false},
-	&sql.Column{Name: "statement", Type: sqltypes.LongText, Nullable: false},
+	&sql.Column{Name: orderColumnName, Type: sqltypes.Uint64, PrimaryKey: true, Nullable: false},
+	&sql.Column{Name: fromColumnName, Type: sqltypes.LongText, Nullable: false},
+	&sql.Column{Name: toColumnName, Type: sqltypes.LongText, Nullable: false},
+	&sql.Column{Name: tableNameColumnName, Type: sqltypes.LongText, Nullable: false},
+	&sql.Column{Name: diffTypeColumnName, Type: sqltypes.LongText, Nullable: false},
+	&sql.Column{Name: statementColumnName, Type: sqltypes.LongText, Nullable: false},
 }
 
 // NewInstance creates a new instance of TableFunction interface
@@ -80,6 +255,10 @@ func (p *PatchTableFunction) Resolved() bool {
 	return p.commitsResolved()
 }
 
+func (p *PatchTableFunction) IsReadOnly() bool {
+	return true
+}
+
 func (p *PatchTableFunction) commitsResolved() bool {
 	if p.dotCommitExpr != nil {
 		return p.dotCommitExpr.Resolved()
@@ -98,7 +277,10 @@ func (p *PatchTableFunction) String() string {
 	if p.tableNameExpr != nil {
 		return fmt.Sprintf("DOLT_PATCH(%s, %s, %s)", p.fromCommitExpr.String(), p.toCommitExpr.String(), p.tableNameExpr.String())
 	}
-	return fmt.Sprintf("DOLT_PATCH(%s, %s)", p.fromCommitExpr.String(), p.toCommitExpr.String())
+	if p.fromCommitExpr != nil && p.toCommitExpr != nil {
+		return fmt.Sprintf("DOLT_PATCH(%s, %s)", p.fromCommitExpr.String(), p.toCommitExpr.String())
+	}
+	return fmt.Sprintf("DOLT_PATCH(<INVALID>)")
 }
 
 // Schema implements the sql.Node interface.
@@ -135,8 +317,8 @@ func (p *PatchTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.Pri
 			return false
 		}
 
-		return opChecker.UserHasPrivileges(ctx,
-			sql.NewPrivilegedOperation(p.database.Name(), tableName, "", sql.PrivilegeType_Select))
+		subject := sql.PrivilegeCheckSubject{Database: p.database.Name(), Table: tableName}
+		return opChecker.UserHasPrivileges(ctx, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 	}
 
 	tblNames, err := p.database.GetTableNames(ctx)
@@ -144,9 +326,10 @@ func (p *PatchTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.Pri
 		return false
 	}
 
-	var operations []sql.PrivilegedOperation
+	operations := make([]sql.PrivilegedOperation, 0, len(tblNames))
 	for _, tblName := range tblNames {
-		operations = append(operations, sql.NewPrivilegedOperation(p.database.Name(), tblName, "", sql.PrivilegeType_Select))
+		subject := sql.PrivilegeCheckSubject{Database: p.database.Name(), Table: tblName}
+		operations = append(operations, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 	}
 
 	return opChecker.UserHasPrivileges(ctx, operations...)
@@ -167,12 +350,12 @@ func (p *PatchTableFunction) Expressions() []sql.Expression {
 }
 
 // WithExpressions implements the sql.Expressioner interface.
-func (p *PatchTableFunction) WithExpressions(expression ...sql.Expression) (sql.Node, error) {
-	if len(expression) < 1 {
-		return nil, sql.ErrInvalidArgumentNumber.New(p.Name(), "1 to 3", len(expression))
+func (p *PatchTableFunction) WithExpressions(expr ...sql.Expression) (sql.Node, error) {
+	if len(expr) < 1 {
+		return nil, sql.ErrInvalidArgumentNumber.New(p.Name(), "1 to 3", len(expr))
 	}
 
-	for _, expr := range expression {
+	for _, expr := range expr {
 		if !expr.Resolved() {
 			return nil, ErrInvalidNonLiteralArgument.New(p.Name(), expr.String())
 		}
@@ -183,41 +366,41 @@ func (p *PatchTableFunction) WithExpressions(expression ...sql.Expression) (sql.
 	}
 
 	newPtf := *p
-	if strings.Contains(expression[0].String(), "..") {
-		if len(expression) < 1 || len(expression) > 2 {
-			return nil, sql.ErrInvalidArgumentNumber.New(newPtf.Name(), "1 or 2", len(expression))
+	if strings.Contains(expr[0].String(), "..") {
+		if len(expr) < 1 || len(expr) > 2 {
+			return nil, sql.ErrInvalidArgumentNumber.New(newPtf.Name(), "1 or 2", len(expr))
 		}
-		newPtf.dotCommitExpr = expression[0]
-		if len(expression) == 2 {
-			newPtf.tableNameExpr = expression[1]
+		newPtf.dotCommitExpr = expr[0]
+		if len(expr) == 2 {
+			newPtf.tableNameExpr = expr[1]
 		}
 	} else {
-		if len(expression) < 2 || len(expression) > 3 {
-			return nil, sql.ErrInvalidArgumentNumber.New(newPtf.Name(), "2 or 3", len(expression))
+		if len(expr) < 2 || len(expr) > 3 {
+			return nil, sql.ErrInvalidArgumentNumber.New(newPtf.Name(), "2 or 3", len(expr))
 		}
-		newPtf.fromCommitExpr = expression[0]
-		newPtf.toCommitExpr = expression[1]
-		if len(expression) == 3 {
-			newPtf.tableNameExpr = expression[2]
+		newPtf.fromCommitExpr = expr[0]
+		newPtf.toCommitExpr = expr[1]
+		if len(expr) == 3 {
+			newPtf.tableNameExpr = expr[2]
 		}
 	}
 
 	// validate the expressions
 	if newPtf.dotCommitExpr != nil {
-		if !sqltypes.IsText(newPtf.dotCommitExpr.Type()) {
+		if !sqltypes.IsText(newPtf.dotCommitExpr.Type()) && !expression.IsBindVar(newPtf.dotCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newPtf.Name(), newPtf.dotCommitExpr.String())
 		}
 	} else {
-		if !sqltypes.IsText(newPtf.fromCommitExpr.Type()) {
+		if !sqltypes.IsText(newPtf.fromCommitExpr.Type()) && !expression.IsBindVar(newPtf.fromCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newPtf.Name(), newPtf.fromCommitExpr.String())
 		}
-		if !sqltypes.IsText(newPtf.toCommitExpr.Type()) {
+		if !sqltypes.IsText(newPtf.toCommitExpr.Type()) && !expression.IsBindVar(newPtf.toCommitExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newPtf.Name(), newPtf.toCommitExpr.String())
 		}
 	}
 
 	if newPtf.tableNameExpr != nil {
-		if !sqltypes.IsText(newPtf.tableNameExpr.Type()) {
+		if !sqltypes.IsText(newPtf.tableNameExpr.Type()) && !expression.IsBindVar(newPtf.tableNameExpr) {
 			return nil, sql.ErrInvalidArgumentDetails.New(newPtf.Name(), newPtf.tableNameExpr.String())
 		}
 	}
@@ -239,59 +422,17 @@ func (p *PatchTableFunction) WithDatabase(database sql.Database) (sql.Node, erro
 
 // Name implements the sql.TableFunction interface
 func (p *PatchTableFunction) Name() string {
-	return "dolt_patch"
+	return p.String()
 }
 
-// RowIter implements the sql.Node interface
+// RowIter implements the sql.ExecSourceRel interface
 func (p *PatchTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.RowIter, error) {
-	fromCommitVal, toCommitVal, dotCommitVal, tableName, err := p.evaluateArguments()
+	partitions, err := p.Partitions(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	sqledb, ok := p.database.(SqlDatabase)
-	if !ok {
-		return nil, fmt.Errorf("unable to get dolt database")
-	}
-
-	fromRefDetails, toRefDetails, err := loadDetailsForRefs(ctx, fromCommitVal, toCommitVal, dotCommitVal, sqledb)
-	if err != nil {
-		return nil, err
-	}
-
-	tableDeltas, err := diff.GetTableDeltas(ctx, fromRefDetails.root, toRefDetails.root)
-	if err != nil {
-		return nil, err
-	}
-
-	sort.Slice(tableDeltas, func(i, j int) bool {
-		return strings.Compare(tableDeltas[i].ToName, tableDeltas[j].ToName) < 0
-	})
-
-	// If tableNameExpr defined, return a single table patch result
-	if p.tableNameExpr != nil {
-		fromTblExists, err := fromRefDetails.root.HasTable(ctx, tableName)
-		if err != nil {
-			return nil, err
-		}
-		toTblExists, err := toRefDetails.root.HasTable(ctx, tableName)
-		if err != nil {
-			return nil, err
-		}
-		if !fromTblExists && !toTblExists {
-			return nil, sql.ErrTableNotFound.New(tableName)
-		}
-
-		delta := findMatchingDelta(tableDeltas, tableName)
-		tableDeltas = []diff.TableDelta{delta}
-	}
-
-	patches, err := getPatchNodes(ctx, sqledb.DbData(), tableDeltas, fromRefDetails, toRefDetails)
-	if err != nil {
-		return nil, err
-	}
-
-	return newPatchTableFunctionRowIter(patches, fromRefDetails.hashStr, toRefDetails.hashStr), nil
+	return sql.NewTableRowIter(ctx, p, partitions), nil
 }
 
 // evaluateArguments returns fromCommitVal, toCommitVal, dotCommitVal, and tableName.
@@ -339,12 +480,30 @@ type patchNode struct {
 	dataPatchStmts   []string
 }
 
-func getPatchNodes(ctx *sql.Context, dbData env.DbData, tableDeltas []diff.TableDelta, fromRefDetails, toRefDetails *refDetails) ([]*patchNode, error) {
-	var patches []*patchNode
+func getPatchNodes(ctx *sql.Context, dbData env.DbData, tableDeltas []diff.TableDelta, fromRefDetails, toRefDetails *refDetails, includeSchemaDiff, includeDataDiff bool) (patches []*patchNode, err error) {
 	for _, td := range tableDeltas {
-		// no diff
 		if td.FromTable == nil && td.ToTable == nil {
-			continue
+			// no diff
+			if !strings.HasPrefix(td.FromName.Name, diff.DBPrefix) || !strings.HasPrefix(td.ToName.Name, diff.DBPrefix) {
+				continue
+			}
+
+			// db collation diff
+			dbName := strings.TrimPrefix(td.ToName.Name, diff.DBPrefix)
+			fromColl, cerr := fromRefDetails.root.GetCollation(ctx)
+			if cerr != nil {
+				return nil, cerr
+			}
+			toColl, cerr := toRefDetails.root.GetCollation(ctx)
+			if cerr != nil {
+				return nil, cerr
+			}
+			alterDBCollStmt := sqlfmt.AlterDatabaseCollateStmt(dbName, fromColl, toColl)
+			patches = append(patches, &patchNode{
+				tblName:          td.FromName.Name,
+				schemaPatchStmts: []string{alterDBCollStmt},
+				dataPatchStmts:   []string{},
+			})
 		}
 
 		tblName := td.ToName
@@ -353,59 +512,27 @@ func getPatchNodes(ctx *sql.Context, dbData env.DbData, tableDeltas []diff.Table
 		}
 
 		// Get SCHEMA DIFF
-		schemaStmts, err := getSchemaSqlPatch(ctx, toRefDetails.root, td)
-		if err != nil {
-			return nil, err
+		var schemaStmts []string
+		if includeSchemaDiff {
+			schemaStmts, err = sqlfmt.GenerateSqlPatchSchemaStatements(ctx, toRefDetails.root, td)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// Get DATA DIFF
 		var dataStmts []string
-		if canGetDataDiff(ctx, td) {
+		if includeDataDiff && canGetDataDiff(ctx, td) {
 			dataStmts, err = getUserTableDataSqlPatch(ctx, dbData, td, fromRefDetails, toRefDetails)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		patches = append(patches, &patchNode{tblName: tblName, schemaPatchStmts: schemaStmts, dataPatchStmts: dataStmts})
+		patches = append(patches, &patchNode{tblName: tblName.Name, schemaPatchStmts: schemaStmts, dataPatchStmts: dataStmts})
 	}
 
 	return patches, nil
-}
-
-func getSchemaSqlPatch(ctx *sql.Context, toRoot *doltdb.RootValue, td diff.TableDelta) ([]string, error) {
-	toSchemas, err := toRoot.GetAllSchemas(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("could not read schemas from toRoot, cause: %s", err.Error())
-	}
-
-	fromSch, toSch, err := td.GetSchemas(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("cannot retrieve schema for table %s, cause: %s", td.ToName, err.Error())
-	}
-
-	var ddlStatements []string
-	if td.IsDrop() {
-		ddlStatements = append(ddlStatements, sqlfmt.DropTableStmt(td.FromName))
-	} else if td.IsAdd() {
-		toPkSch, err := sqlutil.FromDoltSchema(td.ToName, td.ToSch)
-		if err != nil {
-			return nil, err
-		}
-		stmt, err := diff.GenerateCreateTableStatement(td.ToName, td.ToSch, toPkSch, td.ToFks, td.ToFksParentSch)
-		if err != nil {
-			return nil, errhand.VerboseErrorFromError(err)
-		}
-		ddlStatements = append(ddlStatements, stmt)
-	} else {
-		stmts, err := diff.GetNonCreateNonDropTableSqlSchemaDiff(td, toSchemas, fromSch, toSch)
-		if err != nil {
-			return nil, err
-		}
-		ddlStatements = append(ddlStatements, stmts...)
-	}
-
-	return ddlStatements, nil
 }
 
 func canGetDataDiff(ctx *sql.Context, td diff.TableDelta) bool {
@@ -422,16 +549,7 @@ func canGetDataDiff(ctx *sql.Context, td diff.TableDelta) bool {
 		})
 		return false
 	}
-	// cannot sql diff
-	if td.ToSch == nil || (td.FromSch != nil && !schema.SchemasAreEqual(td.FromSch, td.ToSch)) {
-		// TODO(8/24/22 Zach): this is overly broad, we can absolutely do better
-		ctx.Session.Warn(&sql.Warning{
-			Level:   "Warning",
-			Code:    mysql.ERNotSupportedYet,
-			Message: fmt.Sprintf("Incompatible schema change, skipping data diff for table '%s'", td.ToName),
-		})
-		return false
-	}
+
 	return true
 }
 
@@ -442,12 +560,12 @@ func getUserTableDataSqlPatch(ctx *sql.Context, dbData env.DbData, td diff.Table
 		return nil, err
 	}
 
-	targetPkSch, err := sqlutil.FromDoltSchema(td.ToName, td.ToSch)
+	targetPkSch, err := sqlutil.FromDoltSchema("", td.ToName.Name, td.ToSch)
 	if err != nil {
 		return nil, err
 	}
 
-	return getDataSqlPatchResults(ctx, diffSch, targetPkSch.Schema, projections, ri, td.ToName, td.ToSch)
+	return getDataSqlPatchResults(ctx, diffSch, targetPkSch.Schema, projections, ri, td.ToName.Name, td.ToSch)
 }
 
 func getDataSqlPatchResults(ctx *sql.Context, diffQuerySch, targetSch sql.Schema, projections []sql.Expression, iter sql.RowIter, tn string, tsch schema.Schema) ([]string, error) {
@@ -465,7 +583,7 @@ func getDataSqlPatchResults(ctx *sql.Context, diffQuerySch, targetSch sql.Schema
 			return nil, err
 		}
 
-		r, err = plan.ProjectRow(ctx, projections, r)
+		r, err = rowexec.ProjectRow(ctx, projections, r)
 		if err != nil {
 			return nil, err
 		}
@@ -477,14 +595,14 @@ func getDataSqlPatchResults(ctx *sql.Context, diffQuerySch, targetSch sql.Schema
 
 		var stmt string
 		if oldRow.Row != nil {
-			stmt, err = diff.GetDataDiffStatement(tn, tsch, oldRow.Row, oldRow.RowDiff, oldRow.ColDiffs)
+			stmt, err = sqlfmt.GenerateDataDiffStatement(tn, tsch, oldRow.Row, oldRow.RowDiff, oldRow.ColDiffs)
 			if err != nil {
 				return nil, err
 			}
 		}
 
 		if newRow.Row != nil {
-			stmt, err = diff.GetDataDiffStatement(tn, tsch, newRow.Row, newRow.RowDiff, newRow.ColDiffs)
+			stmt, err = sqlfmt.GenerateDataDiffStatement(tn, tsch, newRow.Row, newRow.RowDiff, newRow.ColDiffs)
 			if err != nil {
 				return nil, err
 			}
@@ -505,7 +623,7 @@ func getDiffQuery(ctx *sql.Context, dbData env.DbData, td diff.TableDelta, fromR
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	diffPKSch, err := sqlutil.FromDoltSchema("", diffTableSchema)
+	diffPKSch, err := sqlutil.FromDoltSchema("", "", diffTableSchema)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -545,7 +663,7 @@ func getDiffQuerySqlSchemaAndProjections(diffTableSch sql.Schema, columns []stri
 		idx    int
 	}
 
-	columns = append(columns, "diff_type")
+	columns = append(columns, diffTypeColumnName)
 	colMap := make(map[string]*column)
 	for _, c := range columns {
 		colMap[c] = nil
@@ -666,9 +784,9 @@ func (p *patchStatementsRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 	}
 
 	stmt := p.stmts[p.idx]
-	diffType := "schema"
+	diffType := diffTypeSchema
 	if p.idx >= p.ddlLen {
-		diffType = "data"
+		diffType = diffTypeData
 	}
 
 	return sql.Row{diffType, stmt}, nil

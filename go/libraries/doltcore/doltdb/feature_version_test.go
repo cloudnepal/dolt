@@ -58,7 +58,10 @@ func (cmd fvCommand) exec(ctx context.Context, dEnv *env.DoltEnv) int {
 	// execute the command using |cmd.user|'s Feature Version
 	doltdb.DoltFeatureVersion = cmd.user.vers
 	defer func() { doltdb.DoltFeatureVersion = DoltFeatureVersionCopy }()
-	return cmd.cmd.Exec(ctx, cmd.cmd.Name(), cmd.args, dEnv)
+
+	cliCtx, _ := commands.NewArgFreeCliContext(ctx, dEnv)
+
+	return cmd.cmd.Exec(ctx, cmd.cmd.Name(), cmd.args, dEnv, cliCtx)
 }
 
 type fvUser struct {
@@ -151,6 +154,7 @@ func TestFeatureVersion(t *testing.T) {
 
 			doltdb.DoltFeatureVersion = oldVersion
 			dEnv := dtestutils.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 			doltdb.DoltFeatureVersion = DoltFeatureVersionCopy
 
 			for _, cmd := range test.setup {
@@ -166,7 +170,7 @@ func TestFeatureVersion(t *testing.T) {
 			doltdb.DoltFeatureVersion = newVersion
 			defer func() { doltdb.DoltFeatureVersion = DoltFeatureVersionCopy }()
 
-			assertFeatureVersion := func(r *doltdb.RootValue) {
+			assertFeatureVersion := func(r doltdb.RootValue) {
 				act, ok, err := r.GetFeatureVersion(ctx)
 				require.NoError(t, err)
 				require.True(t, ok)

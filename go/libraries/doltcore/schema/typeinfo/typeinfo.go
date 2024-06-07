@@ -17,7 +17,6 @@ package typeinfo
 import (
 	"context"
 	"fmt"
-	"math"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
@@ -56,6 +55,7 @@ const (
 	MultiLineStringTypeIdentifier    Identifier = "multilinestring"
 	MultiPolygonTypeIdentifier       Identifier = "multipolygon"
 	GeometryCollectionTypeIdentifier Identifier = "geometrycollection"
+	ExtendedTypeIdentifier           Identifier = "extended"
 )
 
 var Identifiers = map[Identifier]struct{}{
@@ -86,6 +86,7 @@ var Identifiers = map[Identifier]struct{}{
 	MultiLineStringTypeIdentifier:    {},
 	MultiPolygonTypeIdentifier:       {},
 	GeometryCollectionTypeIdentifier: {},
+	ExtendedTypeIdentifier:           {},
 }
 
 // TypeInfo is an interface used for encoding type information.
@@ -135,11 +136,26 @@ type TypeInfo interface {
 
 // FromSqlType takes in a sql.Type and returns the most relevant TypeInfo.
 func FromSqlType(sqlType sql.Type) (TypeInfo, error) {
-	switch sqlType.Type() {
+	if gmsExtendedType, ok := sqlType.(gmstypes.ExtendedType); ok {
+		return CreateExtendedTypeFromSqlType(gmsExtendedType), nil
+	}
+	sqlType, err := fillInCollationWithDefault(sqlType)
+	if err != nil {
+		return nil, err
+	}
+
+	queryType := sqlType.Type()
+	switch queryType {
 	case sqltypes.Null:
 		return UnknownType, nil
 	case sqltypes.Int8:
-		return Int8Type, nil
+		// MySQL allows only the TINYINT type to have a display width, so it's the only
+		// integer type that needs to be checked for it's underlying NumberType data.
+		numberType, ok := sqlType.(sql.NumberType)
+		if !ok {
+			return nil, fmt.Errorf("expected sql.NumberType, but received: %T", sqlType)
+		}
+		return &intType{numberType}, nil
 	case sqltypes.Int16:
 		return Int16Type, nil
 	case sqltypes.Int24:
@@ -162,14 +178,12 @@ func FromSqlType(sqlType sql.Type) (TypeInfo, error) {
 		return Float32Type, nil
 	case sqltypes.Float64:
 		return Float64Type, nil
-	case sqltypes.Timestamp:
-		return TimestampType, nil
+	case sqltypes.Timestamp, sqltypes.Datetime:
+		return CreateDatetimeTypeFromSqlType(sqlType.(sql.DatetimeType)), nil
 	case sqltypes.Date:
 		return DateType, nil
 	case sqltypes.Time:
 		return TimeType, nil
-	case sqltypes.Datetime:
-		return DatetimeType, nil
 	case sqltypes.Year:
 		return YearType, nil
 	case sqltypes.Geometry:
@@ -264,6 +278,16 @@ func FromSqlType(sqlType sql.Type) (TypeInfo, error) {
 	}
 }
 
+// fillInCollationWithDefault sets the default collation on any collated type with no collation set.
+// We don't serialize the collation if it's the default collation, but the engine expects every column to have an
+// explicit collation. So fill it in on load in that case.
+func fillInCollationWithDefault(typ sql.Type) (sql.Type, error) {
+	if collationType, ok := typ.(sql.TypeWithCollation); ok && collationType.Collation() == sql.Collation_Unspecified {
+		return collationType.WithNewCollation(sql.Collation_Default)
+	}
+	return typ, nil
+}
+
 // FromTypeParams constructs a TypeInfo from the given identifier and parameters.
 func FromTypeParams(id Identifier, params map[string]string) (TypeInfo, error) {
 	switch id {
@@ -273,6 +297,8 @@ func FromTypeParams(id Identifier, params map[string]string) (TypeInfo, error) {
 		return CreateBlobStringTypeFromParams(params)
 	case BoolTypeIdentifier:
 		return BoolType, nil
+	case ExtendedTypeIdentifier:
+		return CreateExtendedTypeFromParams(params)
 	case DatetimeTypeIdentifier:
 		return CreateDatetimeTypeFromParams(params)
 	case DecimalTypeIdentifier:
@@ -281,28 +307,28 @@ func FromTypeParams(id Identifier, params map[string]string) (TypeInfo, error) {
 		return CreateEnumTypeFromParams(params)
 	case FloatTypeIdentifier:
 		return CreateFloatTypeFromParams(params)
+	case GeometryCollectionTypeIdentifier:
+		return CreateGeomCollTypeFromParams(params)
+	case GeometryTypeIdentifier:
+		return CreateGeometryTypeFromParams(params)
 	case InlineBlobTypeIdentifier:
 		return CreateInlineBlobTypeFromParams(params)
 	case IntTypeIdentifier:
 		return CreateIntTypeFromParams(params)
 	case JSONTypeIdentifier:
 		return JSONType, nil
-	case GeometryTypeIdentifier:
-		return CreateGeometryTypeFromParams(params)
-	case PointTypeIdentifier:
-		return CreatePointTypeFromParams(params)
 	case LineStringTypeIdentifier:
 		return CreateLineStringTypeFromParams(params)
-	case PolygonTypeIdentifier:
-		return CreatePolygonTypeFromParams(params)
 	case MultiPointTypeIdentifier:
 		return CreateMultiPointTypeFromParams(params)
 	case MultiLineStringTypeIdentifier:
 		return CreateMultiLineStringTypeFromParams(params)
 	case MultiPolygonTypeIdentifier:
 		return CreateMultiPolygonTypeFromParams(params)
-	case GeometryCollectionTypeIdentifier:
-		return CreateGeomCollTypeFromParams(params)
+	case PointTypeIdentifier:
+		return CreatePointTypeFromParams(params)
+	case PolygonTypeIdentifier:
+		return CreatePolygonTypeFromParams(params)
 	case SetTypeIdentifier:
 		return CreateSetTypeFromParams(params)
 	case TimeTypeIdentifier:
@@ -331,10 +357,12 @@ func FromKind(kind types.NomsKind) TypeInfo {
 		return &varBinaryType{gmstypes.LongBlob}
 	case types.BoolKind:
 		return BoolType
+	case types.ExtendedKind:
+		panic(fmt.Errorf(`type not supported by the old format "%v"`, kind.String()))
 	case types.FloatKind:
 		return Float64Type
 	case types.InlineBlobKind:
-		return &inlineBlobType{gmstypes.MustCreateBinary(sqltypes.VarBinary, math.MaxUint16)}
+		return &inlineBlobType{gmstypes.MustCreateBinary(sqltypes.VarBinary, MaxVarcharLength/16)}
 	case types.IntKind:
 		return Int64Type
 	case types.JSONKind:
@@ -364,12 +392,6 @@ func FromKind(kind types.NomsKind) TypeInfo {
 	default:
 		panic(fmt.Errorf(`no default type info for NomsKind "%v"`, kind.String()))
 	}
-}
-
-// IsStringType returns whether the given TypeInfo represents a CHAR, VARCHAR, or TEXT-derivative.
-func IsStringType(ti TypeInfo) bool {
-	_, ok := ti.(*varStringType)
-	return ok
 }
 
 // ParseIdentifier takes in an Identifier in string form and returns the matching Identifier.

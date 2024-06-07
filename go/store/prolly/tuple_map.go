@@ -111,8 +111,8 @@ func MutateMapWithTupleIter(ctx context.Context, m Map, iter TupleIter) (Map, er
 	}, nil
 }
 
-func DiffMaps(ctx context.Context, from, to Map, cb tree.DiffFn) error {
-	return tree.DiffOrderedTrees(ctx, from.tuples, to.tuples, makeDiffCallBack(from, to, cb))
+func DiffMaps(ctx context.Context, from, to Map, considerAllRowsModified bool, cb tree.DiffFn) error {
+	return tree.DiffOrderedTrees(ctx, from.tuples, to.tuples, considerAllRowsModified, makeDiffCallBack(from, to, cb))
 }
 
 // RangeDiffMaps returns diffs within a Range. See Range for which diffs are
@@ -168,7 +168,12 @@ func makeDiffCallBack(from, to Map, innerCb tree.DiffFn) tree.DiffFn {
 
 func MergeMaps(ctx context.Context, left, right, base Map, cb tree.CollisionFn) (Map, tree.MergeStats, error) {
 	serializer := message.NewProllyMapSerializer(left.valDesc, base.NodeStore().Pool())
-	tuples, stats, err := tree.MergeOrderedTrees(ctx, left.tuples, right.tuples, base.tuples, cb, serializer)
+	// TODO: MergeMaps does not properly detect merge conflicts when one side adds a NULL to the end of its tuple.
+	// To fix this, accurate values of `leftSchemaChanged` and `rightSchemaChanged` must be computed.
+	// However, since `MergeMaps` is not currently called, fixing this is not a priority.
+	leftSchemaChanged := false
+	rightSchemaChanged := false
+	tuples, stats, err := tree.MergeOrderedTrees(ctx, left.tuples, right.tuples, base.tuples, cb, leftSchemaChanged, rightSchemaChanged, serializer)
 	if err != nil {
 		return Map{}, tree.MergeStats{}, err
 	}
@@ -208,6 +213,11 @@ func (m Map) Mutate() *MutableMap {
 	return newMutableMap(m)
 }
 
+// Rewriter returns a mutator that intends to rewrite this map with the key and value descriptors provided.
+func (m Map) Rewriter(kd, vd val.TupleDesc) *MutableMap {
+	return newMutableMapWithDescriptors(m, kd, vd)
+}
+
 // Count returns the number of key-value pairs in the Map.
 func (m Map) Count() (int, error) {
 	return m.tuples.Count()
@@ -245,6 +255,14 @@ func (m Map) WalkNodes(ctx context.Context, cb tree.NodeCb) error {
 func (m Map) Get(ctx context.Context, key val.Tuple, cb tree.KeyValueFn[val.Tuple, val.Tuple]) (err error) {
 	return m.tuples.Get(ctx, key, cb)
 }
+
+// GetPrefix returns the first key-value pair that matches the prefix key
+// or nil to the callback.
+func (m Map) GetPrefix(ctx context.Context, key val.Tuple, prefDesc val.TupleDesc, cb tree.KeyValueFn[val.Tuple, val.Tuple]) (err error) {
+	return m.tuples.GetPrefix(ctx, key, prefDesc, cb)
+}
+
+// todo(andy): iter prefix
 
 // Has returns true is |key| is present in the Map.
 func (m Map) Has(ctx context.Context, key val.Tuple) (ok bool, err error) {
@@ -297,6 +315,15 @@ func (m Map) IterRange(ctx context.Context, rng Range) (MapIter, error) {
 	return filteredIter{iter: iter, rng: rng}, nil
 }
 
+// IterRangeReverse returns a mutableMapIter that iterates over a Range backwards.
+func (m Map) IterRangeReverse(ctx context.Context, rng Range) (MapIter, error) {
+	iter, err := treeIterFromRangeReverse(ctx, m.tuples.Root, m.tuples.NodeStore, rng)
+	if err != nil {
+		return nil, err
+	}
+	return filteredIter{iter: iter, rng: rng}, nil
+}
+
 // IterKeyRange iterates over a physical key range defined by |start| and
 // |stop|. If |startInclusive| and/or |stop| is nil, the range will be open
 // towards that end.
@@ -337,6 +364,16 @@ func treeIterFromRange(
 ) (*tree.OrderedTreeIter[val.Tuple, val.Tuple], error) {
 	findStart, findStop := rangeStartSearchFn(rng), rangeStopSearchFn(rng)
 	return tree.OrderedTreeIterFromCursors[val.Tuple, val.Tuple](ctx, root, ns, findStart, findStop)
+}
+
+func treeIterFromRangeReverse(
+	ctx context.Context,
+	root tree.Node,
+	ns tree.NodeStore,
+	rng Range,
+) (*tree.OrderedTreeIter[val.Tuple, val.Tuple], error) {
+	findStart, findStop := rangeStartSearchFn(rng), rangeStopSearchFn(rng)
+	return tree.ReverseOrderedTreeIterFromCursors[val.Tuple, val.Tuple](ctx, root, ns, findStart, findStop)
 }
 
 func NewPointLookup(k, v val.Tuple) *pointLookup {
@@ -400,7 +437,7 @@ func ConvertToSecondaryKeylessIndex(m Map) Map {
 	newTypes := make([]val.Type, len(keyDesc.Types)+1)
 	copy(newTypes, keyDesc.Types)
 	newTypes[len(newTypes)-1] = val.Type{Enc: val.Hash128Enc}
-	newKeyDesc := val.NewTupleDescriptorWithComparator(keyDesc.Comparator(), newTypes...)
+	newKeyDesc := val.NewTupleDescriptorWithArgs(val.TupleDescriptorArgs{Comparator: keyDesc.Comparator()}, newTypes...)
 	newTuples := m.tuples
 	newTuples.Order = newKeyDesc
 	return Map{

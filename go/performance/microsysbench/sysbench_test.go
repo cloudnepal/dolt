@@ -18,8 +18,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -115,10 +115,10 @@ func setupBenchmark(t *testing.B, dEnv *env.DoltEnv) (*sql.Context, *engine.SqlE
 		Autocommit: true,
 	}
 
-	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv.IgnoreLockFile, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
 	require.NoError(t, err)
 
-	eng, err := engine.NewSqlEngine(ctx, mrEnv, engine.FormatNull, config)
+	eng, err := engine.NewSqlEngine(ctx, mrEnv, config)
 	require.NoError(t, err)
 
 	sqlCtx, err := eng.NewLocalContext(ctx)
@@ -129,7 +129,7 @@ func setupBenchmark(t *testing.B, dEnv *env.DoltEnv) (*sql.Context, *engine.SqlE
 }
 
 func readTestData(file string) string {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		panic(err)
 	}
@@ -140,7 +140,12 @@ func populateRepo(dEnv *env.DoltEnv, insertData string) {
 	execSql := func(dEnv *env.DoltEnv, q string) int {
 		ctx := context.Background()
 		args := []string{"-r", "null", "-q", q}
-		return commands.SqlCmd{}.Exec(ctx, "sql", args, dEnv)
+		cliCtx, err := commands.NewArgFreeCliContext(ctx, dEnv)
+		if err != nil {
+			panic(err)
+		}
+
+		return commands.SqlCmd{}.Exec(ctx, "sql", args, dEnv, cliCtx)
 	}
 	execSql(dEnv, createTable)
 	execSql(dEnv, insertData)

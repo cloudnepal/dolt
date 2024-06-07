@@ -20,7 +20,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/shopspring/decimal"
 	"gopkg.in/src-d/go-errors.v1"
 
@@ -57,6 +56,8 @@ func GetTypeConverter(ctx context.Context, srcTi TypeInfo, destTi TypeInfo) (tc 
 		return blobStringTypeConverter(ctx, src, destTi)
 	case *boolType:
 		return boolTypeConverter(ctx, src, destTi)
+	case *extendedType:
+		return nil, false, fmt.Errorf("extended types require conversion at a different layer")
 	case *datetimeType:
 		return datetimeTypeConverter(ctx, src, destTi)
 	case *decimalType:
@@ -133,6 +134,8 @@ func wrapConvertValueToNomsValue(
 			vInt = string(str)
 		case types.Bool:
 			vInt = bool(val)
+		case types.Extended:
+			return nil, fmt.Errorf("cannot convert to a extended type")
 		case types.Decimal:
 			vInt = decimal.Decimal(val).String()
 		case types.Float:
@@ -145,7 +148,7 @@ func wrapConvertValueToNomsValue(
 			vInt = int64(val)
 		case types.JSON:
 			var err error
-			vInt, err = json.NomsJSON(val).ToString(sql.NewEmptyContext())
+			vInt, err = json.NomsJSON(val).JSONString()
 			if err != nil {
 				return nil, err
 			}

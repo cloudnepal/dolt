@@ -15,14 +15,18 @@
 package json
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/dolthub/go-mysql-server/enginetest"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/row"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
@@ -32,25 +36,7 @@ import (
 	"github.com/dolthub/dolt/go/store/types"
 )
 
-func TestReader(t *testing.T) {
-	testJSON := `{
-		"rows": [
-			 {
-			   "id": 0,
-			   "first name": "tim",
-			   "last name": "sehn"
-			},
-			{
-			   "id": 1,
-			   "first name": "brian",
-			   "last name": "hendriks"
-			}
-		]
-	}`
-
-	fs := filesys.EmptyInMemFS("/")
-	require.NoError(t, fs.WriteFile("file.json", []byte(testJSON)))
-
+func testGoodJSON(t *testing.T, getReader func(types.ValueReadWriter, schema.Schema) (*JSONReader, error)) {
 	colColl := schema.NewColCollection(
 		schema.Column{
 			Name:       "id",
@@ -78,11 +64,11 @@ func TestReader(t *testing.T) {
 	sch, err := schema.SchemaFromCols(colColl)
 	require.NoError(t, err)
 
-	sqlSch, err := sqlutil.FromDoltSchema("", sch)
+	sqlSch, err := sqlutil.FromDoltSchema("", "", sch)
 	require.NoError(t, err)
 
 	vrw := types.NewMemoryValueStore()
-	reader, err := OpenJSONReader(vrw, "file.json", fs, sch)
+	reader, err := getReader(vrw, sch)
 	require.NoError(t, err)
 
 	verifySchema, err := reader.VerifySchema(sch)
@@ -106,6 +92,75 @@ func TestReader(t *testing.T) {
 	}
 
 	assert.Equal(t, enginetest.WidenRows(sqlSch.Schema, expectedRows), rows)
+}
+
+func TestReader(t *testing.T) {
+	testJSON := `{
+		"rows": [
+			 {
+			   "id": 0,
+			   "first name": "tim",
+			   "last name": "sehn"
+			},
+			{
+			   "id": 1,
+			   "first name": "brian",
+			   "last name": "hendriks"
+			}
+		]
+	}`
+
+	fs := filesys.EmptyInMemFS("/")
+	require.NoError(t, fs.WriteFile("file.json", []byte(testJSON), os.ModePerm))
+
+	testGoodJSON(t, func(vrw types.ValueReadWriter, sch schema.Schema) (*JSONReader, error) {
+		return OpenJSONReader(vrw, "file.json", fs, sch)
+	})
+}
+
+func TestReaderBOMHandling(t *testing.T) {
+	testJSON := `{
+		"rows": [
+			 {
+			   "id": 0,
+			   "first name": "tim",
+			   "last name": "sehn"
+			},
+			{
+			   "id": 1,
+			   "first name": "brian",
+			   "last name": "hendriks"
+			}
+		]
+	}`
+	t.Run("UTF-8", func(t *testing.T) {
+		bs := bytes.NewBuffer([]byte(testJSON))
+		reader := transform.NewReader(bs, unicode.UTF8.NewEncoder())
+		testGoodJSON(t, func(vrw types.ValueReadWriter, sch schema.Schema) (*JSONReader, error) {
+			return NewJSONReader(vrw, io.NopCloser(reader), sch)
+		})
+	})
+	t.Run("UTF-8 BOM", func(t *testing.T) {
+		bs := bytes.NewBuffer([]byte(testJSON))
+		reader := transform.NewReader(bs, unicode.UTF8BOM.NewEncoder())
+		testGoodJSON(t, func(vrw types.ValueReadWriter, sch schema.Schema) (*JSONReader, error) {
+			return NewJSONReader(vrw, io.NopCloser(reader), sch)
+		})
+	})
+	t.Run("UTF-16 LE BOM", func(t *testing.T) {
+		bs := bytes.NewBuffer([]byte(testJSON))
+		reader := transform.NewReader(bs, unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewEncoder())
+		testGoodJSON(t, func(vrw types.ValueReadWriter, sch schema.Schema) (*JSONReader, error) {
+			return NewJSONReader(vrw, io.NopCloser(reader), sch)
+		})
+	})
+	t.Run("UTF-16 BE BOM", func(t *testing.T) {
+		bs := bytes.NewBuffer([]byte(testJSON))
+		reader := transform.NewReader(bs, unicode.UTF16(unicode.BigEndian, unicode.UseBOM).NewEncoder())
+		testGoodJSON(t, func(vrw types.ValueReadWriter, sch schema.Schema) (*JSONReader, error) {
+			return NewJSONReader(vrw, io.NopCloser(reader), sch)
+		})
+	})
 }
 
 func TestReaderBadJson(t *testing.T) {
@@ -132,7 +187,7 @@ func TestReaderBadJson(t *testing.T) {
 }`
 
 	fs := filesys.EmptyInMemFS("/")
-	require.NoError(t, fs.WriteFile("file.json", []byte(testJSON)))
+	require.NoError(t, fs.WriteFile("file.json", []byte(testJSON), os.ModePerm))
 
 	colColl := schema.NewColCollection(
 		schema.Column{

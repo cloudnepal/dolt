@@ -58,28 +58,29 @@ teardown() {
     PORT=$( definePORT )
     dolt sql-server --host 0.0.0.0 --port=$PORT &
     SERVER_PID=$! # will get killed by teardown_common
-    sleep 5 # not using python wait so this works on windows
+    SQL_USER='root'
+    wait_for_connection $PORT 8500
 
-    run dolt sql-client -P $PORT -u root --use-db test_db -q "select user from mysql.user order by user"
+    run dolt sql -q "select user from mysql.user order by user"
     [ $status -eq 0 ]
     [[ $output =~ "root" ]] || false
 
-    dolt sql-client -P $PORT -u root --use-db test_db -q "create user new_user"
-    run dolt sql-client -P $PORT -u root --use-db test_db -q "select user from mysql.user order by user"
+    dolt sql -q "create user new_user"
+    run dolt sql -q "select user from mysql.user order by user"
     [ $status -eq 0 ]
     [[ $output =~ "root" ]] || false
     [[ $output =~ "new_user" ]] || false
 
     stop_sql_server
-    rm -f .dolt/sql-server.lock
 
     # restarting server
     PORT=$( definePORT )
     dolt sql-server --host 0.0.0.0 --port=$PORT &
     SERVER_PID=$! # will get killed by teardown_common
-    sleep 5 # not using python wait so this works on windows
+    SQL_USER='new_user'
+    wait_for_connection $PORT 8500
 
-    run dolt sql-client -P $PORT -u root --use-db test_db -q "select user from mysql.user order by user"
+    run dolt -u root sql -q "select user from mysql.user order by user"
     [ $status -ne 0 ]
 }
 
@@ -89,12 +90,12 @@ teardown() {
 
     start_sql_server_with_config test_db server.yaml
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user order by user"
+    run dolt sql -q "select user from mysql.user order by user"
     [ $status -eq 0 ]
     [[ $output =~ "dolt" ]] || false
     
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user order by user"
+    dolt sql -q "create user new_user"
+    run dolt sql -q "select user from mysql.user order by user"
     [ $status -eq 0 ]
     [[ $output =~ "dolt" ]] || false
     [[ $output =~ "new_user" ]] || false
@@ -127,7 +128,7 @@ behavior:
     sleep 5
 
 
-    run dolt sql-client -P $PORT -u cmddolt --use-db test_db -q "select user from mysql.user"
+    run dolt -u cmddolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ "cmddolt" ]] || false
 }
@@ -154,7 +155,7 @@ behavior:
     SERVER_PID=$!
     sleep 5
 
-    run dolt sql-client -P $PORT -u cmddolt --use-db test_db -q "select user from mysql.user"
+    run dolt -u cmddolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ "cmddolt" ]] || false
 }
@@ -166,13 +167,13 @@ behavior:
 
     start_sql_server_with_config test_db server.yaml
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -192,13 +193,13 @@ behavior:
 
     start_sql_server_with_config test_db server.yaml
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -218,14 +219,14 @@ behavior:
 
     start_sql_server_with_args --host 0.0.0.0 --user=dolt --privilege-file=privs.json
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ privs_user ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -236,11 +237,10 @@ behavior:
     ! [[ "$output" =~ "\"User\":\"privs_user\"" ]] || false
 
     # Restart server
-    rm -f ./.dolt/sql-server.lock
     stop_sql_server
     start_sql_server_with_args --host 0.0.0.0 --user=dolt --privilege-file=privs.json
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -265,13 +265,13 @@ behavior:
     run ls -a
     ! [[ "$output" =~ ".doltcfg" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -287,7 +287,7 @@ behavior:
     make_test_repo
 
     start_sql_server_with_args --host 127.0.0.1 --user=dolt
-    run dolt sql-client -P $PORT -u dolt --use-db test_db --result-format csv -q "select user, host from mysql.user order by user"
+    run dolt sql --result-format csv -q "select user, host from mysql.user order by user"
     [ $status -eq 0 ]
     [[ "$output" =~ "dolt,%" ]] || false
 }
@@ -324,7 +324,7 @@ behavior:
     ! [[ "$output" =~ ".doltcfg" ]] || false
     ! [[ "$output" =~ "privileges.db" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "show databases"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "show databases"
     [ $status -eq 0 ]
     [[ $output =~ db1 ]] || false
     [[ $output =~ db2 ]] || false
@@ -332,13 +332,13 @@ behavior:
     [[ $output =~ information_schema ]] || false
     [[ $output =~ mysql ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db db1 -q "create user new_user"
+    dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -364,13 +364,13 @@ behavior:
     ! [[ "$output" =~ ".doltcfg" ]] || false
     ! [[ "$output" =~ "doltcfgdir" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -392,13 +392,13 @@ behavior:
     ! [[ "$output" =~ ".doltcfg" ]] || false
     ! [[ "$output" =~ "privs.db" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -422,7 +422,7 @@ behavior:
     ! [[ "$output" =~ ".doltcfg" ]] || false
     ! [[ "$output" =~ "privileges.db" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "show databases"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "show databases"
     [ $status -eq 0 ]
     [[ $output =~ db1 ]] || false
     [[ $output =~ db2 ]] || false
@@ -430,13 +430,13 @@ behavior:
     [[ $output =~ information_schema ]] || false
     [[ $output =~ mysql ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db db1 -q "create user new_user"
+    dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -467,7 +467,7 @@ behavior:
     ! [[ "$output" =~ ".doltcfg" ]] || false
     ! [[ "$output" =~ "privs.db" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "show databases"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "show databases"
     [ $status -eq 0 ]
     [[ $output =~ db1 ]] || false
     [[ $output =~ db2 ]] || false
@@ -475,13 +475,13 @@ behavior:
     [[ $output =~ information_schema ]] || false
     [[ $output =~ mysql ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db db1 -q "create user new_user"
+    dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -508,13 +508,13 @@ behavior:
     ! [[ "$output" =~ "doltcfgdir" ]] || false
     ! [[ "$output" =~ "privs.db" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -540,7 +540,7 @@ behavior:
     ! [[ "$output" =~ "privileges.db" ]] || false
     ! [[ "$output" =~ "privs.db" ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "show databases"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "show databases"
     [ $status -eq 0 ]
     [[ $output =~ db1 ]] || false
     [[ $output =~ db2 ]] || false
@@ -548,13 +548,13 @@ behavior:
     [[ $output =~ information_schema ]] || false
     [[ $output =~ mysql ]] || false
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
 
-    dolt sql-client -P $PORT -u dolt --use-db db1 -q "create user new_user"
+    dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "create user new_user"
 
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db db1 sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -581,7 +581,7 @@ behavior:
     dolt init
     start_sql_server_with_args --host 0.0.0.0 --user=dolt
 
-    dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user new_user"
+    dolt sql -q "create user new_user"
     stop_sql_server
     sleep 1
     run ls -a
@@ -591,7 +591,7 @@ behavior:
 
     cd db_dir
     start_sql_server_with_args --host 0.0.0.0 --user=dolt
-    run dolt sql-client -P $PORT -u dolt --use-db db1 -q "select user from mysql.user"
+    run dolt sql -q "select user from mysql.user"
     [ $status -eq 0 ]
     [[ $output =~ dolt ]] || false
     [[ $output =~ new_user ]] || false
@@ -599,56 +599,57 @@ behavior:
 
 @test "sql-privs: basic lack of privileges tests" {
      make_test_repo
+     SQL_USER='dolt'
      start_sql_server
 
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "create table t1(c1 int)"
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user test"
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "grant select on test_db.* to test"
+     dolt sql -q "create table t1(c1 int)"
+     dolt sql -q "create user test"
+     dolt sql -q "grant select on test_db.* to test"
 
      # Should only see test_db database
-     run dolt sql-client -P $PORT -u dolt --use-db '' -q "show databases"
+     run dolt sql -q "show databases"
      [ $status -eq 0 ]
      [[ $output =~ test_db ]] || false
      
-     run dolt sql-client -P $PORT -u dolt --use-db test_db -q "show tables"
+     run dolt sql -q "show tables"
      [ $status -eq 0 ]
      [[ $output =~ t1 ]] || false
 
      # check information_schema.SCHEMA_PRIVILEGES table
-     run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select * from information_schema.SCHEMA_PRIVILEGES;"
+     run dolt sql -q "select * from information_schema.SCHEMA_PRIVILEGES;"
      [[ "$output" =~ "| 'test'@'%' | def           | test_db      | SELECT         | NO           |" ]] || false
 
      # Revoke works as expected
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "revoke select on test_db.* from test"
-     run dolt sql-client -P $PORT -u test --use-db test_db -q "show tables"
+     dolt sql -q "revoke select on test_db.* from test"
+     run dolt -u test sql -q "show tables"
      [ $status -ne 0 ]
 
      # Host in privileges is respected
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "drop user test"
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user test@'127.0.0.1'"
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "grant select on test_db.* to test@'127.0.0.1'"
-     run dolt sql-client -P $PORT -u test -H 127.0.0.1 --use-db test_db -q "show tables"
+     dolt sql -q "drop user test"
+     dolt sql -q "create user test@'127.0.0.1'"
+     dolt sql -q "grant select on test_db.* to test@'127.0.0.1'"
+     run dolt sql -q "show tables"
      [ $status -eq 0 ]
      [[ $output =~ t1 ]] || false
 
      # check information_schema.SCHEMA_PRIVILEGES table
-     run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select * from information_schema.SCHEMA_PRIVILEGES;"
+     run dolt sql -q "select * from information_schema.SCHEMA_PRIVILEGES;"
      [[ "$output" =~ "| 'test'@'127.0.0.1' | def           | test_db      | SELECT         | NO           |" ]] || false
 
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "grant update on test_db.t1 to test@'127.0.0.1'"
+     dolt sql -q "grant update on test_db.t1 to test@'127.0.0.1'"
      # check information_schema.TABLE_PRIVILEGES table
-     run dolt sql-client -P $PORT -u dolt --use-db test_db -q "select * from information_schema.TABLE_PRIVILEGES;"
+     run dolt sql -q "select * from information_schema.TABLE_PRIVILEGES;"
      [[ "$output" =~ "| 'test'@'127.0.0.1' | def           | test_db      | t1         | UPDATE         | NO           |" ]] || false
 
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "grant insert on *.* to test@'127.0.0.1'"
+     dolt sql -q "grant insert on *.* to test@'127.0.0.1'"
      # check information_schema.USER_PRIVILEGES table
-     run dolt sql-client -P $PORT -u test -H 127.0.0.1 --use-db test_db -q "select * from information_schema.USER_PRIVILEGES;"
+     run dolt -u test sql -q "select * from information_schema.USER_PRIVILEGES;"
      [[ "$output" =~ "| 'test'@'127.0.0.1' | def           | INSERT         | NO           |" ]] || false
 
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "drop user test@'127.0.0.1'"
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "create user test@'10.10.10.10'"
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "grant select on test_db.* to test@'10.10.10.10'"
-     run dolt sql-client -P $PORT -u test --use-db test_db -q "show tables"
+     dolt sql -q "drop user test@'127.0.0.1'"
+     dolt sql -q "create user test@'10.10.10.10'"
+     dolt sql -q "grant select on test_db.* to test@'10.10.10.10'"
+     run dolt -u test sql -q "show tables"
      [ $status -ne 0 ]
 }
 
@@ -656,24 +657,24 @@ behavior:
      make_test_repo
      start_sql_server
 
-     dolt sql-client -P $PORT -u dolt --use-db '' -q "create user test identified by 'test'"
-     dolt sql-client -P $PORT -u dolt --use-db '' -q "grant select on mysql.user to test"
+     dolt sql -q "create user test identified by 'test'"
+     dolt sql -q "grant select on mysql.user to test"
 
      # Should not be able to connect to test_db
-     run dolt sql-client -P $PORT -u test -p test --use-db test_db -q "select user from mysql.user order by user"
+     run dolt -u test -p test --use-db test_db sql -q "select user from mysql.user order by user"
      [ $status -ne 0 ]
 
-     run dolt sql-client -P $PORT -u test -p test --use-db '' -q "select user from mysql.user"
+     run dolt --port $PORT --host 0.0.0.0 --no-tls -u test -p test --use-db '' sql -q "select user from mysql.user"
      [ $status -eq 0 ]
      [[ $output =~ dolt ]] || false
      [[ $output =~ test ]] || false
 
      # Bad password can't connect
-     run dolt sql-client -P $PORT -u test -p bad --use-db '' -q "select user from mysql.user order by user"
+     run dolt -u test -p bad --use-db '' sql -q "select user from mysql.user order by user"
      [ $status -ne 0 ]
      
      # Should only see mysql database
-     run dolt sql-client -P $PORT -u test -p test --use-db '' -q "show databases"
+     run dolt --port $PORT --host 0.0.0.0 --no-tls -u test -p test --use-db '' sql -q "show databases"
      [ $status -eq 0 ]	
      [[ $output =~ mysql ]] || false
      ! [[ $output =~ test_db ]] || false
@@ -681,18 +682,60 @@ behavior:
 
 @test "sql-privs: deleting user prevents access by that user" {
      make_test_repo
+     SQL_USER='dolt'
      start_sql_server
 
-     dolt sql-client -P $PORT -u dolt --use-db test_db -q "create table t1(c1 int)"
-     dolt sql-client -P $PORT -u dolt --use-db '' -q "create user test"
-     dolt sql-client -P $PORT -u dolt --use-db '' -q "grant select on test_db.* to test"
-     run dolt sql-client -P $PORT -u test --use-db test_db -q "show tables"
+     dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db test_db sql -q "create table t1(c1 int)"
+     dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db '' sql -q "create user test"
+     dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db '' sql -q "grant select on test_db.* to test"
+     run dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db test_db sql -q "show tables"
      [ $status -eq 0 ]
-     echo $output
      [[ $output =~ t1 ]] || false
 
-     dolt sql-client -P $PORT -u dolt --use-db '' -q "drop user test"
+     dolt -u dolt --port $PORT --host 0.0.0.0 --no-tls --use-db '' sql -q "drop user test"
 
-     run dolt sql-client -P $PORT -u test --use-db test_db -q "show tables"
+     run dolt -u test --port $PORT --host 0.0.0.0 --no-tls --use-db test_db sql -q "show tables"
      [ $status -ne 0 ]
+}
+
+# Don't run this test with a server - we want to ensure that the privileges file
+# is being serialized, persisted, and loaded
+@test "sql-privs: revoking last privilege doesn't result in corrupted privileges file" {
+     make_test_repo
+
+     dolt sql -q "CREATE USER tester@localhost"
+     dolt sql -q "GRANT SELECT ON test_db.* TO tester@localhost"
+     dolt sql -q "REVOKE SELECT ON test_db.* FROM tester@localhost"
+
+     run dolt sql -q "SHOW GRANTS FOR tester@localhost"
+     [ $status -eq 0 ]
+     [[ $output =~ "GRANT USAGE ON *.* TO \`tester\`@\`localhost\`" ]] || false
+     ! [[ $output =~ "SELECT" ]] || false
+
+     dolt sql -q "GRANT SELECT ON test_db.* TO tester@localhost"
+     dolt sql -q "GRANT UPDATE ON test_db.* TO tester@localhost"
+     run dolt sql -q "SHOW GRANTS FOR tester@localhost"
+     [ $status -eq 0 ]
+     [[ $output =~ "GRANT USAGE ON *.* TO \`tester\`@\`localhost\`" ]] || false
+     [[ $output =~ "GRANT SELECT, UPDATE ON \`test_db\`.* TO \`tester\`@\`localhost\`" ]] || false
+
+     dolt sql -q "REVOKE UPDATE ON test_db.* FROM tester@localhost"
+     run dolt sql -q "SHOW GRANTS FOR tester@localhost"
+     [ $status -eq 0 ]
+     [[ $output =~ "GRANT USAGE ON *.* TO \`tester\`@\`localhost\`" ]] || false
+     [[ $output =~ "GRANT SELECT ON \`test_db\`.* TO \`tester\`@\`localhost\`" ]] || false
+     ! [[ $output =~ "UPDATE" ]] || false
+}
+
+@test "sql-privs: revoking all privileges doesn't result in a corrupted privileges file" {
+     make_test_repo
+
+     dolt sql -q "CREATE USER tester@localhost"
+     dolt sql -q "GRANT SELECT ON test_db.* TO tester@localhost"
+     dolt sql -q "REVOKE ALL ON test_db.* FROM tester@localhost"
+
+     run dolt sql -q "SHOW GRANTS FOR tester@localhost"
+     [ $status -eq 0 ]
+     [[ $output =~ "GRANT USAGE ON *.* TO \`tester\`@\`localhost\`" ]] || false
+     ! [[ $output =~ "SELECT" ]] || false
 }

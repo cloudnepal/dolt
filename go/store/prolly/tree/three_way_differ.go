@@ -21,48 +21,71 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/dolthub/go-mysql-server/sql"
+
 	"github.com/dolthub/dolt/go/store/val"
 )
 
 // ThreeWayDiffer is an iterator that gives an increased level of granularity
 // of diffs between three root values. See diffOp for the classes of diffs.
 type ThreeWayDiffer[K ~[]byte, O Ordering[K]] struct {
-	lIter, rIter Differ[K, O]
-	resolveCb    resolveCb
-	lDiff        Diff
-	rDiff        Diff
-	lDone        bool
-	rDone        bool
-	keyless      bool
+	lIter, rIter              Differ[K, O]
+	resolveCb                 resolveCb
+	lDiff                     Diff
+	rDiff                     Diff
+	lDone                     bool
+	rDone                     bool
+	keyless                   bool
+	leftAndRightSchemasDiffer bool
 }
 
 //var _ DiffIter = (*threeWayDiffer[Item, val.TupleDesc])(nil)
 
-type resolveCb func(val.Tuple, val.Tuple, val.Tuple) (val.Tuple, bool)
+type resolveCb func(*sql.Context, val.Tuple, val.Tuple, val.Tuple) (val.Tuple, bool, error)
+
+// ThreeWayDiffInfo stores contextual data that can influence the diff.
+// If |LeftSchemaChange| is true, then the left side's bytes have a different interpretation from the base,
+// so every row in both Left and Base should be considered a modification, even if they have the same bytes.
+// If |RightSchemaChange| is true, then the right side's bytes have a different interpretation from the base,
+// so every row in both Right and Base should be considered a modification, even if they have the same bytes.
+// Note that these values aren't set for schema changes that have no effect on the meaning of the bytes,
+// such as collation.
+// If |LeftAndRightSchemasDiffer| is true, then the left and right sides of the diff have a different interpretation
+// of their bytes, so there cannot be any convergent edits, even if two rows in Left and Right have the same bytes.
+type ThreeWayDiffInfo struct {
+	LeftSchemaChange          bool
+	RightSchemaChange         bool
+	LeftAndRightSchemasDiffer bool
+}
 
 func NewThreeWayDiffer[K, V ~[]byte, O Ordering[K]](
 	ctx context.Context,
 	ns NodeStore,
-	left, right, base StaticMap[K, V, O],
+	left StaticMap[K, V, O],
+	right StaticMap[K, V, O],
+	base StaticMap[K, V, O],
 	resolveCb resolveCb,
 	keyless bool,
+	diffInfo ThreeWayDiffInfo,
 	order O,
 ) (*ThreeWayDiffer[K, O], error) {
-	ld, err := DifferFromRoots[K](ctx, ns, ns, base.Root, left.Root, order)
+	// probably compute each of these separately
+	ld, err := DifferFromRoots[K](ctx, ns, ns, base.Root, left.Root, order, diffInfo.LeftSchemaChange)
 	if err != nil {
 		return nil, err
 	}
 
-	rd, err := DifferFromRoots[K](ctx, ns, ns, base.Root, right.Root, order)
+	rd, err := DifferFromRoots[K](ctx, ns, ns, base.Root, right.Root, order, diffInfo.RightSchemaChange)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ThreeWayDiffer[K, O]{
-		lIter:     ld,
-		rIter:     rd,
-		resolveCb: resolveCb,
-		keyless:   keyless,
+		lIter:                     ld,
+		rIter:                     rd,
+		resolveCb:                 resolveCb,
+		keyless:                   keyless,
+		leftAndRightSchemasDiffer: diffInfo.LeftAndRightSchemasDiffer,
 	}, nil
 }
 
@@ -79,7 +102,7 @@ const (
 	dsMatchFinalize
 )
 
-func (d *ThreeWayDiffer[K, O]) Next(ctx context.Context) (ThreeWayDiff, error) {
+func (d *ThreeWayDiffer[K, O]) Next(ctx *sql.Context) (ThreeWayDiff, error) {
 	var err error
 	var res ThreeWayDiff
 	nextState := dsInit
@@ -161,11 +184,23 @@ func (d *ThreeWayDiffer[K, O]) Next(ctx context.Context) (ThreeWayDiff, error) {
 			if d.lDiff.To == nil && d.rDiff.To == nil {
 				res = d.newConvergentEdit(d.lDiff.Key, d.lDiff.To, d.lDiff.Type)
 			} else if d.lDiff.To == nil || d.rDiff.To == nil {
-				res = d.newDivergentDeleteConflict(d.lDiff.Key, d.lDiff.From, d.lDiff.To, d.rDiff.To)
+				// Divergent delete. Attempt to resolve.
+				_, ok, err := d.resolveCb(ctx, val.Tuple(d.lDiff.To), val.Tuple(d.rDiff.To), val.Tuple(d.lDiff.From))
+				if err != nil {
+					return ThreeWayDiff{}, err
+				}
+				if !ok {
+					res = d.newDivergentDeleteConflict(d.lDiff.Key, d.lDiff.From, d.lDiff.To, d.rDiff.To)
+				} else {
+					res = d.newDivergentDeleteResolved(d.lDiff.Key, d.lDiff.From, d.lDiff.To, d.rDiff.To)
+				}
 			} else if d.lDiff.Type == d.rDiff.Type && bytes.Equal(d.lDiff.To, d.rDiff.To) {
 				res = d.newConvergentEdit(d.lDiff.Key, d.lDiff.To, d.lDiff.Type)
 			} else {
-				resolved, ok := d.resolveCb(val.Tuple(d.lDiff.To), val.Tuple(d.rDiff.To), val.Tuple(d.lDiff.From))
+				resolved, ok, err := d.resolveCb(ctx, val.Tuple(d.lDiff.To), val.Tuple(d.rDiff.To), val.Tuple(d.lDiff.From))
+				if err != nil {
+					return ThreeWayDiff{}, err
+				}
 				if !ok {
 					res = d.newDivergentClashConflict(d.lDiff.Key, d.lDiff.From, d.lDiff.To, d.rDiff.To)
 				} else {
@@ -213,9 +248,10 @@ const (
 	DiffOpConvergentAdd                         //convergentAdd
 	DiffOpConvergentDelete                      //convergentDelete
 	DiffOpConvergentModify                      //convergentModify
-	DiffOpDivergentModifyResolved               //divergenModifytResolved
+	DiffOpDivergentModifyResolved               //divergentModifyResolved
 	DiffOpDivergentDeleteConflict               //divergentDeleteConflict
 	DiffOpDivergentModifyConflict               //divergentModifyConflict
+	DiffOpDivergentDeleteResolved               //divergentDeleteConflict
 )
 
 // ThreeWayDiff is a generic object for encoding a three way diff.
@@ -298,6 +334,16 @@ func (d *ThreeWayDiffer[K, O]) newDivergentResolved(key, left, right, merged Ite
 func (d *ThreeWayDiffer[K, O]) newDivergentDeleteConflict(key, base, left, right Item) ThreeWayDiff {
 	return ThreeWayDiff{
 		Op:    DiffOpDivergentDeleteConflict,
+		Key:   val.Tuple(key),
+		Base:  val.Tuple(base),
+		Left:  val.Tuple(left),
+		Right: val.Tuple(right),
+	}
+}
+
+func (d *ThreeWayDiffer[K, O]) newDivergentDeleteResolved(key, base, left, right Item) ThreeWayDiff {
+	return ThreeWayDiff{
+		Op:    DiffOpDivergentDeleteResolved,
 		Key:   val.Tuple(key),
 		Base:  val.Tuple(base),
 		Left:  val.Tuple(left),

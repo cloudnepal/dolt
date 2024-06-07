@@ -16,6 +16,7 @@ package dolt_builder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -27,8 +28,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func Run(commitList []string) error {
-	parentCtx := context.Background()
+const envDoltBin = "DOLT_BIN"
+
+func Run(parentCtx context.Context, commitList []string, profilePath string) error {
+	if profilePath != "" && len(commitList) > 1 {
+		return errors.New("cannot build more that one binary when a profile is supplied")
+	}
 
 	doltBin, err := getDoltBin()
 	if err != nil {
@@ -54,7 +59,7 @@ func Run(commitList []string) error {
 	}
 
 	// clone dolt source
-	err = GitCloneBare(parentCtx, tempDir)
+	err = GitCloneBare(parentCtx, tempDir, GithubDolt)
 	if err != nil {
 		return err
 	}
@@ -79,7 +84,7 @@ func Run(commitList []string) error {
 	for _, commit := range commitList {
 		commit := commit // https://golang.org/doc/faq#closures_and_goroutines
 		g.Go(func() error {
-			return buildBinaries(ctx, tempDir, repoDir, doltBin, commit)
+			return buildBinaries(ctx, tempDir, repoDir, doltBin, profilePath, commit)
 		})
 	}
 
@@ -106,7 +111,7 @@ func Run(commitList []string) error {
 // as the parent directory for a `doltBin` directory
 func getDoltBin() (string, error) {
 	var doltBin string
-	dir := os.Getenv("DOLT_BIN")
+	dir := os.Getenv(envDoltBin)
 	if dir == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -128,7 +133,7 @@ func getDoltBin() (string, error) {
 }
 
 // buildBinaries builds a dolt binary at the given commit and stores it in the doltBin
-func buildBinaries(ctx context.Context, tempDir, repoDir, doltBinDir, commit string) error {
+func buildBinaries(ctx context.Context, tempDir, repoDir, doltBinDir, profilePath, commit string) error {
 	checkoutDir := filepath.Join(tempDir, commit)
 	if err := os.MkdirAll(checkoutDir, os.ModePerm); err != nil {
 		return err
@@ -144,7 +149,7 @@ func buildBinaries(ctx context.Context, tempDir, repoDir, doltBinDir, commit str
 		return err
 	}
 
-	command, err := goBuild(ctx, checkoutDir, commitDir)
+	command, err := goBuild(ctx, checkoutDir, commitDir, profilePath)
 	if err != nil {
 		return err
 	}
@@ -153,14 +158,24 @@ func buildBinaries(ctx context.Context, tempDir, repoDir, doltBinDir, commit str
 }
 
 // goBuild builds the dolt binary and returns the filename
-func goBuild(ctx context.Context, source, dest string) (string, error) {
+func goBuild(ctx context.Context, source, dest, profilePath string) (string, error) {
 	goDir := filepath.Join(source, "go")
 	doltFileName := "dolt"
 	if runtime.GOOS == "windows" {
 		doltFileName = "dolt.exe"
 	}
+
+	args := make([]string, 0)
+	args = append(args, "build")
+
+	if profilePath != "" {
+		args = append(args, fmt.Sprintf("-pgo=%s", profilePath))
+	}
+
 	toBuild := filepath.Join(dest, doltFileName)
-	build := ExecCommand(ctx, "go", "build", "-o", toBuild, filepath.Join(goDir, "cmd", "dolt"))
+	args = append(args, "-o", toBuild, filepath.Join(goDir, "cmd", "dolt"))
+
+	build := ExecCommand(ctx, "go", args...)
 	build.Dir = goDir
 	err := build.Run()
 	if err != nil {

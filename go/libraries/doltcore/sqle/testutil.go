@@ -32,18 +32,19 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/row"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
-	config2 "github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/types"
 	"github.com/dolthub/dolt/go/store/val"
 )
 
 // ExecuteSql executes all the SQL non-select statements given in the string against the root value given and returns
 // the updated root, or an error. Statements in the input string are split by `;\n`
-func ExecuteSql(dEnv *env.DoltEnv, root *doltdb.RootValue, statements string) (*doltdb.RootValue, error) {
+func ExecuteSql(dEnv *env.DoltEnv, root doltdb.RootValue, statements string) (doltdb.RootValue, error) {
 	tmpDir, err := dEnv.TempTableFilesDir()
 	if err != nil {
 		return nil, err
@@ -59,7 +60,7 @@ func ExecuteSql(dEnv *env.DoltEnv, root *doltdb.RootValue, statements string) (*
 	if err != nil {
 		return nil, err
 	}
-	dsess.DSessFromSess(ctx.Session).EnableBatchedMode()
+
 	err = ctx.Session.SetSessionVariable(ctx, sql.AutoCommitSessionVar, false)
 	if err != nil {
 		return nil, err
@@ -87,14 +88,11 @@ func ExecuteSql(dEnv *env.DoltEnv, root *doltdb.RootValue, statements string) (*
 			if execErr == nil {
 				execErr = drainIter(ctx, rowIter)
 			}
-		case *sqlparser.DDL, *sqlparser.MultiAlterDDL:
+		case *sqlparser.DDL, *sqlparser.AlterTable:
 			var rowIter sql.RowIter
 			_, rowIter, execErr = engine.Query(ctx, query)
 			if execErr == nil {
 				execErr = drainIter(ctx, rowIter)
-			}
-			if err = db.Flush(ctx); err != nil {
-				return nil, err
 			}
 		default:
 			return nil, fmt.Errorf("Unsupported SQL statement: '%v'.", query)
@@ -113,13 +111,8 @@ func ExecuteSql(dEnv *env.DoltEnv, root *doltdb.RootValue, statements string) (*
 	return db.GetRoot(ctx)
 }
 
-// NewTestSQLCtx returns a new *sql.Context with a default DoltSession, a new IndexRegistry, and a new ViewRegistry
-func NewTestSQLCtx(ctx context.Context) *sql.Context {
-	return NewTestSQLCtxWithProvider(ctx, dsess.EmptyDatabaseProvider())
-}
-
-func NewTestSQLCtxWithProvider(ctx context.Context, pro dsess.DoltDatabaseProvider) *sql.Context {
-	s, err := dsess.NewDoltSession(sql.NewBaseSession(), pro, config2.NewMapConfig(make(map[string]string)), branch_control.CreateDefaultController())
+func NewTestSQLCtxWithProvider(ctx context.Context, pro dsess.DoltDatabaseProvider, statsPro sql.StatsProvider) *sql.Context {
+	s, err := dsess.NewDoltSession(sql.NewBaseSession(), pro, config.NewMapConfig(make(map[string]string)), branch_control.CreateDefaultController(ctx), statsPro, writer.NewWriteSession)
 	if err != nil {
 		panic(err)
 	}
@@ -132,7 +125,7 @@ func NewTestSQLCtxWithProvider(ctx context.Context, pro dsess.DoltDatabaseProvid
 }
 
 // NewTestEngine creates a new default engine, and a *sql.Context and initializes indexes and schema fragments.
-func NewTestEngine(dEnv *env.DoltEnv, ctx context.Context, db SqlDatabase) (*sqle.Engine, *sql.Context, error) {
+func NewTestEngine(dEnv *env.DoltEnv, ctx context.Context, db dsess.SqlDatabase) (*sqle.Engine, *sql.Context, error) {
 	b := env.GetDefaultInitBranch(dEnv.Config)
 	pro, err := NewDoltDatabaseProviderWithDatabase(b, dEnv.FS, db, dEnv.FS)
 	if err != nil {
@@ -140,47 +133,14 @@ func NewTestEngine(dEnv *env.DoltEnv, ctx context.Context, db SqlDatabase) (*sql
 	}
 
 	engine := sqle.NewDefault(pro)
-	sqlCtx := NewTestSQLCtxWithProvider(ctx, pro)
 
-	dbState, err := getDbState(db, dEnv)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	err = dsess.DSessFromSess(sqlCtx.Session).AddDB(sqlCtx, dbState)
-	if err != nil {
-		return nil, nil, err
-	}
-
+	sqlCtx := NewTestSQLCtxWithProvider(ctx, pro, nil)
 	sqlCtx.SetCurrentDatabase(db.Name())
 	return engine, sqlCtx, nil
 }
 
-func getDbState(db sql.Database, dEnv *env.DoltEnv) (dsess.InitialDbState, error) {
-	ctx := context.Background()
-
-	head := dEnv.RepoStateReader().CWBHeadSpec()
-	headCommit, err := dEnv.DoltDB.Resolve(ctx, head, dEnv.RepoStateReader().CWBHeadRef())
-	if err != nil {
-		return dsess.InitialDbState{}, err
-	}
-
-	ws, err := dEnv.WorkingSet(ctx)
-	if err != nil {
-		return dsess.InitialDbState{}, err
-	}
-
-	return dsess.InitialDbState{
-		Db:         db,
-		HeadCommit: headCommit,
-		WorkingSet: ws,
-		DbData:     dEnv.DbData(),
-		Remotes:    dEnv.RepoState.Remotes,
-	}, nil
-}
-
 // ExecuteSelect executes the select statement given and returns the resulting rows, or an error if one is encountered.
-func ExecuteSelect(dEnv *env.DoltEnv, root *doltdb.RootValue, query string) ([]sql.Row, error) {
+func ExecuteSelect(dEnv *env.DoltEnv, root doltdb.RootValue, query string) ([]sql.Row, error) {
 	dbData := env.DbData{
 		Ddb: dEnv.DoltDB,
 		Rsw: dEnv.RepoStateWriter(),
@@ -441,8 +401,8 @@ func CreateTestEnvWithName(envName string) *env.DoltEnv {
 	dEnv := env.Load(context.Background(), homeDirFunc, fs, doltdb.InMemDoltDB+envName, "test")
 	cfg, _ := dEnv.Config.GetConfig(env.GlobalConfig)
 	cfg.SetStrings(map[string]string{
-		env.UserNameKey:  name,
-		env.UserEmailKey: email,
+		config.UserNameKey:  name,
+		config.UserEmailKey: email,
 	})
 
 	err := dEnv.InitRepo(context.Background(), types.Format_Default, name, email, env.DefaultInitBranch)
@@ -480,7 +440,7 @@ func CreateEmptyTestTable(dEnv *env.DoltEnv, tableName string, sch schema.Schema
 		return err
 	}
 
-	newRoot, err := root.PutTable(ctx, tableName, tbl)
+	newRoot, err := root.PutTable(ctx, doltdb.TableName{Name: tableName}, tbl)
 	if err != nil {
 		return err
 	}
@@ -592,7 +552,7 @@ func sqlRowFromTuples(sch schema.Schema, kd, vd val.TupleDesc, k, v val.Tuple) (
 	for i, col := range sch.GetAllCols().GetColumns() {
 		pos, ok := sch.GetPKCols().TagToIdx[col.Tag]
 		if ok {
-			r[i], err = index.GetField(ctx, kd, pos, k, nil)
+			r[i], err = tree.GetField(ctx, kd, pos, k, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -603,7 +563,7 @@ func sqlRowFromTuples(sch schema.Schema, kd, vd val.TupleDesc, k, v val.Tuple) (
 			pos += 1 // compensate for cardinality field
 		}
 		if ok {
-			r[i], err = index.GetField(ctx, vd, pos, v, nil)
+			r[i], err = tree.GetField(ctx, vd, pos, v, nil)
 			if err != nil {
 				return nil, err
 			}

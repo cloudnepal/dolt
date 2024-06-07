@@ -233,7 +233,7 @@ var _ sql.RowIter = prollyDiffIter{}
 // than |targetFromSchema| or |targetToSchema|. We convert the rows from the
 // schema of |from| to |targetFromSchema| and the schema of |to| to
 // |targetToSchema|. See the tablediff_prolly package.
-func newProllyDiffIter(ctx *sql.Context, dp DiffPartition, ddb *doltdb.DoltDB, targetFromSchema, targetToSchema schema.Schema) (prollyDiffIter, error) {
+func newProllyDiffIter(ctx *sql.Context, dp DiffPartition, targetFromSchema, targetToSchema schema.Schema) (prollyDiffIter, error) {
 	fromCm := commitInfo2{
 		name: dp.fromName,
 		ts:   (*time.Time)(dp.fromDate),
@@ -335,7 +335,9 @@ func (itr prollyDiffIter) Close(ctx *sql.Context) error {
 }
 
 func (itr prollyDiffIter) queueRows(ctx context.Context) {
-	err := prolly.DiffMaps(ctx, itr.from, itr.to, func(ctx context.Context, d tree.Diff) error {
+	// TODO: Determine whether or not the schema has changed. If it has, then all rows should count as modifications in the diff.
+	considerAllRowsModified := false
+	err := prolly.DiffMaps(ctx, itr.from, itr.to, considerAllRowsModified, func(ctx context.Context, d tree.Diff) error {
 		dItr, err := itr.makeDiffRowItr(ctx, d)
 		if err != nil {
 			return err

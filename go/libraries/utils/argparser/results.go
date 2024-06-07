@@ -22,10 +22,16 @@ import (
 	"github.com/dolthub/dolt/go/libraries/utils/set"
 )
 
+const (
+	NO_POSITIONAL_ARGS = -1
+)
+
 type ArgParseResults struct {
 	options map[string]string
 	Args    []string
 	parser  *ArgParser
+
+	PositionalArgsSeparatorIndex int
 }
 
 // Equals res and other are only considered equal if the order and contents of their arguments
@@ -48,6 +54,11 @@ func (res *ArgParseResults) Equals(other *ArgParseResults) bool {
 	}
 
 	return true
+}
+
+// NewEmptyResults creates a new ArgParseResults object with no arguments or options. Mostly useful for testing.
+func NewEmptyResults() *ArgParseResults {
+	return &ArgParseResults{options: make(map[string]string), Args: make([]string, 0)}
 }
 
 func (res *ArgParseResults) Contains(name string) bool {
@@ -114,6 +125,23 @@ func (res *ArgParseResults) GetValues(names ...string) map[string]string {
 	}
 
 	return vals
+}
+
+// DropValue removes the value for the given name from the results. A new ArgParseResults object is returned without the
+// names value. If the value is not present in the results then the original results object is returned.
+func (res *ArgParseResults) DropValue(name string) *ArgParseResults {
+	if _, ok := res.options[name]; !ok {
+		return res
+	}
+
+	newNamedArgs := make(map[string]string, len(res.options)-1)
+	for flag, val := range res.options {
+		if flag != name {
+			newNamedArgs[flag] = val
+		}
+	}
+
+	return &ArgParseResults{newNamedArgs, res.Args, res.parser, NO_POSITIONAL_ARGS}
 }
 
 func (res *ArgParseResults) MustGetValue(name string) string {

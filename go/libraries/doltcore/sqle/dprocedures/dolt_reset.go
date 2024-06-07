@@ -62,19 +62,15 @@ func doDoltReset(ctx *sql.Context, args []string) (int, error) {
 		return 1, fmt.Errorf("error: --%s and --%s are mutually exclusive options.", cli.HardResetParam, cli.SoftResetParam)
 	}
 
-	provider := dSess.Provider()
-	db, err := provider.Database(ctx, dbName)
-	if err != nil {
-		return 1, err
-	}
-
 	// Disallow manipulating any roots for read-only databases – changing the branch
 	// HEAD would allow changing data, and working set and index shouldn't ever have
 	// any contents for a read-only database.
-	if rodb, ok := db.(sql.ReadOnlyDatabase); ok {
-		if rodb.IsReadOnly() {
-			return 1, fmt.Errorf("unable to reset HEAD in read-only databases")
-		}
+	isReadOnly, err := isReadOnlyDatabase(ctx, dbName)
+	if err != nil {
+		return 1, err
+	}
+	if isReadOnly {
+		return 1, fmt.Errorf("unable to reset HEAD in read-only databases")
 	}
 
 	// Get all the needed roots.
@@ -100,29 +96,87 @@ func doDoltReset(ctx *sql.Context, args []string) (int, error) {
 
 		// TODO: this overrides the transaction setting, needs to happen at commit, not here
 		if newHead != nil {
-			if err := dbData.Ddb.SetHeadToCommit(ctx, dbData.Rsr.CWBHeadRef(), newHead); err != nil {
+			headRef, err := dbData.Rsr.CWBHeadRef()
+			if err != nil {
+				return 1, err
+			}
+			if err := dbData.Ddb.SetHeadToCommit(ctx, headRef, newHead); err != nil {
 				return 1, err
 			}
 		}
 
+		// TODO - refactor and make transactional with the head update above.
 		ws, err := dSess.WorkingSet(ctx, dbName)
 		if err != nil {
 			return 1, err
 		}
-		err = dSess.SetWorkingSet(ctx, dbName, ws.WithWorkingRoot(roots.Working).WithStagedRoot(roots.Staged).ClearMerge())
-		if err != nil {
-			return 1, err
-		}
-	} else {
-		roots, err = actions.ResetSoftTables(ctx, dbData, apr, roots)
+		err = dSess.SetWorkingSet(ctx, dbName, ws.WithWorkingRoot(roots.Working).WithStagedRoot(roots.Staged).ClearMerge().ClearRebase())
 		if err != nil {
 			return 1, err
 		}
 
-		err = dSess.SetRoots(ctx, dbName, roots)
-		if err != nil {
-			return 1, err
+	} else if apr.Contains(cli.SoftResetParam) {
+		arg := ""
+		if apr.NArg() > 1 {
+			return 1, fmt.Errorf("--soft supports at most one additional param")
+		} else if apr.NArg() == 1 {
+			arg = apr.Arg(0)
 		}
+
+		if arg != "" {
+			roots, err = actions.ResetSoftToRef(ctx, dbData, arg)
+			if err != nil {
+				return 1, err
+			}
+			ws, err := dSess.WorkingSet(ctx, dbName)
+			if err != nil {
+				return 1, err
+			}
+			err = dSess.SetWorkingSet(ctx, dbName, ws.WithStagedRoot(roots.Staged).ClearMerge().ClearRebase())
+			if err != nil {
+				return 1, err
+			}
+		}
+	} else {
+		if apr.NArg() != 1 || (apr.NArg() == 1 && apr.Arg(0) == ".") {
+			roots, err = actions.ResetSoftTables(ctx, dbData, apr, roots)
+			if err != nil {
+				return 1, err
+			}
+			err = dSess.SetRoots(ctx, dbName, roots)
+			if err != nil {
+				return 1, err
+			}
+		} else {
+			// check if the input is a table name or commit ref
+			_, okHead, _ := roots.Head.ResolveTableName(ctx, doltdb.TableName{Name: apr.Arg(0)})
+			_, okStaged, _ := roots.Staged.ResolveTableName(ctx, doltdb.TableName{Name: apr.Arg(0)})
+			_, okWorking, _ := roots.Working.ResolveTableName(ctx, doltdb.TableName{Name: apr.Arg(0)})
+			if okHead || okStaged || okWorking {
+				roots, err = actions.ResetSoftTables(ctx, dbData, apr, roots)
+				if err != nil {
+					return 1, err
+				}
+				err = dSess.SetRoots(ctx, dbName, roots)
+				if err != nil {
+					return 1, err
+				}
+			} else {
+				roots, err = actions.ResetSoftToRef(ctx, dbData, apr.Arg(0))
+				if err != nil {
+					return 1, err
+				}
+				ws, err := dSess.WorkingSet(ctx, dbName)
+				if err != nil {
+					return 1, err
+				}
+				err = dSess.SetWorkingSet(ctx, dbName, ws.WithStagedRoot(roots.Staged).ClearMerge().ClearRebase())
+				if err != nil {
+					return 1, err
+				}
+			}
+		}
+
 	}
 
 	return 0, nil

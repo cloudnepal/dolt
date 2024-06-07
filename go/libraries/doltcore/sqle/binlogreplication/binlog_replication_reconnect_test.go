@@ -17,6 +17,7 @@ package binlogreplication
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,15 +41,20 @@ func TestBinlogReplicationAutoReconnect(t *testing.T) {
 	configureFastConnectionRetry(t)
 	startReplication(t, proxyPort)
 
+	// Get the replica started up and ensure it's in sync with the primary before turning on the limit_data toxic
 	testInitialReplicaStatus(t)
-
 	primaryDatabase.MustExec("create table reconnect_test(pk int primary key, c1 varchar(255));")
+	waitForReplicaToCatchUp(t)
+	turnOnLimitDataToxic(t)
+
 	for i := 0; i < 1000; i++ {
 		value := "foobarbazbashfoobarbazbashfoobarbazbashfoobarbazbashfoobarbazbash"
 		primaryDatabase.MustExec(fmt.Sprintf("insert into reconnect_test values (%v, %q)", i, value))
 	}
 	// Remove the limit_data toxic so that a connection can be reestablished
-	mysqlProxy.RemoveToxic("limit_data")
+	err := mysqlProxy.RemoveToxic("limit_data")
+	require.NoError(t, err)
+	t.Logf("Toxiproxy proxy limit_data toxic removed")
 
 	// Assert that all records get written to the table
 	waitForReplicaToCatchUp(t)
@@ -56,7 +62,7 @@ func TestBinlogReplicationAutoReconnect(t *testing.T) {
 	rows, err := replicaDatabase.Queryx("select min(pk) as min, max(pk) as max, count(pk) as count from db01.reconnect_test;")
 	require.NoError(t, err)
 
-	row := convertByteArraysToStrings(readNextRow(t, rows))
+	row := convertMapScanResultToStrings(readNextRow(t, rows))
 	require.Equal(t, "0", row["min"])
 	require.Equal(t, "999", row["max"])
 	require.Equal(t, "1000", row["count"])
@@ -65,7 +71,7 @@ func TestBinlogReplicationAutoReconnect(t *testing.T) {
 	// Assert that show replica status show reconnection IO error
 	status := showReplicaStatus(t)
 	require.Equal(t, "1158", status["Last_IO_Errno"])
-	require.Equal(t, "unexpected EOF", status["Last_IO_Error"])
+	require.True(t, strings.Contains(status["Last_IO_Error"].(string), "EOF"))
 	requireRecentTimeString(t, status["Last_IO_Error_Timestamp"])
 }
 
@@ -73,7 +79,7 @@ func TestBinlogReplicationAutoReconnect(t *testing.T) {
 // connection retry interval. This is used for testing connection retry logic without waiting the full default period.
 func configureFastConnectionRetry(_ *testing.T) {
 	replicaDatabase.MustExec(
-		fmt.Sprintf("change replication source to SOURCE_CONNECT_RETRY=5;"))
+		"change replication source to SOURCE_CONNECT_RETRY=5;")
 }
 
 // testInitialReplicaStatus tests the data returned by SHOW REPLICA STATUS and errors
@@ -83,7 +89,7 @@ func testInitialReplicaStatus(t *testing.T) {
 	status := showReplicaStatus(t)
 
 	// Positioning settings
-	require.Equal(t, "true", status["Auto_Position"])
+	require.Equal(t, "1", status["Auto_Position"])
 
 	// Connection settings
 	require.Equal(t, "5", status["Connect_Retry"])
@@ -139,7 +145,7 @@ func showReplicaStatus(t *testing.T) map[string]interface{} {
 	rows, err := replicaDatabase.Queryx("show replica status;")
 	require.NoError(t, err)
 	defer rows.Close()
-	return convertByteArraysToStrings(readNextRow(t, rows))
+	return convertMapScanResultToStrings(readNextRow(t, rows))
 }
 
 func configureToxiProxy(t *testing.T) {
@@ -151,7 +157,7 @@ func configureToxiProxy(t *testing.T) {
 		toxiproxyServer.Listen("localhost", strconv.Itoa(toxiproxyPort))
 	}()
 	time.Sleep(500 * time.Millisecond)
-	fmt.Printf("Toxiproxy server running on port %d \n", toxiproxyPort)
+	t.Logf("Toxiproxy control plane running on port %d", toxiproxyPort)
 
 	toxiClient = toxiproxyclient.NewClient(fmt.Sprintf("localhost:%d", toxiproxyPort))
 
@@ -163,23 +169,59 @@ func configureToxiProxy(t *testing.T) {
 	if err != nil {
 		panic(fmt.Sprintf("unable to create toxiproxy: %v", err.Error()))
 	}
-
-	mysqlProxy.AddToxic("limit_data", "limit_data", "downstream", 1.0, toxiproxyclient.Attributes{
-		"bytes": 1_000,
-	})
-	fmt.Printf("Toxiproxy proxy with limit_data toxic (1KB) started on port %d \n", proxyPort)
+	t.Logf("Toxiproxy proxy started on port %d", proxyPort)
 }
 
-// convertByteArraysToStrings converts each []byte value in the specified map |m| into a string.
+// turnOnLimitDataToxic adds a limit_data toxic to the active Toxiproxy, which prevents more than 1KB of data
+// from being sent from the primary through the proxy to the replica. Callers MUST call configureToxiProxy
+// before calling this function.
+func turnOnLimitDataToxic(t *testing.T) {
+	require.NotNil(t, mysqlProxy)
+	_, err := mysqlProxy.AddToxic("limit_data", "limit_data", "downstream", 1.0, toxiproxyclient.Attributes{
+		"bytes": 1_000,
+	})
+	require.NoError(t, err)
+	t.Logf("Toxiproxy proxy with limit_data toxic (1KB) started on port %d", proxyPort)
+}
+
+// convertMapScanResultToStrings converts each value in the specified map |m| into a string.
 // This is necessary because MapScan doesn't honor (or know about) the correct underlying SQL types – it
-// gets all results back as strings, typed as []byte.
+// gets results back as strings, typed as []byte. Results also get returned as int64, which are converted to strings
+// for ease of testing.
 // More info at the end of this issue: https://github.com/jmoiron/sqlx/issues/225
-func convertByteArraysToStrings(m map[string]interface{}) map[string]interface{} {
+func convertMapScanResultToStrings(m map[string]interface{}) map[string]interface{} {
 	for key, value := range m {
-		if bytes, ok := value.([]byte); ok {
-			m[key] = string(bytes)
+		switch v := value.(type) {
+		case []uint8:
+			m[key] = string(v)
+		case int64:
+			m[key] = strconv.FormatInt(v, 10)
+		case uint64:
+			m[key] = strconv.FormatUint(v, 10)
 		}
 	}
 
 	return m
+}
+
+// convertSliceScanResultToStrings returns a new slice, formed by converting each value in the slice |ss| into a string.
+// This is necessary because SliceScan doesn't honor (or know about) the correct underlying SQL types –it
+// gets results back as strings, typed as []byte, or as int64 values.
+// More info at the end of this issue: https://github.com/jmoiron/sqlx/issues/225
+func convertSliceScanResultToStrings(ss []any) []any {
+	row := make([]any, len(ss))
+	for i, value := range ss {
+		switch v := value.(type) {
+		case []uint8:
+			row[i] = string(v)
+		case int64:
+			row[i] = strconv.FormatInt(v, 10)
+		case uint64:
+			row[i] = strconv.FormatUint(v, 10)
+		default:
+			row[i] = v
+		}
+	}
+
+	return row
 }

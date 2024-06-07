@@ -28,6 +28,7 @@ import (
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/libraries/utils/set"
@@ -35,12 +36,12 @@ import (
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
+const unscopedDiffDefaultRowCount = 1000
+
 var workingSetPartitionKey = []byte("workingset")
 var commitHistoryPartitionKey = []byte("commithistory")
 var commitHashCol = "commit_hash"
 var filterColumnNameSet = set.NewStrSet([]string{commitHashCol})
-
-var _ sql.FilteredTable = (*UnscopedDiffTable)(nil)
 
 // UnscopedDiffTable is a sql.Table implementation of a system table that shows which tables have
 // changed in each commit, across all branches.
@@ -52,36 +53,30 @@ type UnscopedDiffTable struct {
 	commitCheck      doltdb.CommitFilter
 }
 
+var _ sql.Table = (*UnscopedDiffTable)(nil)
+var _ sql.StatisticsTable = (*UnscopedDiffTable)(nil)
+var _ sql.IndexAddressable = (*UnscopedDiffTable)(nil)
+
 // NewUnscopedDiffTable creates an UnscopedDiffTable
 func NewUnscopedDiffTable(_ *sql.Context, dbName string, ddb *doltdb.DoltDB, head *doltdb.Commit) sql.Table {
 	return &UnscopedDiffTable{dbName: dbName, ddb: ddb, head: head}
 }
 
-// Filters returns the list of filters that are applied to this table.
-func (dt *UnscopedDiffTable) Filters() []sql.Expression {
-	return dt.partitionFilters
-}
-
-// HandledFilters returns the list of filters that will be handled by the table itself
-func (dt *UnscopedDiffTable) HandledFilters(filters []sql.Expression) []sql.Expression {
-	filters = append(filters, dt.partitionFilters...)
-	dt.partitionFilters = FilterFilters(filters, ColumnPredicate(filterColumnNameSet))
-	return dt.partitionFilters
-}
-
-// WithFilters returns a new sql.Table instance with the filters applied
-func (dt *UnscopedDiffTable) WithFilters(_ *sql.Context, filters []sql.Expression) sql.Table {
-	dt.partitionFilters = FilterFilters(filters, ColumnPredicate(filterColumnNameSet))
-	commitCheck, err := commitFilterForDiffTableFilterExprs(dt.partitionFilters)
+func (dt *UnscopedDiffTable) DataLength(ctx *sql.Context) (uint64, error) {
+	numBytesPerRow := schema.SchemaAvgLength(dt.Schema())
+	numRows, _, err := dt.RowCount(ctx)
 	if err != nil {
-		return nil
+		return 0, err
 	}
-	dt.commitCheck = commitCheck
-	return dt
+	return numBytesPerRow * numRows, nil
+}
+
+func (dt *UnscopedDiffTable) RowCount(_ *sql.Context) (uint64, bool, error) {
+	return unscopedDiffDefaultRowCount, false, nil
 }
 
 // Name is a sql.Table interface function which returns the name of the table which is defined by the constant
-// LogTableName
+// DiffTableName
 func (dt *UnscopedDiffTable) Name() string {
 	return doltdb.DiffTableName
 }
@@ -95,14 +90,14 @@ func (dt *UnscopedDiffTable) String() string {
 // Schema is a sql.Table interface function that returns the sql.Schema for this system table.
 func (dt *UnscopedDiffTable) Schema() sql.Schema {
 	return []*sql.Column{
-		{Name: "commit_hash", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: true},
-		{Name: "table_name", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: true},
-		{Name: "committer", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false},
-		{Name: "email", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false},
-		{Name: "date", Type: types.Datetime, Source: doltdb.DiffTableName, PrimaryKey: false},
-		{Name: "message", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false},
-		{Name: "data_change", Type: types.Boolean, Source: doltdb.DiffTableName, PrimaryKey: false},
-		{Name: "schema_change", Type: types.Boolean, Source: doltdb.DiffTableName, PrimaryKey: false},
+		{Name: "commit_hash", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: true, DatabaseSource: dt.dbName},
+		{Name: "table_name", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: true, DatabaseSource: dt.dbName},
+		{Name: "committer", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "email", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "date", Type: types.Datetime, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "message", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "data_change", Type: types.Boolean, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
+		{Name: "schema_change", Type: types.Boolean, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
 	}
 }
 
@@ -146,13 +141,18 @@ func (dt *UnscopedDiffTable) PartitionRows(ctx *sql.Context, partition sql.Parti
 
 // GetIndexes implements sql.IndexAddressable
 func (dt *UnscopedDiffTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
-	return index.DoltCommitIndexes(dt.Name(), dt.ddb, true)
+	return index.DoltCommitIndexes(dt.dbName, dt.Name(), dt.ddb, true)
 }
 
 // IndexedAccess implements sql.IndexAddressable
 func (dt *UnscopedDiffTable) IndexedAccess(lookup sql.IndexLookup) sql.IndexedTable {
 	nt := *dt
 	return &nt
+}
+
+// PreciseMatch implements sql.IndexAddressable
+func (dt *UnscopedDiffTable) PreciseMatch() bool {
+	return true
 }
 
 func (dt *UnscopedDiffTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
@@ -240,7 +240,7 @@ func (d *doltDiffWorkingSetRowItr) Next(ctx *sql.Context) (sql.Row, error) {
 
 	sqlRow := sql.NewRow(
 		changeSet,
-		change.TableName,
+		change.TableName.Name,
 		nil, // committer
 		nil, // email
 		nil, // date
@@ -331,14 +331,25 @@ func (itr *doltDiffCommitHistoryRowItr) Next(ctx *sql.Context) (sql.Row, error) 
 			}
 			itr.commits = nil
 		} else if itr.child != nil {
-			_, commit, err := itr.child.Next(ctx)
+			_, optCmt, err := itr.child.Next(ctx)
 			if err != nil {
 				return nil, err
 			}
+			commit, ok := optCmt.ToCommit()
+			if !ok {
+				return nil, io.EOF
+			}
+
 			err = itr.loadTableChanges(ctx, commit)
+			if err == doltdb.ErrGhostCommitEncountered {
+				// When showing the diff table in a shallow clone, we show as much of the dolt_history_{table} as we can,
+				// and don't consider it an error when we hit a ghost commit.
+				return nil, io.EOF
+			}
 			if err != nil {
 				return nil, err
 			}
+
 		} else {
 			return nil, io.EOF
 		}
@@ -350,7 +361,7 @@ func (itr *doltDiffCommitHistoryRowItr) Next(ctx *sql.Context) (sql.Row, error) 
 
 	return sql.NewRow(
 		h.String(),
-		tableChange.TableName,
+		tableChange.TableName.Name,
 		meta.Name,
 		meta.Email,
 		meta.Time(),
@@ -401,9 +412,13 @@ func (itr *doltDiffCommitHistoryRowItr) calculateTableChanges(ctx context.Contex
 		return nil, err
 	}
 
-	parent, err := itr.ddb.ResolveParent(ctx, commit, 0)
+	optCmt, err := itr.ddb.ResolveParent(ctx, commit, 0)
 	if err != nil {
 		return nil, err
+	}
+	parent, ok := optCmt.ToCommit()
+	if !ok {
+		return nil, doltdb.ErrGhostCommitEncountered
 	}
 
 	fromRootValue, err := parent.GetRootValue(ctx)
@@ -453,8 +468,14 @@ func isTableDataEmpty(ctx *sql.Context, table *doltdb.Table) (bool, error) {
 func commitFilterForDiffTableFilterExprs(filters []sql.Expression) (doltdb.CommitFilter, error) {
 	filters = transformFilters(filters...)
 
-	return func(ctx context.Context, h hash.Hash, cm *doltdb.Commit) (filterOut bool, err error) {
+	return func(ctx context.Context, h hash.Hash, optCmt *doltdb.OptionalCommit) (filterOut bool, err error) {
 		sc := sql.NewContext(ctx)
+
+		cm, ok := optCmt.ToCommit()
+		if !ok {
+			return false, doltdb.ErrGhostCommitEncountered
+		}
+
 		meta, err := cm.GetCommitMeta(ctx)
 		if err != nil {
 			return false, err
@@ -542,9 +563,14 @@ func getCommitFromHash(ctx *sql.Context, ddb *doltdb.DoltDB, val string) *doltdb
 	if err != nil {
 		return nil
 	}
-	cm, err := ddb.Resolve(ctx, cmSpec, headRef)
+	optCmt, err := ddb.Resolve(ctx, cmSpec, headRef)
 	if err != nil {
 		return nil
 	}
+	cm, ok := optCmt.ToCommit()
+	if !ok {
+		return nil
+	}
+
 	return cm
 }

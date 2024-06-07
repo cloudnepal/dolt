@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -28,8 +27,10 @@ import (
 	"github.com/dolthub/dolt/go/cmd/dolt/commands"
 	eventsapi "github.com/dolthub/dolt/go/gen/proto/dolt/services/eventsapi/v1alpha1"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/servercfg"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
+	"github.com/dolthub/dolt/go/libraries/utils/svcs"
 )
 
 const (
@@ -47,7 +48,9 @@ const (
 	allowCleartextPasswordsFlag = "allow-cleartext-passwords"
 	socketFlag                  = "socket"
 	remotesapiPortFlag          = "remotesapi-port"
+	remotesapiReadOnlyFlag      = "remotesapi-readonly"
 	goldenMysqlConn             = "golden"
+	eventSchedulerStatus        = "event-scheduler"
 )
 
 func indentLines(s string) string {
@@ -64,20 +67,32 @@ func indentLines(s string) string {
 var sqlServerDocs = cli.CommandDocumentationContent{
 	ShortDesc: "Start a MySQL-compatible server.",
 	LongDesc: "By default, starts a MySQL-compatible server on the dolt database in the current directory. " +
-		"Databases are named after the directories they appear in, with all non-alphanumeric characters replaced by the _ character. " +
+		"Databases are named after the directories they appear in." +
 		"Parameters can be specified using a yaml configuration file passed to the server via " +
 		"{{.EmphasisLeft}}--config <file>{{.EmphasisRight}}, or by using the supported switches and flags to configure " +
 		"the server directly on the command line. If {{.EmphasisLeft}}--config <file>{{.EmphasisRight}} is provided all" +
 		" other command line arguments are ignored.\n\nThis is an example yaml configuration file showing all supported" +
 		" items and their default values:\n\n" +
-		indentLines(serverConfigAsYAMLConfig(DefaultServerConfig()).String()) + "\n\n" + `
+		indentLines(servercfg.ServerConfigAsYAMLConfig(DefaultCommandLineServerConfig()).String()) + "\n\n" + `
 SUPPORTED CONFIG FILE FIELDS:
 
-{{.EmphasisLeft}}vlog_level{{.EmphasisRight}}: Level of logging provided. Options are: {{.EmphasisLeft}}trace{{.EmphasisRight}}, {{.EmphasisLeft}}debug{{.EmphasisRight}}, {{.EmphasisLeft}}info{{.EmphasisRight}}, {{.EmphasisLeft}}warning{{.EmphasisRight}}, {{.EmphasisLeft}}error{{.EmphasisRight}}, and {{.EmphasisLeft}}fatal{{.EmphasisRight}}.
+{{.EmphasisLeft}}data_dir{{.EmphasisRight}}: A directory where the server will load dolt databases to serve, and create new ones. Defaults to the current directory.
 
-{{.EmphasisLeft}}behavior.read_only{{.EmphasisRight}}: If true database modification is disabled
+{{.EmphasisLeft}}cfg_dir{{.EmphasisRight}}: A directory where the server will load and store non-database configuration data, such as permission information. Defaults {{.EmphasisLeft}}$data_dir/.doltcfg{{.EmphasisRight}}.
 
-{{.EmphasisLeft}}behavior.autocommit{{.EmphasisRight}}: If true write queries will automatically alter the working set. When working with autocommit enabled it is highly recommended that listener.max_connections be set to 1 as concurrency issues will arise otherwise
+{{.EmphasisLeft}}log_level{{.EmphasisRight}}: Level of logging provided. Options are: {{.EmphasisLeft}}trace{{.EmphasisRight}}, {{.EmphasisLeft}}debug{{.EmphasisRight}}, {{.EmphasisLeft}}info{{.EmphasisRight}}, {{.EmphasisLeft}}warning{{.EmphasisRight}}, {{.EmphasisLeft}}error{{.EmphasisRight}}, and {{.EmphasisLeft}}fatal{{.EmphasisRight}}.
+
+{{.EmphasisLeft}}privilege_file{{.EmphasisRight}}: "Path to a file to load and store users and grants. Defaults to {{.EmphasisLeft}}$doltcfg-dir/privileges.db{{.EmphasisRight}}. Will be created as needed.
+
+{{.EmphasisLeft}}branch_control_file{{.EmphasisRight}}: Path to a file to load and store branch control permissions. Defaults to {{.EmphasisLeft}}$doltcfg-dir/branch_control.db{{.EmphasisRight}}. Will be created as needed.
+
+{{.EmphasisLeft}}max_logged_query_len{{.EmphasisRight}}: If greater than zero, truncates query strings in logging to the number of characters given.
+
+{{.EmphasisLeft}}behavior.read_only{{.EmphasisRight}}: If true database modification is disabled. Defaults to false.
+
+{{.EmphasisLeft}}behavior.autocommit{{.EmphasisRight}}: If true every statement is committed automatically. Defaults to true. @@autocommit can also be specified in each session.
+
+{{.EmphasisLeft}}behavior.dolt_transaction_commit{{.EmphasisRight}}: If true all SQL transaction commits will automatically create a Dolt commit, with a generated commit message. This is useful when a system working with Dolt wants to create versioned data, but doesn't want to directly use Dolt features such as dolt_commit(). 
 
 {{.EmphasisLeft}}user.name{{.EmphasisRight}}: The username that connections should use for authentication
 
@@ -93,18 +108,20 @@ SUPPORTED CONFIG FILE FIELDS:
 
 {{.EmphasisLeft}}listener.write_timeout_millis{{.EmphasisRight}}: The number of milliseconds that the server will wait for a write operation
 
-{{.EmphasisLeft}}performance.query_parallelism{{.EmphasisRight}}: Amount of go routines spawned to process each query
+{{.EmphasisLeft}}remotesapi.port{{.EmphasisRight}}: A port to listen for remote API operations on. If set to a positive integer, this server will accept connections from clients to clone, pull, etc. databases being served.
 
-{{.EmphasisLeft}}databases{{.EmphasisRight}}: a list of dolt data repositories to make available as SQL databases. If databases is missing or empty then the working directory must be a valid dolt data repository which will be made available as a SQL database
+{{.EmphasisLeft}}remotesapi.read_only{{.EmphasisRight}}: Boolean flag which disables the ability to perform pushes against the server.
 
-{{.EmphasisLeft}}databases[i].path{{.EmphasisRight}}: A path to a dolt data repository
+{{.EmphasisLeft}}system_variables{{.EmphasisRight}}: A map of system variable name to desired value for all system variable values to override.
 
-{{.EmphasisLeft}}databases[i].name{{.EmphasisRight}}: The name that the database corresponding to the given path should be referenced via SQL
+{{.EmphasisLeft}}user_session_vars{{.EmphasisRight}}: A map of user name to a map of session variables to set on connection for each session.
+
+{{.EmphasisLeft}}cluster{{.EmphasisRight}}: Settings related to running this server in a replicated cluster. For information on setting these values, see https://docs.dolthub.com/sql-reference/server/replication
 
 If a config file is not provided many of these settings may be configured on the command line.`,
 	Synopsis: []string{
 		"--config {{.LessThan}}file{{.GreaterThan}}",
-		"[-H {{.LessThan}}host{{.GreaterThan}}] [-P {{.LessThan}}port{{.GreaterThan}}] [-u {{.LessThan}}user{{.GreaterThan}}] [-p {{.LessThan}}password{{.GreaterThan}}] [-t {{.LessThan}}timeout{{.GreaterThan}}] [-l {{.LessThan}}loglevel{{.GreaterThan}}] [--data-dir {{.LessThan}}directory{{.GreaterThan}}] [--query-parallelism {{.LessThan}}num-go-routines{{.GreaterThan}}] [-r]",
+		"[-H {{.LessThan}}host{{.GreaterThan}}] [-P {{.LessThan}}port{{.GreaterThan}}] [-u {{.LessThan}}user{{.GreaterThan}}] [-p {{.LessThan}}password{{.GreaterThan}}] [-t {{.LessThan}}timeout{{.GreaterThan}}] [-l {{.LessThan}}loglevel{{.GreaterThan}}] [--data-dir {{.LessThan}}directory{{.GreaterThan}}] [-r]",
 	},
 }
 
@@ -128,9 +145,13 @@ func (cmd SqlServerCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd SqlServerCmd) ArgParser() *argparser.ArgParser {
-	serverConfig := DefaultServerConfig()
+	return cmd.ArgParserWithName(cmd.Name())
+}
 
-	ap := argparser.NewArgParser()
+func (cmd SqlServerCmd) ArgParserWithName(name string) *argparser.ArgParser {
+	serverConfig := DefaultCommandLineServerConfig()
+
+	ap := argparser.NewArgParserWithVariableArgs(name)
 	ap.SupportsString(configFileFlag, "", "file", "When provided configuration is taken from the yaml config file and all command line parameters are ignored.")
 	ap.SupportsString(hostFlag, "H", "host address", fmt.Sprintf("Defines the host address that the server will run on. Defaults to `%v`.", serverConfig.Host()))
 	ap.SupportsUint(portFlag, "P", "port", fmt.Sprintf("Defines the port that the server will run on. Defaults to `%v`.", serverConfig.Port()))
@@ -139,19 +160,21 @@ func (cmd SqlServerCmd) ArgParser() *argparser.ArgParser {
 	ap.SupportsInt(timeoutFlag, "t", "connection timeout", fmt.Sprintf("Defines the timeout, in seconds, used for connections\nA value of `0` represents an infinite timeout. Defaults to `%v`.", serverConfig.ReadTimeout()))
 	ap.SupportsFlag(readonlyFlag, "r", "Disable modification of the database.")
 	ap.SupportsString(logLevelFlag, "l", "log level", fmt.Sprintf("Defines the level of logging provided\nOptions are: `trace`, `debug`, `info`, `warning`, `error`, `fatal`. Defaults to `%v`.", serverConfig.LogLevel()))
-	ap.SupportsString(commands.DataDirFlag, "", "directory", "Defines a directory whose subdirectories should all be dolt data repositories accessible as independent databases within. Defaults to the current directory.")
-	ap.SupportsString(commands.MultiDBDirFlag, "", "directory", "Defines a directory whose subdirectories should all be dolt data repositories accessible as independent databases within. Defaults to the current directory. This is deprecated, you should use `--data-dir` instead.")
-	ap.SupportsString(commands.CfgDirFlag, "", "directory", "Defines a directory that contains configuration files for dolt. Defaults to `$data-dir/.doltcfg`. Will only be created if there is a change that affect configuration settings.")
+	ap.SupportsString(commands.DataDirFlag, "", "directory", "Defines a directory to find databases to serve. Defaults to the current directory.")
+	ap.SupportsString(commands.MultiDBDirFlag, "", "directory", "Deprecated, use `--data-dir` instead.")
+	ap.SupportsString(commands.CfgDirFlag, "", "directory", "Defines a directory that contains non-database storage for dolt. Defaults to `$data-dir/.doltcfg`. Will be created automatically as needed.")
 	ap.SupportsFlag(noAutoCommitFlag, "", "Set @@autocommit = off for the server.")
-	ap.SupportsInt(queryParallelismFlag, "", "num-go-routines", fmt.Sprintf("Set the number of go routines spawned to handle each query. Defaults to `%d`.", serverConfig.QueryParallelism()))
+	ap.SupportsInt(queryParallelismFlag, "", "num-go-routines", "Deprecated, no effect in current versions of Dolt")
 	ap.SupportsInt(maxConnectionsFlag, "", "max-connections", fmt.Sprintf("Set the number of connections handled by the server. Defaults to `%d`.", serverConfig.MaxConnections()))
 	ap.SupportsString(persistenceBehaviorFlag, "", "persistence-behavior", fmt.Sprintf("Indicate whether to `load` or `ignore` persisted global variables. Defaults to `%s`.", serverConfig.PersistenceBehavior()))
-	ap.SupportsString(commands.PrivsFilePathFlag, "", "privilege file", "Path to a file to load and store users and grants. Defaults to `$doltcfg-dir/privileges.db`. Will only be created if there is a change to privileges.")
-	ap.SupportsString(commands.BranchCtrlPathFlag, "", "branch control file", "Path to a file to load and store branch control permissions. Defaults to `$doltcfg-dir/branch_control.db`. Will only be created if there is a change to branch control permissions.")
+	ap.SupportsString(commands.PrivsFilePathFlag, "", "privilege file", "Path to a file to load and store users and grants. Defaults to `$doltcfg-dir/privileges.db`. Will be created as needed.")
+	ap.SupportsString(commands.BranchCtrlPathFlag, "", "branch control file", "Path to a file to load and store branch control permissions. Defaults to `$doltcfg-dir/branch_control.db`. Will be created as needed.")
 	ap.SupportsString(allowCleartextPasswordsFlag, "", "allow-cleartext-passwords", "Allows use of cleartext passwords. Defaults to false.")
 	ap.SupportsOptionalString(socketFlag, "", "socket file", "Path for the unix socket file. Defaults to '/tmp/mysql.sock'.")
-	ap.SupportsUint(remotesapiPortFlag, "", "remotesapi port", "Sets the port for a server which can expose the databases in this sql-server over remotesapi.")
-	ap.SupportsString(goldenMysqlConn, "", "mysql connection string", "Provides a connection string to a MySQL instance to be user to validate query results")
+	ap.SupportsUint(remotesapiPortFlag, "", "remotesapi port", "Sets the port for a server which can expose the databases in this sql-server over remotesapi, so that clients can clone or pull from this server.")
+	ap.SupportsFlag(remotesapiReadOnlyFlag, "", "Disable writes to the sql-server via the push operations. SQL writes are unaffected by this setting.")
+	ap.SupportsString(goldenMysqlConn, "", "mysql connection string", "Provides a connection string to a MySQL instance to be used to validate query results")
+	ap.SupportsString(eventSchedulerStatus, "", "status", "Determines whether the Event Scheduler is enabled and running on the server. It has one of the following values: 'ON', 'OFF' or 'DISABLED'.")
 	return ap
 }
 
@@ -169,18 +192,37 @@ func (cmd SqlServerCmd) RequiresRepo() bool {
 }
 
 // Exec executes the command
-func (cmd SqlServerCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
-	controller := NewServerController()
+func (cmd SqlServerCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
+	controller := svcs.NewController()
 	newCtx, cancelF := context.WithCancel(context.Background())
 	go func() {
-		<-ctx.Done()
-		controller.StopServer()
-		cancelF()
+		// Here we only forward along the SIGINT if the server starts
+		// up successfully.  If the service does not start up
+		// successfully, or if WaitForStart() blocks indefinitely, then
+		// startServer() should have returned an error and we do not
+		// need to Stop the running server or deal with our canceled
+		// parent context.
+		if controller.WaitForStart() == nil {
+			<-ctx.Done()
+			controller.Stop()
+			cancelF()
+		}
 	}()
-	return startServer(newCtx, cmd.VersionStr, commandStr, args, dEnv, controller)
+
+	err := StartServer(newCtx, cmd.VersionStr, commandStr, args, dEnv, controller)
+	if err != nil {
+		cli.Println(color.RedString(err.Error()))
+		return 1
+	}
+
+	return 0
 }
 
 func validateSqlServerArgs(apr *argparser.ArgParseResults) error {
+	if apr.NArg() > 0 {
+		args := strings.Join(apr.Args, ", ")
+		return fmt.Errorf("error: sql-server does not take positional arguments, but found %d: %s", apr.NArg(), args)
+	}
 	_, multiDbDir := apr.GetValue(commands.MultiDBDirFlag)
 	if multiDbDir {
 		cli.PrintErrln("WARNING: --multi-db-dir is deprecated, use --data-dir instead")
@@ -188,73 +230,118 @@ func validateSqlServerArgs(apr *argparser.ArgParseResults) error {
 	return nil
 }
 
-func startServer(ctx context.Context, versionStr, commandStr string, args []string, dEnv *env.DoltEnv, serverController *ServerController) int {
+// StartServer starts the sql server with the controller provided and blocks until the server is stopped.
+func StartServer(ctx context.Context, versionStr, commandStr string, args []string, dEnv *env.DoltEnv, controller *svcs.Controller) error {
 	ap := SqlServerCmd{}.ArgParser()
 	help, _ := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, sqlServerDocs, ap))
-
-	// We need a username and password for many SQL commands, so set defaults if they don't exist
-	dEnv.Config.SetFailsafes(env.DefaultFailsafeConfig)
-
-	apr := cli.ParseArgsOrDie(ap, args, help)
-	if err := validateSqlServerArgs(apr); err != nil {
-		return 1
-	}
-	serverConfig, err := GetServerConfig(dEnv, apr)
+	serverConfig, err := ServerConfigFromArgs(ap, help, args, dEnv)
 	if err != nil {
-		if serverController != nil {
-			serverController.StopServer()
-			serverController.serverStopped(err)
-		}
-
-		cli.PrintErrln(color.RedString("Failed to start server. Bad Configuration"))
-		cli.PrintErrln(err.Error())
-		return 1
-	}
-	if err = SetupDoltConfig(dEnv, apr, serverConfig); err != nil {
-		if serverController != nil {
-			serverController.StopServer()
-			serverController.serverStopped(err)
-		}
-
-		cli.PrintErrln(color.RedString("Failed to start server. Bad Configuration"))
-		cli.PrintErrln(err.Error())
-		return 1
+		return err
 	}
 
-	cli.PrintErrf("Starting server with Config %v\n", ConfigInfo(serverConfig))
-
-	if startError, closeError := Serve(ctx, versionStr, serverConfig, serverController, dEnv); startError != nil || closeError != nil {
-		if startError != nil {
-			cli.PrintErrln(startError)
-		}
-		if closeError != nil {
-			cli.PrintErrln(closeError)
-		}
-		return 1
+	err = servercfg.ApplySystemVariables(serverConfig, sql.SystemVariables)
+	if err != nil {
+		return err
 	}
 
-	return 0
+	cli.PrintErrf("Starting server with Config %v\n", servercfg.ConfigInfo(serverConfig))
+
+	startError, closeError := Serve(ctx, versionStr, serverConfig, controller, dEnv)
+	if startError != nil {
+		return startError
+	}
+	if closeError != nil {
+		return closeError
+	}
+
+	return nil
 }
 
-// GetServerConfig returns ServerConfig that is set either from yaml file if given, if not it is set with values defined
-// on command line. Server config variables not defined are set to default values.
-func GetServerConfig(dEnv *env.DoltEnv, apr *argparser.ArgParseResults) (ServerConfig, error) {
-	var yamlCfg YAMLConfig
-	if cfgFile, ok := apr.GetValue(configFileFlag); ok {
-		cfg, err := getYAMLServerConfig(dEnv.FS, cfgFile)
-		if err != nil {
-			return nil, err
-		}
-		yamlCfg = cfg.(YAMLConfig)
-	} else {
-		return getCommandLineServerConfig(dEnv, apr)
+// ServerConfigFromArgs returns a ServerConfig from the given args
+func ServerConfigFromArgs(ap *argparser.ArgParser, help cli.UsagePrinter, args []string, dEnv *env.DoltEnv) (servercfg.ServerConfig, error) {
+	return ServerConfigFromArgsWithReader(ap, help, args, dEnv, DoltServerConfigReader{})
+}
+
+// ServerConfigFromArgsWithReader returns a ServerConfig from the given args, using the provided ServerConfigReader
+func ServerConfigFromArgsWithReader(
+	ap *argparser.ArgParser,
+	help cli.UsagePrinter,
+	args []string,
+	dEnv *env.DoltEnv,
+	reader ServerConfigReader,
+) (servercfg.ServerConfig, error) {
+	apr := cli.ParseArgsOrDie(ap, args, help)
+	if err := validateSqlServerArgs(apr); err != nil {
+		cli.PrintErrln(color.RedString(err.Error()))
+		return nil, err
 	}
 
-	// if command line user argument was given, replace yaml's user and password
+	serverConfig, err := getServerConfig(dEnv.FS, apr, reader)
+	if err != nil {
+		return nil, fmt.Errorf("bad configuration: %w", err)
+	}
+
+	if err = setupDoltConfig(dEnv, apr, serverConfig); err != nil {
+		return nil, fmt.Errorf("bad configuration: %w", err)
+	}
+
+	return serverConfig, nil
+}
+
+// getServerConfig returns ServerConfig that is set either from yaml file if given, if not it is set with values defined
+// on command line. Server config variables not defined are set to default values.
+func getServerConfig(cwdFS filesys.Filesys, apr *argparser.ArgParseResults, reader ServerConfigReader) (servercfg.ServerConfig, error) {
+	cfgFile, ok := apr.GetValue(configFileFlag)
+	if !ok {
+		return reader.ReadConfigArgs(apr)
+	}
+
+	cfg, err := reader.ReadConfigFile(cwdFS, cfgFile)
+	if err != nil {
+		return nil, err
+	}
+
+	// if command line user argument was given, override the config file's user and password
 	if user, hasUser := apr.GetValue(commands.UserFlag); hasUser {
-		pass, _ := apr.GetValue(passwordFlag)
-		yamlCfg.UserConfig.Name = &user
-		yamlCfg.UserConfig.Password = &pass
+		if wcfg, ok := cfg.(servercfg.WritableServerConfig); ok {
+			pass, _ := apr.GetValue(passwordFlag)
+			wcfg.SetUserName(user)
+			wcfg.SetPassword(pass)
+		}
+	}
+
+	if connStr, ok := apr.GetValue(goldenMysqlConn); ok {
+		if yamlCfg, ok := cfg.(servercfg.YAMLConfig); ok {
+			cli.Println(connStr)
+			yamlCfg.GoldenMysqlConn = &connStr
+		}
+	}
+
+	return cfg, nil
+}
+
+// GetClientConfig returns configuration which is suitable for a client to use. The fact that it returns a ServerConfig
+// is a little confusing, but it is because the client and server use the same configuration struct. The main difference
+// between this method and getServerConfig is that this method required a cli.UserPassword argument. It is created by
+// prompting the user, and we don't want the server to follow that code path.
+func GetClientConfig(cwdFS filesys.Filesys, creds *cli.UserPassword, apr *argparser.ArgParseResults) (servercfg.ServerConfig, error) {
+	cfgFile, hasCfgFile := apr.GetValue(configFileFlag)
+
+	if !hasCfgFile {
+		return NewCommandLineConfig(creds, apr)
+	}
+
+	var yamlCfg servercfg.YAMLConfig
+	cfg, err := servercfg.YamlConfigFromFile(cwdFS, cfgFile)
+	if err != nil {
+		return nil, err
+	}
+	yamlCfg = cfg.(servercfg.YAMLConfig)
+
+	// if command line user argument was given, replace yaml's user and password
+	if creds.Specified {
+		yamlCfg.UserConfig.Name = &creds.Username
+		yamlCfg.UserConfig.Password = &creds.Password
 	}
 
 	if connStr, ok := apr.GetValue(goldenMysqlConn); ok {
@@ -265,8 +352,8 @@ func GetServerConfig(dEnv *env.DoltEnv, apr *argparser.ArgParseResults) (ServerC
 	return yamlCfg, nil
 }
 
-// SetupDoltConfig updates the given server config with where to create .doltcfg directory
-func SetupDoltConfig(dEnv *env.DoltEnv, apr *argparser.ArgParseResults, config ServerConfig) error {
+// setupDoltConfig updates the given server config with where to create .doltcfg directory
+func setupDoltConfig(dEnv *env.DoltEnv, apr *argparser.ArgParseResults, config servercfg.ServerConfig) error {
 	if _, ok := apr.GetValue(configFileFlag); ok {
 		return nil
 	}
@@ -338,133 +425,4 @@ func SetupDoltConfig(dEnv *env.DoltEnv, apr *argparser.ArgParseResults, config S
 	}
 
 	return nil
-}
-
-// getCommandLineServerConfig sets server config variables and persisted global variables with values defined on command line.
-// If not defined, it sets variables to default values.
-func getCommandLineServerConfig(dEnv *env.DoltEnv, apr *argparser.ArgParseResults) (ServerConfig, error) {
-	serverConfig := DefaultServerConfig()
-
-	if sock, ok := apr.GetValue(socketFlag); ok {
-		// defined without value gets default
-		if sock == "" {
-			sock = defaultUnixSocketFilePath
-		}
-		serverConfig.WithSocket(sock)
-	}
-
-	if host, ok := apr.GetValue(hostFlag); ok {
-		serverConfig.WithHost(host)
-	}
-
-	if port, ok := apr.GetInt(portFlag); ok {
-		serverConfig.WithPort(port)
-	}
-
-	if user, ok := apr.GetValue(commands.UserFlag); ok {
-		serverConfig.withUser(user)
-	}
-
-	if password, ok := apr.GetValue(passwordFlag); ok {
-		serverConfig.withPassword(password)
-	}
-
-	if port, ok := apr.GetInt(remotesapiPortFlag); ok {
-		serverConfig.WithRemotesapiPort(&port)
-	}
-
-	if persistenceBehavior, ok := apr.GetValue(persistenceBehaviorFlag); ok {
-		serverConfig.withPersistenceBehavior(persistenceBehavior)
-	}
-
-	if timeoutStr, ok := apr.GetValue(timeoutFlag); ok {
-		timeout, err := strconv.ParseUint(timeoutStr, 10, 64)
-
-		if err != nil {
-			return nil, fmt.Errorf("invalid value for --timeout '%s'", timeoutStr)
-		}
-
-		serverConfig.withTimeout(timeout * 1000)
-
-		err = sql.SystemVariables.SetGlobal("net_read_timeout", timeout*1000)
-		if err != nil {
-			return nil, fmt.Errorf("failed to set net_read_timeout. Error: %s", err.Error())
-		}
-		err = sql.SystemVariables.SetGlobal("net_write_timeout", timeout*1000)
-		if err != nil {
-			return nil, fmt.Errorf("failed to set net_write_timeout. Error: %s", err.Error())
-		}
-	}
-
-	if _, ok := apr.GetValue(readonlyFlag); ok {
-		serverConfig.withReadOnly(true)
-	}
-
-	if logLevel, ok := apr.GetValue(logLevelFlag); ok {
-		serverConfig.withLogLevel(LogLevel(strings.ToLower(logLevel)))
-	}
-
-	if dataDir, ok := apr.GetValue(commands.MultiDBDirFlag); ok {
-		serverConfig.withDataDir(dataDir)
-	}
-
-	if dataDir, ok := apr.GetValue(commands.DataDirFlag); ok {
-		serverConfig.withDataDir(dataDir)
-	}
-
-	if queryParallelism, ok := apr.GetInt(queryParallelismFlag); ok {
-		serverConfig.withQueryParallelism(queryParallelism)
-	}
-
-	if maxConnections, ok := apr.GetInt(maxConnectionsFlag); ok {
-		serverConfig.withMaxConnections(uint64(maxConnections))
-		err := sql.SystemVariables.SetGlobal("max_connections", uint64(maxConnections))
-		if err != nil {
-			return nil, fmt.Errorf("failed to set max_connections. Error: %s", err.Error())
-		}
-	}
-
-	serverConfig.autoCommit = !apr.Contains(noAutoCommitFlag)
-	serverConfig.allowCleartextPasswords = apr.Contains(allowCleartextPasswordsFlag)
-
-	if connStr, ok := apr.GetValue(goldenMysqlConn); ok {
-		cli.Println(connStr)
-		serverConfig.withGoldenMysqlConnectionString(connStr)
-	}
-
-	return serverConfig, nil
-}
-
-// getYAMLServerConfig returns server config variables with values defined in yaml file.
-func getYAMLServerConfig(fs filesys.Filesys, path string) (ServerConfig, error) {
-	data, err := fs.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to read file '%s'. Error: %s", path, err.Error())
-	}
-
-	cfg, err := NewYamlConfig(data)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to parse yaml file '%s'. Error: %s", path, err.Error())
-	}
-
-	if cfg.ListenerConfig.MaxConnections != nil {
-		err = sql.SystemVariables.SetGlobal("max_connections", *cfg.ListenerConfig.MaxConnections)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to set max_connections from yaml file '%s'. Error: %s", path, err.Error())
-		}
-	}
-	if cfg.ListenerConfig.ReadTimeoutMillis != nil {
-		err = sql.SystemVariables.SetGlobal("net_read_timeout", *cfg.ListenerConfig.ReadTimeoutMillis)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to set net_read_timeout from yaml file '%s'. Error: %s", path, err.Error())
-		}
-	}
-	if cfg.ListenerConfig.WriteTimeoutMillis != nil {
-		err = sql.SystemVariables.SetGlobal("net_write_timeout", *cfg.ListenerConfig.WriteTimeoutMillis)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to set net_write_timeout from yaml file '%s'. Error: %s", path, err.Error())
-		}
-	}
-
-	return cfg, nil
 }

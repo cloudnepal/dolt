@@ -24,10 +24,13 @@ import (
 	"sort"
 	"strings"
 
+	goerrors "gopkg.in/src-d/go-errors.v1"
+
 	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
+	"github.com/dolthub/dolt/go/libraries/utils/concurrentmap"
 	"github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/libraries/utils/earl"
 	filesys2 "github.com/dolthub/dolt/go/libraries/utils/filesys"
@@ -36,18 +39,33 @@ import (
 
 var NoRemote = Remote{}
 
-var ErrBranchDoesNotMatchUpstream = errors.New("the upstream branch of your current branch does not match the nane if your current branch")
-var ErrUpstreamBranchAlreadySet = errors.New("upstream branch already set")
-var ErrNoUpstreamForBranch = errors.New("the current branch has no upstream branch")
+var ErrBranchDoesNotMatchUpstream = errors.New("the upstream branch of your current branch does not match the name of your current branch")
 var ErrFailedToReadDb = errors.New("failed to read from the db")
 var ErrUnknownBranch = errors.New("unknown branch")
 var ErrCannotSetUpstreamForTag = errors.New("cannot set upstream for tag")
 var ErrCannotPushRef = errors.New("cannot push ref")
 var ErrNoRefSpecForRemote = errors.New("no refspec for remote")
-var ErrInvalidSetUpstreamArgs = errors.New("invalid set-upstream arguments")
 var ErrInvalidFetchSpec = errors.New("invalid fetch spec")
 var ErrPullWithRemoteNoUpstream = errors.New("You asked to pull from the remote '%s', but did not specify a branch. Because this is not the default configured remote for your current branch, you must specify a branch.")
 var ErrPullWithNoRemoteAndNoUpstream = errors.New("There is no tracking information for the current branch.\nPlease specify which branch you want to merge with.\n\n\tdolt pull <remote> <branch>\n\nIf you wish to set tracking information for this branch you can do so with:\n\n\t dolt push --set-upstream <remote> <branch>\n")
+
+var ErrCurrentBranchHasNoUpstream = goerrors.NewKind("fatal: The current branch %s has no upstream branch.\n" +
+	"To push the current branch and set the remote as upstream, use\n" +
+	"\tdolt push --set-upstream %s %s\n" +
+	"To have this happen automatically for branches without a tracking\n" +
+	"upstream, see 'push.autoSetupRemote' in 'dolt config --help'.")
+var ErrInvalidRepository = goerrors.NewKind("fatal: remote '%s' not found.\n" +
+	"Please make sure the remote exists.")
+var ErrAllFlagCannotBeUsedWithRefSpec = goerrors.NewKind("fatal: --all can't be combined with refspecs")
+var ErrNoPushDestination = goerrors.NewKind("fatal: No configured push destination.\n" +
+	"Either specify the URL from the command-line or configure a remote repository using\n\n" +
+	"\tdolt remote add <name> <url>\n\n" +
+	"and then push using the remote name\n\n" +
+	"\tdolt push <name>\n\n")
+var ErrFailedToPush = goerrors.NewKind("error: failed to push some refs to '%s'\n" +
+	"hint: Updates were rejected because the tip of your current branch is behind\n" +
+	"hint: its remote counterpart. Integrate the remote changes (e.g.\n" +
+	"hint: 'dolt pull ...') before pushing again.\n")
 
 func IsEmptyRemote(r Remote) bool {
 	return len(r.Name) == 0 && len(r.Url) == 0 && r.FetchSpecs == nil && r.Params == nil
@@ -114,105 +132,200 @@ func (r *Remote) GetRemoteDBWithoutCaching(ctx context.Context, nbf *types.NomsB
 	return doltdb.LoadDoltDBWithParams(ctx, nbf, r.Url, filesys2.LocalFS, params)
 }
 
-type PushOpts struct {
+func (r Remote) WithParams(params map[string]string) Remote {
+	fetchSpecs := make([]string, len(r.FetchSpecs))
+	copy(fetchSpecs, r.FetchSpecs)
+	for k, v := range r.Params {
+		params[k] = v
+	}
+	r.Params = params
+	return r
+}
+
+// PushOptions contains information needed for push for
+// one or more branches or a tag for a specific remote database.
+type PushOptions struct {
+	Targets []*PushTarget
+	Rsr     RepoStateReader
+	Rsw     RepoStateWriter
+	Remote  *Remote
+	SrcDb   *doltdb.DoltDB
+	DestDb  *doltdb.DoltDB
+	TmpDir  string
+}
+
+// PushTarget contains information needed for push per branch or tag.
+type PushTarget struct {
 	SrcRef      ref.DoltRef
 	DestRef     ref.DoltRef
 	RemoteRef   ref.DoltRef
-	Remote      Remote
 	Mode        ref.UpdateMode
 	SetUpstream bool
+	HasUpstream bool
 }
 
-func NewPushOpts(ctx context.Context, apr *argparser.ArgParseResults, rsr RepoStateReader, ddb *doltdb.DoltDB, force bool, setUpstream bool, pushAutoSetupRemote bool) (*PushOpts, error) {
-	var err error
-	remotes, err := rsr.GetRemotes()
+func NewPushOpts(ctx context.Context, apr *argparser.ArgParseResults, rsr RepoStateReader, ddb *doltdb.DoltDB, force, setUpstream, pushAutoSetupRemote, all bool) ([]*PushTarget, *Remote, error) {
+	if apr.NArg() == 0 {
+		return getPushTargetsAndRemoteFromNoArg(ctx, rsr, ddb, force, setUpstream, pushAutoSetupRemote, all)
+	}
+
+	rsrBranches, err := rsr.GetBranches()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	remoteName := "origin"
-
-	args := apr.Args
-	if len(args) == 1 {
-		if _, ok := remotes[args[0]]; ok {
-			remoteName = args[0]
-			args = []string{}
-		}
-	}
-
-	remote, remoteOK := remotes[remoteName]
-	currentBranch := rsr.CWBHeadRef()
-	branches, err := rsr.GetBranches()
+	currentBranch, err := rsr.CWBHeadRef()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	upstream, hasUpstream := branches[currentBranch.GetPath()]
 
-	var refSpec ref.RefSpec
-	if remoteOK && len(args) == 1 {
-		refSpec, err = getRefSpecFromStr(ctx, ddb, args[0])
+	// the first argument defines the remote name
+	remoteName := apr.Arg(0)
+	if apr.NArg() == 1 {
+		remote, err := getRemote(rsr, remoteName)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-	} else if len(args) == 2 {
-		remoteName = args[0]
-		refSpec, err = getRefSpecFromStr(ctx, ddb, args[1])
-		if err != nil {
-			return nil, err
-		}
-	} else if pushAutoSetupRemote {
-		if hasUpstream {
-			remoteName = upstream.Remote
-			refSpec, err = getCurrentBranchRefSpecFromUpstream(currentBranch, upstream, len(args))
-			if err != nil {
-				return nil, err
-			}
+
+		if all {
+			return getPushTargetsAndRemoteForAllBranches(ctx, rsrBranches, currentBranch, &remote, ddb, force, setUpstream)
 		} else {
-			// no args - set upstream for current branch of 'origin' remote.
-			setUpstream = true
-			refSpec, err = getRefSpecFromStr(ctx, ddb, currentBranch.GetPath())
+			defaultRemote, err := GetDefaultRemote(rsr)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-		}
-	} else if setUpstream {
-		return nil, ErrInvalidSetUpstreamArgs
-	} else if hasUpstream {
-		remoteName = upstream.Remote
-		refSpec, err = getCurrentBranchRefSpecFromUpstream(currentBranch, upstream, len(args))
-		if err != nil {
-			return nil, err
+
+			refSpec, _, hasUpstream, err := getCurrentBranchRefSpec(ctx, rsrBranches, rsr, ddb, remoteName, defaultRemote.Name == remoteName, true, setUpstream, pushAutoSetupRemote)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			opts, err := getPushTargetFromRefSpec(refSpec, currentBranch, &remote, force, setUpstream, hasUpstream)
+			if err != nil {
+				return nil, nil, err
+			}
+			return []*PushTarget{opts}, &remote, nil
 		}
 	} else {
-		if len(args) == 0 {
-			return nil, ErrNoUpstreamForBranch
+		if all {
+			return nil, nil, ErrAllFlagCannotBeUsedWithRefSpec.New()
 		}
 
-		return nil, errors.New("unknown error for remote push args")
+		refSpecNames := apr.Args[1:]
+		// validate given refSpec names
+		for _, refSpecName := range refSpecNames {
+			if len(refSpecName) == 0 {
+				return nil, nil, fmt.Errorf("%w: '%s'", ref.ErrInvalidRefSpec, refSpecName)
+			}
+		}
+
+		remote, err := getRemote(rsr, apr.Arg(0))
+		if err != nil {
+			return nil, nil, err
+		}
+		return getPushTargetsAndRemoteForBranchRefs(ctx, rsrBranches, refSpecNames, currentBranch, &remote, ddb, force, setUpstream)
 	}
+}
 
-	remote, remoteOK = remotes[remoteName]
-
-	if !remoteOK {
-		return nil, fmt.Errorf("%w: '%s'", ErrUnknownRemote, remoteName)
-	}
-
-	hasRef, err := ddb.HasRef(ctx, currentBranch)
-
+func getRemote(rsr RepoStateReader, name string) (Remote, error) {
+	remotes, err := rsr.GetRemotes()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrFailedToReadDb, err.Error())
-	} else if !hasRef {
-		return nil, fmt.Errorf("%w: '%s'", ErrUnknownBranch, currentBranch.GetPath())
+		return NoRemote, err
 	}
 
+	remote, ok := remotes.Get(name)
+	if !ok {
+		return NoRemote, ErrInvalidRepository.New(name)
+	}
+	return remote, nil
+}
+
+// getPushTargetsAndRemoteFromNoArg pushes the current branch on default remote if upstream is set or `-u` is defined;
+// otherwise, all branches of default remote if `--all` flag is used.
+func getPushTargetsAndRemoteFromNoArg(ctx context.Context, rsr RepoStateReader, ddb *doltdb.DoltDB, force, setUpstream, pushAutoSetupRemote, all bool) ([]*PushTarget, *Remote, error) {
+	rsrBranches, err := rsr.GetBranches()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	currentBranch, err := rsr.CWBHeadRef()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	remote, err := GetDefaultRemote(rsr)
+	if err != nil {
+		if err == ErrNoRemote {
+			err = ErrNoPushDestination.New()
+		}
+		return nil, nil, err
+	}
+	if all {
+		return getPushTargetsAndRemoteForAllBranches(ctx, rsrBranches, currentBranch, &remote, ddb, force, setUpstream)
+	} else {
+		refSpec, remoteName, hasUpstream, err := getCurrentBranchRefSpec(ctx, rsrBranches, rsr, ddb, remote.Name, true, false, setUpstream, pushAutoSetupRemote)
+		if err != nil {
+			return nil, nil, err
+		}
+		if remoteName != remote.Name {
+			remote, err = getRemote(rsr, remoteName)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+
+		opts, err := getPushTargetFromRefSpec(refSpec, currentBranch, &remote, force, setUpstream, hasUpstream)
+		if err != nil {
+			return nil, nil, err
+		}
+		return []*PushTarget{opts}, &remote, nil
+	}
+}
+
+func getPushTargetsAndRemoteForAllBranches(ctx context.Context, rsrBranches *concurrentmap.Map[string, BranchConfig], currentBranch ref.DoltRef, remote *Remote, ddb *doltdb.DoltDB, force, setUpstream bool) ([]*PushTarget, *Remote, error) {
+	localBranches, err := ddb.GetBranches(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var lbNames = make([]string, len(localBranches))
+	for i, branch := range localBranches {
+		lbNames[i] = branch.GetPath()
+	}
+	return getPushTargetsAndRemoteForBranchRefs(ctx, rsrBranches, lbNames, currentBranch, remote, ddb, force, setUpstream)
+}
+
+func getPushTargetsAndRemoteForBranchRefs(ctx context.Context, rsrBranches *concurrentmap.Map[string, BranchConfig], localBranches []string, currentBranch ref.DoltRef, remote *Remote, ddb *doltdb.DoltDB, force, setUpstream bool) ([]*PushTarget, *Remote, error) {
+	var pushOptsList []*PushTarget
+	for _, refSpecName := range localBranches {
+		refSpec, err := getRefSpecFromStr(ctx, ddb, refSpecName)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// if the remote of upstream does not match the remote given,
+		// it should push to the given remote creating new remote branch
+		upstream, hasUpstream := rsrBranches.Get(refSpecName)
+		hasUpstream = hasUpstream && upstream.Remote == remote.Name
+
+		opts, err := getPushTargetFromRefSpec(refSpec, currentBranch, remote, force, setUpstream, hasUpstream)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		pushOptsList = append(pushOptsList, opts)
+	}
+	return pushOptsList, remote, nil
+}
+
+func getPushTargetFromRefSpec(refSpec ref.RefSpec, currentBranch ref.DoltRef, remote *Remote, force, setUpstream, hasUpstream bool) (*PushTarget, error) {
 	src := refSpec.SrcRef(currentBranch)
 	dest := refSpec.DestRef(src)
 
 	var remoteRef ref.DoltRef
-
+	var err error
 	switch src.GetType() {
 	case ref.BranchRefType:
-		remoteRef, err = GetTrackingRef(dest, remote)
+		remoteRef, err = GetTrackingRef(dest, *remote)
 	case ref.TagRefType:
 		if setUpstream {
 			err = ErrCannotSetUpstreamForTag
@@ -220,35 +333,68 @@ func NewPushOpts(ctx context.Context, apr *argparser.ArgParseResults, rsr RepoSt
 	default:
 		err = fmt.Errorf("%w: '%s' of type '%s'", ErrCannotPushRef, src.String(), src.GetType())
 	}
-
 	if err != nil {
 		return nil, err
 	}
 
-	opts := &PushOpts{
+	return &PushTarget{
 		SrcRef:    src,
 		DestRef:   dest,
 		RemoteRef: remoteRef,
-		Remote:    remote,
 		Mode: ref.UpdateMode{
 			Force: force,
 		},
 		SetUpstream: setUpstream,
-	}
-
-	return opts, nil
+		HasUpstream: hasUpstream,
+	}, nil
 }
 
-// NewFetchOpts returns remote and refSpec for given remote name. If remote name is not defined,
-// default remote is used. Default remote is "origin" if there are multiple remotes for now.
-func NewFetchOpts(args []string, rsr RepoStateReader) (Remote, []ref.RemoteRefSpec, error) {
+// getCurrentBranchRefSpec is called when refSpec is NOT specified. Whether to push depends on the specified remote.
+// If the specified remote is the default or the only remote, then it cannot push without its upstream set.
+// If the specified remote is one of many and non-default remote, then it pushes regardless of upstream is set.
+// If there is no remote specified, the current branch needs to have upstream set to push; otherwise, returns error.
+// This function returns |refSpec| for current branch, name of the remote the branch is associated with and
+// whether the current branch has upstream set.
+func getCurrentBranchRefSpec(ctx context.Context, branches *concurrentmap.Map[string, BranchConfig], rsr RepoStateReader, ddb *doltdb.DoltDB, remoteName string, isDefaultRemote, remoteSpecified, setUpstream, pushAutoSetupRemote bool) (ref.RefSpec, string, bool, error) {
+	var refSpec ref.RefSpec
+	currentBranch, err := rsr.CWBHeadRef()
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	currentBranchName := currentBranch.GetPath()
+	upstream, hasUpstream := branches.Get(currentBranchName)
+
+	if remoteSpecified || pushAutoSetupRemote {
+		if isDefaultRemote && !pushAutoSetupRemote {
+			return nil, "", false, ErrCurrentBranchHasNoUpstream.New(currentBranchName, remoteName, currentBranchName)
+		}
+		setUpstream = true
+		refSpec, err = getRefSpecFromStr(ctx, ddb, currentBranchName)
+		if err != nil {
+			return nil, "", false, err
+		}
+	} else if hasUpstream {
+		remoteName = upstream.Remote
+		refSpec, err = getCurrentBranchRefSpecFromUpstream(currentBranch, upstream)
+		if err != nil {
+			return nil, "", false, err
+		}
+	} else {
+		return nil, "", false, ErrCurrentBranchHasNoUpstream.New(currentBranchName, remoteName, currentBranchName)
+	}
+	return refSpec, remoteName, hasUpstream && upstream.Remote == remoteName, nil
+}
+
+// RemoteForFetchArgs returns the remote and remaining arg strings for a fetch command
+func RemoteForFetchArgs(args []string, rsr RepoStateReader) (Remote, []string, error) {
 	var err error
 	remotes, err := rsr.GetRemotes()
 	if err != nil {
 		return NoRemote, nil, err
 	}
 
-	if len(remotes) == 0 {
+	if remotes.Len() == 0 {
 		return NoRemote, nil, ErrNoRemote
 	}
 
@@ -260,24 +406,26 @@ func NewFetchOpts(args []string, rsr RepoStateReader) (Remote, []ref.RemoteRefSp
 		args = args[1:]
 	}
 
-	remote, ok := remotes[remName]
+	remote, ok := remotes.Get(remName)
 	if !ok {
 		msg := "does not appear to be a dolt database. could not read from the remote database. please make sure you have the correct access rights and the database exists"
 		return NoRemote, nil, fmt.Errorf("%w; '%s' %s", ErrUnknownRemote, remName, msg)
 	}
 
-	var rs []ref.RemoteRefSpec
+	return remote, args, nil
+}
+
+// ParseRefSpecs returns the ref specs for the string arguments given for the remote provided, or the default ref
+// specs for that remote if no arguments are provided. In the event that the default ref specs are returned, the
+// returned boolean value will be true.
+func ParseRefSpecs(args []string, rsr RepoStateReader, remote Remote) ([]ref.RemoteRefSpec, bool, error) {
 	if len(args) != 0 {
-		rs, err = ParseRSFromArgs(remName, args)
+		specs, err := ParseRSFromArgs(remote.Name, args)
+		return specs, false, err
 	} else {
-		rs, err = GetRefSpecs(rsr, remName)
+		specs, err := GetRefSpecs(rsr, remote.Name)
+		return specs, true, err
 	}
-
-	if err != nil {
-		return NoRemote, nil, err
-	}
-
-	return remote, rs, err
 }
 
 func ParseRSFromArgs(remName string, args []string) ([]ref.RemoteRefSpec, error) {
@@ -358,11 +506,7 @@ func getRefSpecFromStr(ctx context.Context, ddb *doltdb.DoltDB, refSpecStr strin
 
 // getCurrentBranchRefSpecFromUpstream validates the number of args defined and returns ref.RefSpec object of
 // current branch corresponding to the given upstream.
-func getCurrentBranchRefSpecFromUpstream(currentBranch ref.DoltRef, upstream BranchConfig, argsLen int) (ref.RefSpec, error) {
-	if argsLen > 0 {
-		return nil, fmt.Errorf("%w for '%s'", ErrUpstreamBranchAlreadySet, currentBranch)
-	}
-
+func getCurrentBranchRefSpecFromUpstream(currentBranch ref.DoltRef, upstream BranchConfig) (ref.RefSpec, error) {
 	if currentBranch.GetPath() != upstream.Merge.Ref.GetPath() {
 		return nil, ErrBranchDoesNotMatchUpstream
 	}
@@ -390,9 +534,8 @@ func GetTrackingRef(branchRef ref.DoltRef, remote Remote) (ref.DoltRef, error) {
 }
 
 type PullSpec struct {
-	Msg        string
 	Squash     bool
-	Noff       bool
+	NoFF       bool
 	NoCommit   bool
 	NoEdit     bool
 	Force      bool
@@ -402,10 +545,47 @@ type PullSpec struct {
 	Branch     ref.DoltRef
 }
 
-// NewPullSpec returns PullSpec object using arguments passed into this function, which are remoteName, remoteRefName,
-// squash, noff, noCommit, noEdit,  refSpecs, force and remoteOnly. This function validates remote and gets remoteRef
+type PullSpecOpt func(*PullSpec)
+
+func WithSquash(squash bool) PullSpecOpt {
+	return func(ps *PullSpec) {
+		ps.Squash = squash
+	}
+}
+
+func WithNoFF(noff bool) PullSpecOpt {
+	return func(ps *PullSpec) {
+		ps.NoFF = noff
+	}
+}
+
+func WithNoCommit(nocommit bool) PullSpecOpt {
+	return func(ps *PullSpec) {
+		ps.NoCommit = nocommit
+	}
+}
+
+func WithNoEdit(noedit bool) PullSpecOpt {
+	return func(ps *PullSpec) {
+		ps.NoEdit = noedit
+	}
+}
+
+func WithForce(force bool) PullSpecOpt {
+	return func(ps *PullSpec) {
+		ps.Force = force
+	}
+}
+
+// NewPullSpec returns a PullSpec for the arguments given. This function validates remote and gets remoteRef
 // for given remoteRefName; if it's not defined, it uses current branch to get its upstream branch if it exists.
-func NewPullSpec(_ context.Context, rsr RepoStateReader, remoteName, remoteRefName string, squash, noff, noCommit, noEdit, force, remoteOnly bool) (*PullSpec, error) {
+func NewPullSpec(
+	_ context.Context,
+	rsr RepoStateReader,
+	remoteName, remoteRefName string,
+	remoteOnly bool,
+	opts ...PullSpecOpt,
+) (*PullSpec, error) {
 	refSpecs, err := GetRefSpecs(rsr, remoteName)
 	if err != nil {
 		return nil, err
@@ -418,17 +598,23 @@ func NewPullSpec(_ context.Context, rsr RepoStateReader, remoteName, remoteRefNa
 	if err != nil {
 		return nil, err
 	}
-	remote := remotes[refSpecs[0].GetRemote()]
+	remote, found := remotes.Get(refSpecs[0].GetRemote())
+	if !found {
+		return nil, ErrPullWithNoRemoteAndNoUpstream
+	}
 
 	var remoteRef ref.DoltRef
 	if remoteRefName == "" {
-		branch := rsr.CWBHeadRef()
+		branch, err := rsr.CWBHeadRef()
+		if err != nil {
+			return nil, err
+		}
 		trackedBranches, err := rsr.GetBranches()
 		if err != nil {
 			return nil, err
 		}
 
-		trackedBranch, hasUpstream := trackedBranches[branch.GetPath()]
+		trackedBranch, hasUpstream := trackedBranches.Get(branch.GetPath())
 		if !hasUpstream {
 			if remoteOnly {
 				return nil, fmt.Errorf(ErrPullWithRemoteNoUpstream.Error(), remoteName)
@@ -442,17 +628,18 @@ func NewPullSpec(_ context.Context, rsr RepoStateReader, remoteName, remoteRefNa
 		remoteRef = ref.NewBranchRef(remoteRefName)
 	}
 
-	return &PullSpec{
-		Squash:     squash,
-		Noff:       noff,
-		NoCommit:   noCommit,
-		NoEdit:     noEdit,
+	spec := &PullSpec{
 		RemoteName: remoteName,
 		Remote:     remote,
 		RefSpecs:   refSpecs,
 		Branch:     remoteRef,
-		Force:      force,
-	}, nil
+	}
+
+	for _, opt := range opts {
+		opt(spec)
+	}
+
+	return spec, nil
 }
 
 func GetAbsRemoteUrl(fs filesys2.Filesys, cfg config.ReadableConfig, urlArg string) (string, string, error) {
@@ -477,7 +664,7 @@ func GetAbsRemoteUrl(fs filesys2.Filesys, cfg config.ReadableConfig, urlArg stri
 		return dbfactory.HTTPSScheme, "https://" + urlArg, nil
 	}
 
-	hostName, err := cfg.GetString(RemotesApiHostKey)
+	hostName, err := cfg.GetString(config.RemotesApiHostKey)
 
 	if err != nil {
 		if err != config.ErrConfigParamNotFound {

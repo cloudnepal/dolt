@@ -1,3 +1,4 @@
+#!/usr/bin/env bats
 load $BATS_TEST_DIRNAME/helper/common.bash
 
 setup() {
@@ -21,7 +22,7 @@ SQL
 
     run dolt sql -q "SHOW DATABASES;"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "dolt_repo_$$" ]] || false
+    [[ "$output" =~ "dolt-repo-$$" ]] || false
     [[ "$output" =~ "information_schema" ]] || false
     [[ "$output" =~ "mydb" ]] || false
     
@@ -42,7 +43,7 @@ SQL
 
     run dolt sql -q "SHOW DATABASES;"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "dolt_repo_$$" ]] || false
+    [[ "$output" =~ "dolt-repo-$$" ]] || false
     [[ "$output" =~ "information_schema" ]] || false
     [[ "$output" =~ "mydb" ]] || false
 
@@ -64,7 +65,7 @@ SQL
 
     run dolt sql -q "SHOW DATABASES;"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "dolt_repo_$$" ]] || false
+    [[ "$output" =~ "dolt-repo-$$" ]] || false
     [[ "$output" =~ "information_schema" ]] || false
     [[ "$output" =~ "mydb" ]] || false
 
@@ -74,8 +75,6 @@ SQL
 }
 
 @test "sql-create-database: drop database" {
-    skiponwindows "failing with file in use error"
-    
     dolt sql <<SQL
 create database mydb;
 use mydb;
@@ -98,12 +97,23 @@ SQL
     [ ! -d mydb ]
 }
 
+@test "sql-create-database: drop and recreate database" {
+    run dolt sql <<SQL
+create database mydb;
+drop database mydb;
+create database mydb;
+SQL
+
+    [ "$status" -eq 0 ]
+    [ -d mydb ]
+}
+
 @test "sql-create-database: with data-dir" {
     skiponwindows "failing with file in use error"
 
     mkdir db_dir
     
-    dolt sql --data-dir db_dir <<SQL
+    dolt --data-dir db_dir sql <<SQL
 create database mydb1;
 create database mydb2;
 use mydb1;
@@ -132,22 +142,22 @@ SQL
 
     cd ../../
     
-    dolt sql --data-dir db_dir -q "drop database mydb1"
+    dolt --data-dir db_dir sql -q "drop database mydb1"
     
     [ ! -d db_dir/mydb1 ]
     [ -d db_dir/mydb2 ]
 
-    run dolt sql --data-dir db_dir -q "show databases"
+    run dolt --data-dir db_dir sql -q "show databases"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "mydb2" ]] || false
     [[ ! "$output" =~ "mydb1" ]] || false
-    [[ ! "$output" =~ "dolt_repo_$$" ]] || false
+    [[ ! "$output" =~ "dolt-repo-$$" ]] || false
 
     # data-dir with abs path
     absdir="/tmp/$$/db_dir"
     mkdir -p "$absdir"
 
-    dolt sql --data-dir "$absdir" <<SQL
+    dolt --data-dir "$absdir" sql <<SQL
 create database mydb1;
 create database mydb2;
 use mydb1;
@@ -164,7 +174,7 @@ SQL
     [ -d "$absdir/mydb1" ]
     [ -d "$absdir/mydb2" ]
 
-    dolt sql --data-dir "$absdir" -q "drop database mydb1"
+    dolt --data-dir "$absdir" sql -q "drop database mydb1"
 
     [ ! -d "$absdir/mydb1" ]
     [ -d "$absdir/mydb2" ]
@@ -194,8 +204,6 @@ SQL
 }
 
 @test "sql-create-database: create and drop new database in same session" {
-    skiponwindows "failing with file in use error"
-    
     run dolt sql << SQL
 CREATE DATABASE mydb;
 DROP DATABASE mydb;
@@ -210,8 +218,6 @@ SQL
 }
 
 @test "sql-create-database: create new database IF NOT EXISTS" {
-    skiponwindows "failing with file in use error"
-    
     # Test bad syntax.
     run dolt sql -q "CREATE DATABASE IF EXISTS test;"
     [ "$status" -eq 1 ]
@@ -220,7 +226,7 @@ SQL
     dolt sql -q "CREATE DATABASE IF NOT EXISTS test;"
     run dolt sql -q "SHOW DATABASES;"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "dolt_repo_$$" ]] || false
+    [[ "$output" =~ "dolt-repo-$$" ]] || false
     [[ "$output" =~ "information_schema" ]] || false
     [[ "$output" =~ "test" ]] || false
 
@@ -270,14 +276,18 @@ SQL
 @test "sql-create-database: sql drop database errors for info schema" {
     run dolt sql -q "DROP DATABASE information_schema"
     [ "$status" -eq 1 ]
-    [[ "$output" =~ "DROP DATABASE isn't supported for database information_schema" ]] || false
+    [[ "$output" =~ "unable to drop database: information_schema" ]] || false
+
+    run dolt sql -q "DROP DATABASE INFORMATION_SCHEMA"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "unable to drop database: INFORMATION_SCHEMA" ]] || false
 }
 
 @test "sql-create-database: create new database via SCHEMA alias" {
     dolt sql -q "CREATE SCHEMA mydb"
 
     run dolt sql -q "SHOW DATABASES;"
-    [[ "$output" =~ "dolt_repo_$$" ]] || false
+    [[ "$output" =~ "dolt-repo-$$" ]] || false
     [[ "$output" =~ "information_schema" ]] || false
     [[ "$output" =~ "mydb" ]] || false    
 }
@@ -289,8 +299,6 @@ SQL
 }
 
 @test "sql-create-database: SHOW DATABASES works after CREATE and DROP" {
-    skiponwindows "failing with file in use error"
-    
     run dolt sql -q "SHOW DATABASES"
     before=$output
 
@@ -310,7 +318,7 @@ SQL
 
     run dolt sql -q "SHOW DATABASES;"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "dolt_repo_$$" ]] || false
+    [[ "$output" =~ "dolt-repo-$$" ]] || false
     [[ "$output" =~ "information_schema" ]] || false
     [[ "$output" =~ "metabase" ]] || false
 
@@ -319,4 +327,46 @@ SQL
     run dolt sql -q "select * from information_schema.SCHEMATA where schema_name = 'metabase';" -r csv
     [[ "$output" =~ "def,metabase,utf8mb4,utf8mb4_unicode_ci,,NO" ]] || false
     cd ..
+}
+
+@test "sql-create-database: creating database with hyphen and space characters replaced" {
+    mkdir 'test- dashes'
+    cd 'test- dashes'
+    dolt init
+    export DOLT_DBNAME_REPLACE="true"
+
+    # aliasing with 'a' allows check on the exact length of the database name
+    run dolt sql << SQL
+USE test_dashes;
+SELECT DATABASE() AS a;
+SQL
+    [ $status -eq 0 ]
+    [[ $output =~ "| test_dashes |" ]] || false
+}
+
+@test "sql-create-database: creating database with hyphen and space characters allowed" {
+    mkdir ' test- db _  '
+    cd ' test- db _  '
+    dolt init
+
+    # aliasing with 'a' allows check on the exact length of the database name
+    run dolt sql << SQL
+USE \` test- db _  \`;
+SELECT DATABASE() AS a;
+SQL
+    [ $status -eq 0 ]
+    [[ $output =~ "|  test- db _   |" ]] || false
+}
+
+@test "sql-create-database: alter database collation" {
+    run dolt sql -q "create database tmpdb"
+    [ "$status" -eq 0 ]
+    run dolt sql -q "show create database tmpdb"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin" ]] || false
+    run dolt sql -q "alter database tmpdb collate utf8mb4_spanish_ci"
+    [ "$status" -eq 0 ]
+    run dolt sql -q "show create database tmpdb"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_spanish_ci" ]] || false
 }

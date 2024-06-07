@@ -16,8 +16,6 @@ package merge
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -35,7 +33,25 @@ import (
 )
 
 type MergeOpts struct {
+	// IsCherryPick is set for cherry-pick operations.
 	IsCherryPick bool
+	// KeepSchemaConflicts is set when schema conflicts should be stored,
+	// otherwise the merge errors out when schema conflicts are detected.
+	KeepSchemaConflicts bool
+	// ReverifyAllConstraints is set to indicate that a merge should not rely on existing
+	// constraint violation artifacts and should instead ensure that all constraints are
+	// verified. When this option is not set, merge will use optimizations to short circuit
+	// some calculations that aren't needed for merge correctness, but are still needed to
+	// correctly verify all constraints.
+	ReverifyAllConstraints bool
+	// RecordViolationsForTables is an optional map that allows the caller to control which
+	// tables will have constraint violations recorded as artifacts in the merged tables. When
+	// this field is nil or an empty map, constraint violations will be recorded for all tables,
+	// but if the map is populated with any (case-insensitive) table names, then only those tables
+	// will have constraint violations recorded. This functionality is primarily used by the
+	// dolt_verify_constraints() stored procedure to allow callers to verify constraints for a
+	// subset of tables.
+	RecordViolationsForTables map[string]struct{}
 }
 
 type TableMerger struct {
@@ -54,6 +70,12 @@ type TableMerger struct {
 
 	vrw types.ValueReadWriter
 	ns  tree.NodeStore
+
+	// recordViolations controls whether constraint violations should be recorded as table
+	// artifacts when merging this table. In almost all cases, this should be set to true. The
+	// exception is for the dolt_verify_constraints() stored procedure, which allows callers to
+	// only record constraint violations for a specified subset of tables.
+	recordViolations bool
 }
 
 func (tm TableMerger) tableHashes() (left, right, anc hash.Hash, err error) {
@@ -76,9 +98,9 @@ func (tm TableMerger) tableHashes() (left, right, anc hash.Hash, err error) {
 }
 
 type RootMerger struct {
-	left  *doltdb.RootValue
-	right *doltdb.RootValue
-	anc   *doltdb.RootValue
+	left  doltdb.RootValue
+	right doltdb.RootValue
+	anc   doltdb.RootValue
 
 	rightSrc doltdb.Rootish
 	ancSrc   doltdb.Rootish
@@ -89,7 +111,7 @@ type RootMerger struct {
 
 // NewMerger creates a new merger utility object.
 func NewMerger(
-	left, right, anc *doltdb.RootValue,
+	left, right, anc doltdb.RootValue,
 	rightSrc, ancestorSrc doltdb.Rootish,
 	vrw types.ValueReadWriter,
 	ns tree.NodeStore,
@@ -105,10 +127,15 @@ func NewMerger(
 	}, nil
 }
 
+type MergedTable struct {
+	table    *doltdb.Table
+	conflict SchemaConflict
+}
+
 // MergeTable merges schema and table data for the table tblName.
 // TODO: this code will loop infinitely when merging certain schema changes
-func (rm *RootMerger) MergeTable(ctx context.Context, tblName string, opts editor.Options, mergeOpts MergeOpts) (*doltdb.Table, *MergeStats, error) {
-	tm, err := rm.makeTableMerger(ctx, tblName)
+func (rm *RootMerger) MergeTable(ctx *sql.Context, tblName string, opts editor.Options, mergeOpts MergeOpts) (*MergedTable, *MergeStats, error) {
+	tm, err := rm.makeTableMerger(ctx, tblName, mergeOpts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -116,172 +143,131 @@ func (rm *RootMerger) MergeTable(ctx context.Context, tblName string, opts edito
 	// short-circuit here if we can
 	finished, stats, err := rm.maybeShortCircuit(ctx, tm, mergeOpts)
 	if finished != nil || stats != nil || err != nil {
-		return finished, stats, err
+		return &MergedTable{table: finished}, stats, err
 	}
 
-	if mergeOpts.IsCherryPick && !schema.SchemasAreEqual(tm.leftSch, tm.rightSch) {
-		return nil, nil, errors.New(fmt.Sprintf("schema changes not supported: %s table schema does not match in current HEAD and cherry-pick commit.", tblName))
-	}
-
-	mergeSch, schConflicts, err := SchemaMerge(ctx, tm.vrw.Format(), tm.leftSch, tm.rightSch, tm.ancSch, tblName)
+	// Calculate a merge of the schemas, but don't apply it yet
+	mergeSch, schConflicts, mergeInfo, diffInfo, err := SchemaMerge(ctx, tm.vrw.Format(), tm.leftSch, tm.rightSch, tm.ancSch, tblName)
 	if err != nil {
 		return nil, nil, err
 	}
-	if schConflicts.Count() != 0 {
-		// error on schema conflicts for now
-		return nil, nil, fmt.Errorf("%w.\n%s", ErrSchemaConflict, schConflicts.AsError().Error())
+	if schConflicts.Count() > 0 {
+		if !mergeOpts.KeepSchemaConflicts {
+			return nil, nil, schConflicts
+		}
+		// handle schema conflicts above
+		mt := &MergedTable{
+			table:    tm.leftTbl,
+			conflict: schConflicts,
+		}
+		stats = &MergeStats{
+			Operation:       TableModified,
+			SchemaConflicts: schConflicts.Count(),
+		}
+		return mt, stats, nil
 	}
 
+	var tbl *doltdb.Table
 	if types.IsFormat_DOLT(tm.vrw.Format()) {
-		err = rm.maybeAbortDueToUnmergeableIndexes(tm.name, tm.leftSch, tm.rightSch, mergeSch)
-		if err != nil {
-			return nil, nil, err
-		}
+		tbl, stats, err = mergeProllyTable(ctx, tm, mergeSch, mergeInfo, diffInfo)
+	} else {
+		tbl, stats, err = mergeNomsTable(ctx, tm, mergeSch, rm.vrw, opts)
 	}
-
-	mergeTbl, err := tm.leftTbl.UpdateSchema(ctx, mergeSch)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	if types.IsFormat_DOLT(mergeTbl.Format()) {
-		mergeTbl, err = mergeTableArtifacts(ctx, tm, mergeTbl)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		var stats *MergeStats
-		mergeTbl, stats, err = mergeTableData(ctx, tm, mergeSch, mergeTbl)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		n, err := mergeTbl.NumRowsInConflict(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		stats.Conflicts = int(n)
-
-		mergeTbl, err = mergeAutoIncrementValues(ctx, tm.leftTbl, tm.rightTbl, mergeTbl)
-		if err != nil {
-			return nil, nil, err
-		}
-		return mergeTbl, stats, nil
-	}
-
-	// If any indexes were added during the merge, then we need to generate their row data to add to our updated table.
-	addedIndexesSet := make(map[string]string)
-	for _, index := range mergeSch.Indexes().AllIndexes() {
-		addedIndexesSet[strings.ToLower(index.Name())] = index.Name()
-	}
-	for _, index := range tm.leftSch.Indexes().AllIndexes() {
-		delete(addedIndexesSet, strings.ToLower(index.Name()))
-	}
-	for _, addedIndex := range addedIndexesSet {
-		newIndexData, err := editor.RebuildIndex(ctx, mergeTbl, addedIndex, opts)
-		if err != nil {
-			return nil, nil, err
-		}
-		mergeTbl, err = mergeTbl.SetNomsIndexRows(ctx, addedIndex, newIndexData)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	updatedTblEditor, err := editor.NewTableEditor(ctx, mergeTbl, mergeSch, tblName, opts)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	rows, err := tm.leftTbl.GetNomsRowData(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	mergeRows, err := tm.rightTbl.GetNomsRowData(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ancRows, err := tm.ancTbl.GetRowData(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	resultTbl, cons, stats, err := mergeNomsTableData(ctx, rm.vrw, tblName, mergeSch, rows, mergeRows, durable.NomsMapFromIndex(ancRows), updatedTblEditor)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if cons.Len() > 0 {
-		resultTbl, err = setConflicts(ctx, durable.ConflictIndexFromNomsMap(cons, rm.vrw), tm.leftTbl, tm.rightTbl, tm.ancTbl, resultTbl)
-		if err != nil {
-			return nil, nil, err
-		}
-		stats.Conflicts = int(cons.Len())
-	}
-
-	resultTbl, err = mergeAutoIncrementValues(ctx, tm.leftTbl, tm.rightTbl, resultTbl)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return resultTbl, stats, nil
+	return &MergedTable{table: tbl}, stats, nil
 }
 
-func (rm *RootMerger) makeTableMerger(ctx context.Context, tblName string) (TableMerger, error) {
+func (rm *RootMerger) makeTableMerger(ctx context.Context, tblName string, mergeOpts MergeOpts) (*TableMerger, error) {
+	recordViolations := true
+	if mergeOpts.RecordViolationsForTables != nil {
+		if _, ok := mergeOpts.RecordViolationsForTables[strings.ToLower(tblName)]; !ok {
+			recordViolations = false
+		}
+	}
+
 	tm := TableMerger{
-		name:        tblName,
-		rightSrc:    rm.rightSrc,
-		ancestorSrc: rm.ancSrc,
-		vrw:         rm.vrw,
-		ns:          rm.ns,
+		name:             tblName,
+		rightSrc:         rm.rightSrc,
+		ancestorSrc:      rm.ancSrc,
+		vrw:              rm.vrw,
+		ns:               rm.ns,
+		recordViolations: recordViolations,
 	}
 
-	var ok bool
 	var err error
+	var leftSideTableExists, rightSideTableExists, ancTableExists bool
 
-	tm.leftTbl, ok, err = rm.left.GetTable(ctx, tblName)
+	tm.leftTbl, leftSideTableExists, err = rm.left.GetTable(ctx, doltdb.TableName{Name: tblName})
 	if err != nil {
-		return TableMerger{}, err
+		return nil, err
 	}
-	if ok {
+	if leftSideTableExists {
 		if tm.leftSch, err = tm.leftTbl.GetSchema(ctx); err != nil {
-			return TableMerger{}, err
+			return nil, err
 		}
 	}
 
-	tm.rightTbl, ok, err = rm.right.GetTable(ctx, tblName)
+	tm.rightTbl, rightSideTableExists, err = rm.right.GetTable(ctx, doltdb.TableName{Name: tblName})
 	if err != nil {
-		return TableMerger{}, err
+		return nil, err
 	}
-	if ok {
+	if rightSideTableExists {
 		if tm.rightSch, err = tm.rightTbl.GetSchema(ctx); err != nil {
-			return TableMerger{}, err
+			return nil, err
 		}
 	}
 
-	tm.ancTbl, ok, err = rm.anc.GetTable(ctx, tblName)
-	if err != nil {
-		return TableMerger{}, err
+	// If we need to re-verify all constraints, then we need to stub out tables
+	// that don't exist, so that the diff logic can compare an empty table to
+	// the table containing the real data. This is required by dolt_verify_constraints()
+	// so that we can run the merge logic on all rows in all tables.
+	if mergeOpts.ReverifyAllConstraints {
+		if !leftSideTableExists && rightSideTableExists {
+			// if left side doesn't have the table... stub it out with an empty table from the right side...
+			tm.leftSch = tm.rightSch
+			tm.leftTbl, err = doltdb.NewEmptyTable(ctx, rm.vrw, rm.ns, tm.leftSch)
+			if err != nil {
+				return nil, err
+			}
+		} else if !rightSideTableExists && leftSideTableExists {
+			// if left side doesn't have the table... stub it out with an empty table from the right side...
+			tm.rightSch = tm.leftSch
+			tm.rightTbl, err = doltdb.NewEmptyTable(ctx, rm.vrw, rm.ns, tm.rightSch)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	if ok {
+
+	tm.ancTbl, ancTableExists, err = rm.anc.GetTable(ctx, doltdb.TableName{Name: tblName})
+	if err != nil {
+		return nil, err
+	}
+	if ancTableExists {
 		if tm.ancSch, err = tm.ancTbl.GetSchema(ctx); err != nil {
-			return TableMerger{}, err
+			return nil, err
 		}
 	} else if schema.SchemasAreEqual(tm.leftSch, tm.rightSch) && tm.leftTbl != nil {
 		// If left & right added the same table, fill tm.anc with an empty table
 		tm.ancSch = tm.leftSch
 		tm.ancTbl, err = doltdb.NewEmptyTable(ctx, rm.vrw, rm.ns, tm.ancSch)
 		if err != nil {
-			return TableMerger{}, err
+			return nil, err
 		}
 	}
 
-	return tm, nil
+	return &tm, nil
 }
 
-func (rm *RootMerger) maybeShortCircuit(ctx context.Context, tm TableMerger, opts MergeOpts) (*doltdb.Table, *MergeStats, error) {
+func (rm *RootMerger) maybeShortCircuit(ctx context.Context, tm *TableMerger, opts MergeOpts) (*doltdb.Table, *MergeStats, error) {
+	// If we need to re-verify all constraints as part of this merge, then we can't short
+	// circuit considering any tables, so return immediately
+	if opts.ReverifyAllConstraints {
+		return nil, nil, nil
+	}
+
 	rootHash, mergeHash, ancHash, err := tm.tableHashes()
 	if err != nil {
 		return nil, nil, err
@@ -324,18 +310,25 @@ func (rm *RootMerger) maybeShortCircuit(ctx context.Context, tm TableMerger, opt
 
 	// Deleted in root or in merge, either a conflict (if any changes in other root) or else a fast-forward
 	if ancExists && (!leftExists || !rightExists) {
-		if opts.IsCherryPick && leftExists && !rightExists {
-			// TODO : this is either drop table or rename table case
-			// We can delete only if the table in current HEAD and parent commit contents are exact the same (same schema and same data);
-			// otherwise, return ErrTableDeletedAndModified
-			// We need to track renaming of a table --> the renamed table could be added as new table
-			err = fmt.Errorf("schema changes not supported: %s table was renamed or dropped in cherry-pick commit", tm.name)
-			return nil, &MergeStats{Operation: TableModified}, err
+		var childTable *doltdb.Table
+		var childHash hash.Hash
+		if rightExists {
+			childTable = tm.rightTbl
+			childHash = mergeHash
+		} else {
+			childTable = tm.leftTbl
+			childHash = rootHash
 		}
-
-		if (rightExists && mergeHash != ancHash) ||
-			(leftExists && rootHash != ancHash) {
-			return nil, nil, ErrTableDeletedAndModified
+		if childHash != ancHash {
+			schemasEqual, err := doltdb.SchemaHashesEqual(ctx, childTable, tm.ancTbl)
+			if err != nil {
+				return nil, nil, err
+			}
+			if schemasEqual {
+				return nil, nil, ErrTableDeletedAndModified
+			} else {
+				return nil, nil, ErrTableDeletedAndSchemaModified
+			}
 		}
 		// fast-forward
 		return nil, &MergeStats{Operation: TableRemoved}, nil
@@ -361,80 +354,6 @@ func (rm *RootMerger) maybeShortCircuit(ctx context.Context, tm TableMerger, opt
 
 	// no short-circuit
 	return nil, nil, nil
-}
-
-func (rm *RootMerger) maybeAbortDueToUnmergeableIndexes(tableName string, leftSchema, rightSchema, targetSchema schema.Schema) error {
-	leftOk, err := validateTupleFields(leftSchema, targetSchema)
-	if err != nil {
-		return err
-	}
-
-	rightOk, err := validateTupleFields(rightSchema, targetSchema)
-	if err != nil {
-		return err
-	}
-
-	if !leftOk || !rightOk {
-		return fmt.Errorf("table %s can't be automatically merged.\nTo merge this table, make the schema on the source and target branch equal.", tableName)
-	}
-
-	return nil
-}
-
-func validateTupleFields(existingSch schema.Schema, targetSch schema.Schema) (bool, error) {
-	existingVD := existingSch.GetValueDescriptor()
-	targetVD := targetSch.GetValueDescriptor()
-
-	_, valMapping, err := schema.MapSchemaBasedOnTagAndName(existingSch, targetSch)
-	if err != nil {
-		return false, err
-	}
-
-	for i, j := range valMapping {
-
-		// If the field positions have changed between existing and target, bail.
-		if i != j {
-			return false, nil
-		}
-
-		// If the field types have changed between existing and target, bail.
-		if existingVD.Types[i].Enc != targetVD.Types[j].Enc {
-			return false, nil
-		}
-
-		// If a not null constraint was added, bail.
-		if existingVD.Types[j].Nullable && !targetVD.Types[j].Nullable {
-			return false, nil
-		}
-
-		// If the collation was changed, bail.
-		// Different collations will affect the ordering of any secondary indexes using this column.
-		existingStr, ok1 := existingSch.GetNonPKCols().GetByIndex(i).TypeInfo.ToSqlType().(sql.StringType)
-		targetStr, ok2 := targetSch.GetNonPKCols().GetByIndex(i).TypeInfo.ToSqlType().(sql.StringType)
-
-		if ok1 && ok2 && !existingStr.Collation().Equals(targetStr.Collation()) {
-			return false, nil
-		}
-	}
-
-	_, valMapping, err = schema.MapSchemaBasedOnTagAndName(targetSch, existingSch)
-	if err != nil {
-		return false, err
-	}
-
-	for i, j := range valMapping {
-		if i == j {
-			continue
-		}
-
-		// If we haven't bailed so far, then these fields were added at the end.
-		// If they are not-null bail.
-		if !targetVD.Types[i].Nullable {
-			return false, nil
-		}
-	}
-
-	return true, nil
 }
 
 func setConflicts(ctx context.Context, cons durable.ConflictIndex, tbl, mergeTbl, ancTbl, tableToUpdate *doltdb.Table) (*doltdb.Table, error) {

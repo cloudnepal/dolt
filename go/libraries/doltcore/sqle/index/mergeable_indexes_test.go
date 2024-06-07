@@ -15,19 +15,17 @@
 package index_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/parse"
 	"github.com/dolthub/go-mysql-server/sql/plan"
+	"github.com/dolthub/go-mysql-server/sql/planbuilder"
 	"github.com/dolthub/go-mysql-server/sql/transform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/typed/noms"
 	"github.com/dolthub/dolt/go/store/types"
@@ -42,7 +40,7 @@ func TestMergeableIndexes(t *testing.T) {
 		t.Skip() // this test is specific to Noms ranges
 	}
 
-	engine, denv, root, db, indexTuples := setupIndexes(t, "test", `INSERT INTO test VALUES
+	engine, sqlCtx, indexTuples := setupIndexes(t, "test", `INSERT INTO test VALUES
 		(-3, NULL, NULL),
 		(-2, NULL, NULL),
 		(-1, NULL, NULL),
@@ -1316,16 +1314,6 @@ func TestMergeableIndexes(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.whereStmt, func(t *testing.T) {
-			ctx := context.Background()
-			sqlCtx := NewTestSQLCtx(ctx)
-			session := dsess.DSessFromSess(sqlCtx.Session)
-			dbState := getDbState(t, db, denv)
-			err := session.AddDB(sqlCtx, dbState)
-			require.NoError(t, err)
-			sqlCtx.SetCurrentDatabase(db.Name())
-			err = session.SetRoot(sqlCtx, db.Name(), root)
-			require.NoError(t, err)
-
 			query := fmt.Sprintf(`SELECT pk FROM test WHERE %s ORDER BY 1`, test.whereStmt)
 
 			finalRanges, err := ReadRangesFromQuery(sqlCtx, engine, query)
@@ -1333,7 +1321,7 @@ func TestMergeableIndexes(t *testing.T) {
 
 			_, iter, err := engine.Query(sqlCtx, query)
 			require.NoError(t, err)
-			res, err := sql.RowIterToRows(sqlCtx, nil, iter)
+			res, err := sql.RowIterToRows(sqlCtx, iter)
 			require.NoError(t, err)
 
 			if assert.Equal(t, len(test.pks), len(res)) {
@@ -1363,7 +1351,7 @@ func TestMergeableIndexes(t *testing.T) {
 					}
 				}
 			} else {
-				t.Log(fmt.Sprintf("%v != %v", test.finalRanges, finalRanges))
+				t.Logf("%v != %v", test.finalRanges, finalRanges)
 			}
 		})
 	}
@@ -1382,7 +1370,7 @@ func TestMergeableIndexesNulls(t *testing.T) {
 		t.Skip() // this test is specific to Noms ranges
 	}
 
-	engine, denv, root, db, indexTuples := setupIndexes(t, "test", `INSERT INTO test VALUES
+	engine, sqlCtx, indexTuples := setupIndexes(t, "test", `INSERT INTO test VALUES
 		(0, 10, 20),
 		(1, 11, 21),
 		(2, NULL, NULL),
@@ -1532,16 +1520,6 @@ func TestMergeableIndexesNulls(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.whereStmt, func(t *testing.T) {
-			ctx := context.Background()
-			sqlCtx := NewTestSQLCtx(ctx)
-			session := dsess.DSessFromSess(sqlCtx.Session)
-			dbState := getDbState(t, db, denv)
-			err := session.AddDB(sqlCtx, dbState)
-			require.NoError(t, err)
-			sqlCtx.SetCurrentDatabase(db.Name())
-			err = session.SetRoot(sqlCtx, db.Name(), root)
-			require.NoError(t, err)
-
 			query := fmt.Sprintf(`SELECT pk FROM test WHERE %s ORDER BY 1`, test.whereStmt)
 
 			finalRanges, err := ReadRangesFromQuery(sqlCtx, engine, query)
@@ -1550,7 +1528,7 @@ func TestMergeableIndexesNulls(t *testing.T) {
 			_, iter, err := engine.Query(sqlCtx, query)
 			require.NoError(t, err)
 
-			res, err := sql.RowIterToRows(sqlCtx, nil, iter)
+			res, err := sql.RowIterToRows(sqlCtx, iter)
 			require.NoError(t, err)
 			if assert.Equal(t, len(test.pks), len(res)) {
 				for i, pk := range test.pks {
@@ -1579,14 +1557,15 @@ func TestMergeableIndexesNulls(t *testing.T) {
 					}
 				}
 			} else {
-				t.Log(fmt.Sprintf("%v != %v", test.finalRanges, finalRanges))
+				t.Logf("%v != %v", test.finalRanges, finalRanges)
 			}
 		})
 	}
 }
 
 func ReadRangesFromQuery(ctx *sql.Context, eng *sqle.Engine, query string) ([]*noms.ReadRange, error) {
-	parsed, err := parse.Parse(ctx, query)
+	binder := planbuilder.New(ctx, eng.Analyzer.Catalog, eng.Parser)
+	parsed, _, _, err := binder.Parse(query, false)
 	if err != nil {
 		return nil, err
 	}

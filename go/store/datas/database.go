@@ -60,7 +60,17 @@ type Database interface {
 	// datasetID in the above Datasets Map.
 	GetDataset(ctx context.Context, datasetID string) (Dataset, error)
 
-	GetDatasetsByRootHash(ctx context.Context, rootHash hash.Hash) (DatasetsMap, error)
+	// DatasetsByRootHash returns all datasets as of the root hash given
+	DatasetsByRootHash(ctx context.Context, rootHash hash.Hash) (DatasetsMap, error)
+
+	// GetDatasetByRootHash returns a Dataset struct containing the mapping of datasetId in the Datasets map as it
+	// existed at the root hash given.
+	GetDatasetByRootHash(ctx context.Context, datasetID string, rootHash hash.Hash) (Dataset, error)
+
+	// BuildNewCommit creates a new Commit struct for the provided dataset,
+	// but does not modify the dataset. This allows the commit to be inspected
+	// if necessary before any update is performed.
+	BuildNewCommit(ctx context.Context, ds Dataset, v types.Value, opts CommitOptions) (*Commit, error)
 
 	// Commit updates the Commit that ds.ID() in this database points at. All
 	// Values that have been written to this Database are guaranteed to be
@@ -76,6 +86,10 @@ type Database interface {
 	// an 'ErrMergeNeeded' error.
 	Commit(ctx context.Context, ds Dataset, v types.Value, opts CommitOptions) (Dataset, error)
 
+	// WriteCommit has the same behavior as Commit but accepts an already-constructed Commit
+	// instead of constructing one from a Value and CommitOptions
+	WriteCommit(ctx context.Context, ds Dataset, commit *Commit) (Dataset, error)
+
 	// Tag stores an immutable reference to a Commit. It takes a Hash to
 	// the Commit and a Dataset whose head must be nil (ie a newly created
 	// Dataset).  The new Tag struct is constructed pointing at
@@ -88,6 +102,9 @@ type Database interface {
 	// whether add or remove a stash actions have been performed. This function does not perform any actions
 	// on the stash list itself.
 	UpdateStashList(ctx context.Context, ds Dataset, stashListAddr hash.Hash) (Dataset, error)
+
+	// SetStatsRef updates the singleton statisics ref for this database.
+	SetStatsRef(context.Context, Dataset, hash.Hash) (Dataset, error)
 
 	// UpdateWorkingSet updates the dataset given, setting its value to a new
 	// working set value object with the ref and meta given. If the dataset given
@@ -107,11 +124,13 @@ type Database interface {
 
 	// Delete removes the Dataset named ds.ID() from the map at the root of
 	// the Database. If the Dataset is already not present in the map,
-	// returns success.
+	// returns success. If a workinset path is provided, the Delete will also verify that the working set doesn't
+	// have changes which will be lost by the Delete before deleting it as well. If an empty working set path is
+	// provided, then no changes to the working set will be made.
 	//
 	// If the update cannot be performed, e.g., because of a conflict,
 	// Delete returns an 'ErrMergeNeeded' error.
-	Delete(ctx context.Context, ds Dataset) (Dataset, error)
+	Delete(ctx context.Context, ds Dataset, workingSetPath string) (Dataset, error)
 
 	// SetHead ignores any lineage constraints (e.g. the current head being
 	// an ancestor of the new Commit) and force-sets a mapping from
@@ -122,14 +141,18 @@ type Database interface {
 	// All values that have been written to this Database are guaranteed to
 	// be persistent after SetHead(). If the update cannot be performed,
 	// error will be non-nil.
-	SetHead(ctx context.Context, ds Dataset, newHeadAddr hash.Hash) (Dataset, error)
+	// The workingSetPath is the path to the working set that should be used for updating the working set. If one
+	// is not provided, no working set update will be performed.
+	SetHead(ctx context.Context, ds Dataset, newHeadAddr hash.Hash, workingSetPath string) (Dataset, error)
 
 	// FastForward takes a types.Ref to a Commit object and makes it the new
 	// Head of ds iff it is a descendant of the current Head. Intended to be
 	// used e.g. after a call to Pull(). If the update cannot be performed,
 	// e.g., because another process moved the current Head out from under
 	// you, err will be non-nil.
-	FastForward(ctx context.Context, ds Dataset, newHeadAddr hash.Hash) (Dataset, error)
+	// The workingSetPath is the path to the working set that should be used for updating the working set. If one
+	// is not provided, no working set update will be performed.
+	FastForward(ctx context.Context, ds Dataset, newHeadAddr hash.Hash, workingSetPath string) (Dataset, error)
 
 	// Stats may return some kind of struct that reports statistics about the
 	// ChunkStore that backs this Database instance. The type is
@@ -142,6 +165,11 @@ type Database interface {
 	StatsSummary() string
 
 	Format() *types.NomsBinFormat
+
+	// PersistGhostCommitIDs persists the given set of ghost commit IDs to the storage layer of the database. Ghost
+	// commits are commits which are real but have not been replicated to this instance of the database. Currently,
+	// it is only appropriate to use this method during a shallow clone operation.
+	PersistGhostCommitIDs(ctx context.Context, ghosts hash.HashSet) error
 
 	// chunkStore returns the ChunkStore used to read and write
 	// groups of values to the database efficiently. This interface is a low-

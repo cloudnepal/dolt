@@ -32,15 +32,18 @@ import (
 )
 
 var _ doltdb.CommitHook = (*commithook)(nil)
+var _ doltdb.NotifyWaitFailedCommitHook = (*commithook)(nil)
 
 type commithook struct {
 	rootLgr              *logrus.Entry
 	lgr                  atomic.Value // *logrus.Entry
 	remotename           string
+	remoteurl            string
 	dbname               string
 	mu                   sync.Mutex
 	wg                   sync.WaitGroup
 	cond                 *sync.Cond
+	shutdown             atomic.Bool
 	nextHead             hash.Hash
 	lastPushedHead       hash.Hash
 	nextPushAttempt      time.Time
@@ -52,6 +55,15 @@ type commithook struct {
 	// waitNotify is set by controller when it needs to track whether the
 	// commithooks are caught up with replicating to the standby.
 	waitNotify func()
+
+	// |mu| must be held for all accesses.
+	progressNotifier ProgressNotifier
+
+	// If this is true, the waitF returned by Execute() will fast fail if
+	// we are not already caught up, instead of blocking on a successCh
+	// actually indicated we are caught up. This is set to by a call to
+	// NotifyWaitFailed(), an optional interface on CommitHook.
+	fastFailReplicationWait bool
 
 	role Role
 
@@ -72,11 +84,12 @@ var errDestDBRootHashMoved error = errors.New("cluster/commithook: standby repli
 const logFieldThread = "thread"
 const logFieldRole = "role"
 
-func newCommitHook(lgr *logrus.Logger, remotename, dbname string, role Role, destDBF func(context.Context) (*doltdb.DoltDB, error), srcDB *doltdb.DoltDB, tempDir string) *commithook {
+func newCommitHook(lgr *logrus.Logger, remotename, remoteurl, dbname string, role Role, destDBF func(context.Context) (*doltdb.DoltDB, error), srcDB *doltdb.DoltDB, tempDir string) *commithook {
 	var ret commithook
 	ret.rootLgr = lgr.WithField(logFieldThread, "Standby Replication - "+dbname+" to "+remotename)
 	ret.lgr.Store(ret.rootLgr.WithField(logFieldRole, string(role)))
 	ret.remotename = remotename
+	ret.remoteurl = remoteurl
 	ret.dbname = dbname
 	ret.role = role
 	ret.destDBF = destDBF
@@ -98,7 +111,13 @@ func (h *commithook) run(ctx context.Context) {
 	go h.tick(ctx)
 	<-ctx.Done()
 	h.logger().Tracef("cluster/commithook: background thread: requested shutdown, signaling replication thread.")
+	h.mu.Lock()
+	if h.cancelReplicate != nil {
+		h.cancelReplicate()
+		h.cancelReplicate = nil
+	}
 	h.cond.Signal()
+	h.mu.Unlock()
 	h.wg.Wait()
 	h.logger().Tracef("cluster/commithook: background thread: completed.")
 }
@@ -108,7 +127,8 @@ func (h *commithook) replicate(ctx context.Context) {
 	defer h.logger().Tracef("cluster/commithook: background thread: replicate: shutdown.")
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for {
+	shouldHeartbeat := false
+	for !h.shutdown.Load() {
 		lgr := h.logger()
 		// Shutdown for context canceled.
 		if ctx.Err() != nil {
@@ -138,10 +158,46 @@ func (h *commithook) replicate(ctx context.Context) {
 			h.nextHeadIncomingTime = time.Now()
 		} else if h.shouldReplicate() {
 			h.attemptReplicate(ctx)
+			shouldHeartbeat = false
 		} else {
 			lgr.Tracef("cluster/commithook: background thread: waiting for signal.")
 			if h.waitNotify != nil {
 				h.waitNotify()
+			}
+			caughtUp := h.isCaughtUp()
+			if caughtUp {
+				h.fastFailReplicationWait = false
+
+				// If we ABA on h.nextHead, so that it gets set
+				// to one value, then another, then back to the
+				// first, then the setter for B can make an
+				// outstanding wait while we are replicating
+				// the first set to A. We can be back to
+				// nextHead == A by the time we complete
+				// replicating the first A and we will have the
+				// outstanding waiter for the work for B but we
+				// will be fully quiesced. We make sure to
+				// notify B of success here.
+				if h.progressNotifier.HasWaiters() {
+					a := h.progressNotifier.BeginAttempt()
+					h.progressNotifier.RecordSuccess(a)
+				}
+			}
+			if shouldHeartbeat {
+				h.attemptHeartbeat(ctx)
+
+				// attemptHeartbeat releases |h.mu| for part of
+				// its work. We could miss a shutdown signal
+				// here, but the shutdown signal is always
+				// delivered after the shared Context is
+				// canceled. We check the context again here so
+				// that we don't fail to shutdown if we miss a
+				// shutdown signal.
+				if ctx.Err() != nil {
+					continue
+				}
+			} else if caughtUp {
+				shouldHeartbeat = true
 			}
 			h.cond.Wait()
 			lgr.Tracef("cluster/commithook: background thread: woken up.")
@@ -164,18 +220,46 @@ func (h *commithook) isCaughtUp() bool {
 	if h.role != RolePrimary {
 		return true
 	}
+	if h.nextHead == (hash.Hash{}) {
+		return false
+	}
 	return h.nextHead == h.lastPushedHead
-}
-
-func (h *commithook) isCaughtUpLocking() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.isCaughtUp()
 }
 
 // called with h.mu locked.
 func (h *commithook) primaryNeedsInit() bool {
 	return h.role == RolePrimary && h.nextHead == (hash.Hash{})
+}
+
+// Called by the replicate thread to periodically heartbeat liveness to a
+// standby if we are a primary. These heartbeats are best effort and currently
+// do not affect the data plane much.
+//
+// preconditions: h.mu is locked and shouldReplicate() returned false.
+func (h *commithook) attemptHeartbeat(ctx context.Context) {
+	if h.role != RolePrimary {
+		return
+	}
+	head := h.lastPushedHead
+	if head.IsEmpty() {
+		return
+	}
+	destDB := h.destDB
+	if destDB == nil {
+		return
+	}
+	ctx, h.cancelReplicate = context.WithTimeout(ctx, 5*time.Second)
+	defer func() {
+		if h.cancelReplicate != nil {
+			h.cancelReplicate()
+		}
+		h.cancelReplicate = nil
+	}()
+	h.mu.Unlock()
+	datasDB := doltdb.HackDatasDatabaseFromDoltDB(destDB)
+	cs := datas.ChunkStoreFromDatabase(datasDB)
+	cs.Commit(ctx, head, head)
+	h.mu.Lock()
 }
 
 // Called by the replicate thread to push the nextHead to the destDB and set
@@ -195,6 +279,8 @@ func (h *commithook) attemptReplicate(ctx context.Context) {
 		}
 		h.cancelReplicate = nil
 	}()
+	attempt := h.progressNotifier.BeginAttempt()
+	defer h.progressNotifier.RecordFailure(attempt)
 	h.mu.Unlock()
 
 	if destDB == nil {
@@ -220,7 +306,7 @@ func (h *commithook) attemptReplicate(ctx context.Context) {
 	}
 
 	lgr.Tracef("cluster/commithook: pushing chunks for root hash %v to destDB", toPush.String())
-	err := destDB.PullChunks(ctx, h.tempDir, h.srcDB, []hash.Hash{toPush}, nil)
+	err := destDB.PullChunks(ctx, h.tempDir, h.srcDB, []hash.Hash{toPush}, nil, nil)
 	if err == nil {
 		lgr.Tracef("cluster/commithook: successfully pushed chunks, setting root")
 		datasDB := doltdb.HackDatasDatabaseFromDoltDB(destDB)
@@ -245,6 +331,7 @@ func (h *commithook) attemptReplicate(ctx context.Context) {
 			h.lastPushedHead = toPush
 			h.lastSuccess = incomingTime
 			h.nextPushAttempt = time.Time{}
+			h.progressNotifier.RecordSuccess(attempt)
 		} else {
 			h.currentError = new(string)
 			*h.currentError = fmt.Sprintf("failed to commit chunks on destDB: %v", err)
@@ -298,7 +385,7 @@ func (h *commithook) tick(ctx context.Context) {
 	defer h.wg.Done()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	for {
+	for !h.shutdown.Load() {
 		select {
 		case <-ctx.Done():
 			return
@@ -306,6 +393,17 @@ func (h *commithook) tick(ctx context.Context) {
 			h.cond.Signal()
 		}
 	}
+}
+
+func (h *commithook) databaseWasDropped() {
+	h.shutdown.Store(true)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cancelReplicate != nil {
+		h.cancelReplicate()
+		h.cancelReplicate = nil
+	}
+	h.cond.Signal()
 }
 
 func (h *commithook) recordSuccessfulRemoteSrvCommit() {
@@ -340,31 +438,38 @@ func (h *commithook) setRole(role Role) {
 	h.cond.Signal()
 }
 
-func (h *commithook) setWaitNotify(f func()) {
+func (h *commithook) setWaitNotify(f func()) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if f != nil {
+		if h.waitNotify != nil {
+			return false
+		}
+		f()
+	}
 	h.waitNotify = f
+	return true
 }
 
 var errDetectedBrokenConfigStr = "error: more than one server was configured as primary in the same epoch. this server has stopped accepting writes. choose a primary in the cluster and call dolt_assume_cluster_role() on servers in the cluster to start replication at a higher epoch"
 
 // Execute on this commithook updates the target root hash we're attempting to
 // replicate and wakes the replication thread.
-func (h *commithook) Execute(ctx context.Context, ds datas.Dataset, db datas.Database) error {
+func (h *commithook) Execute(ctx context.Context, ds datas.Dataset, db datas.Database) (func(context.Context) error, error) {
 	lgr := h.logger()
-	lgr.Warnf("cluster/commithook: Execute called post commit")
+	lgr.Tracef("cluster/commithook: Execute called post commit")
 	cs := datas.ChunkStoreFromDatabase(db)
 	root, err := cs.Root(ctx)
 	if err != nil {
-		lgr.Warnf("cluster/commithook: Execute: error retrieving local database root: %v", err)
-		return err
+		lgr.Errorf("cluster/commithook: Execute: error retrieving local database root: %v", err)
+		return nil, err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	lgr = h.logger()
 	if h.role != RolePrimary {
 		lgr.Warnf("cluster/commithook received commit callback for a commit on %s, but we are not role primary; not replicating the commit, which is likely to be lost.", ds.ID())
-		return nil
+		return nil, nil
 	}
 	if root != h.nextHead {
 		lgr.Tracef("signaling replication thread to push new head: %v", root.String())
@@ -373,7 +478,23 @@ func (h *commithook) Execute(ctx context.Context, ds datas.Dataset, db datas.Dat
 		h.nextPushAttempt = time.Time{}
 		h.cond.Signal()
 	}
-	return nil
+	var waitF func(context.Context) error
+	if !h.isCaughtUp() {
+		if h.fastFailReplicationWait {
+			waitF = func(ctx context.Context) error {
+				return fmt.Errorf("circuit breaker for replication to %s/%s is open. this commit did not necessarily replicate successfully.", h.remotename, h.dbname)
+			}
+		} else {
+			waitF = h.progressNotifier.Wait()
+		}
+	}
+	return waitF, nil
+}
+
+func (h *commithook) NotifyWaitFailed() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.fastFailReplicationWait = true
 }
 
 func (h *commithook) HandleError(ctx context.Context, err error) error {

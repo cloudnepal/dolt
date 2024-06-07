@@ -43,6 +43,20 @@ func init() {
 	writeEndpoints["/dolt.services.remotesapi.v1alpha1.ChunkStoreService/GetUploadLocations"] = true
 }
 
+func isLikelyServerResponse(err error) bool {
+	code := status.Code(err)
+	switch code {
+	case codes.Unavailable:
+		fallthrough
+	case codes.DeadlineExceeded:
+		fallthrough
+	case codes.Canceled:
+		return false
+	default:
+		return true
+	}
+}
+
 // clientinterceptor is installed as a Unary and Stream client interceptor on
 // the client conns that are used to communicate with standby remotes. The
 // cluster.Controller sets this server's current Role and role epoch on the
@@ -83,15 +97,15 @@ func (ci *clientinterceptor) Stream() grpc.StreamClientInterceptor {
 		role, epoch := ci.getRole()
 		ci.lgr.Tracef("cluster: clientinterceptor: processing request to %s, role %s", method, string(role))
 		if role == RoleStandby {
-			return nil, status.Error(codes.FailedPrecondition, "this server is a standby and is not currently replicating to its standby")
+			return nil, status.Error(codes.FailedPrecondition, "cluster: clientinterceptor: this server is a standby and is not currently replicating to its standby")
 		}
 		if role == RoleDetectedBrokenConfig {
-			return nil, status.Error(codes.FailedPrecondition, "this server is in detected_broken_config and is not currently replicating to its standby")
+			return nil, status.Error(codes.FailedPrecondition, "cluster: clientinterceptor: this server is in detected_broken_config and is not currently replicating to its standby")
 		}
 		ctx = metadata.AppendToOutgoingContext(ctx, clusterRoleHeader, string(role), clusterRoleEpochHeader, strconv.Itoa(epoch))
 		var header metadata.MD
 		stream, err := streamer(ctx, desc, cc, method, append(opts, grpc.Header(&header))...)
-		ci.handleResponseHeaders(header, role, epoch)
+		ci.handleResponseHeaders(header, err)
 		return stream, err
 	}
 }
@@ -101,40 +115,50 @@ func (ci *clientinterceptor) Unary() grpc.UnaryClientInterceptor {
 		role, epoch := ci.getRole()
 		ci.lgr.Tracef("cluster: clientinterceptor: processing request to %s, role %s", method, string(role))
 		if role == RoleStandby {
-			return status.Error(codes.FailedPrecondition, "this server is a standby and is not currently replicating to its standby")
+			return status.Error(codes.FailedPrecondition, "cluster: clientinterceptor: this server is a standby and is not currently replicating to its standby")
 		}
 		if role == RoleDetectedBrokenConfig {
-			return status.Error(codes.FailedPrecondition, "this server is in detected_broken_config and is not currently replicating to its standby")
+			return status.Error(codes.FailedPrecondition, "cluster: clientinterceptor: this server is in detected_broken_config and is not currently replicating to its standby")
 		}
 		ctx = metadata.AppendToOutgoingContext(ctx, clusterRoleHeader, string(role), clusterRoleEpochHeader, strconv.Itoa(epoch))
 		var header metadata.MD
 		err := invoker(ctx, method, req, reply, cc, append(opts, grpc.Header(&header))...)
-		ci.handleResponseHeaders(header, role, epoch)
+		ci.handleResponseHeaders(header, err)
 		return err
 	}
 }
 
-func (ci *clientinterceptor) handleResponseHeaders(header metadata.MD, role Role, epoch int) {
-	epochs := header.Get(clusterRoleEpochHeader)
-	roles := header.Get(clusterRoleHeader)
-	if len(epochs) > 0 && len(roles) > 0 {
-		if respepoch, err := strconv.Atoi(epochs[0]); err == nil {
-			if roles[0] == string(RolePrimary) {
-				if respepoch == epoch {
-					ci.lgr.Errorf("cluster: clientinterceptor: this server and the server replicating to it are both primary at the same epoch. force transitioning to detected_broken_config.")
-					ci.roleSetter(string(RoleDetectedBrokenConfig), respepoch)
-				} else if respepoch > epoch {
-					// The server we replicate to thinks it is the primary at a higher epoch than us...
-					ci.lgr.Warnf("cluster: clientinterceptor: this server is primary at epoch %d. the server replicating to it is primary at epoch %d. force transitioning to standby.", epoch, respepoch)
-					ci.roleSetter(string(RoleStandby), respepoch)
-				}
-			} else if roles[0] == string(RoleDetectedBrokenConfig) && respepoch >= epoch {
-				ci.lgr.Errorf("cluster: clientinterceptor: this server learned from its standby that the standby is in detected_broken_config. force transitioning to detected_broken_config.")
-				ci.roleSetter(string(RoleDetectedBrokenConfig), respepoch)
-			}
-		}
+func (ci *clientinterceptor) handleResponseHeaders(header metadata.MD, err error) {
+	role, epoch := ci.getRole()
+	if role != RolePrimary {
+		// By the time we process this response, we were no longer a primary.
+		return
 	}
-	ci.lgr.Warnf("cluster: clientinterceptor: response was missing role and epoch metadata")
+	respEpochs := header.Get(clusterRoleEpochHeader)
+	respRoles := header.Get(clusterRoleHeader)
+	if len(respEpochs) > 0 && len(respRoles) > 0 {
+		respRole := respRoles[0]
+		respEpoch, err := strconv.Atoi(respEpochs[0])
+		if err == nil {
+			if respRole == string(RolePrimary) {
+				if respEpoch == epoch {
+					ci.lgr.Errorf("cluster: clientinterceptor: this server and the server replicating to it are both primary at the same epoch. force transitioning to detected_broken_config.")
+					ci.roleSetter(string(RoleDetectedBrokenConfig), respEpoch)
+				} else if respEpoch > epoch {
+					// The server we replicate to thinks it is the primary at a higher epoch than us...
+					ci.lgr.Warnf("cluster: clientinterceptor: this server is primary at epoch %d. a server it attempted to replicate to is primary at epoch %d. force transitioning to standby.", epoch, respEpoch)
+					ci.roleSetter(string(RoleStandby), respEpoch)
+				}
+			} else if respRole == string(RoleDetectedBrokenConfig) && respEpoch >= epoch {
+				ci.lgr.Errorf("cluster: clientinterceptor: this server learned from its standby that the standby is in detected_broken_config at the same or higher epoch. force transitioning to detected_broken_config.")
+				ci.roleSetter(string(RoleDetectedBrokenConfig), respEpoch)
+			}
+		} else {
+			ci.lgr.Errorf("cluster: clientinterceptor: failed to parse epoch in response header; something is wrong: %v", err)
+		}
+	} else if isLikelyServerResponse(err) {
+		ci.lgr.Warnf("cluster: clientinterceptor: response was missing role and epoch metadata")
+	}
 }
 
 func (ci *clientinterceptor) Options() []grpc.DialOption {
@@ -180,12 +204,11 @@ type serverinterceptor struct {
 
 func (si *serverinterceptor) Stream() grpc.StreamServerInterceptor {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		fromStandby := false
+		fromClusterMember := false
 		if md, ok := metadata.FromIncomingContext(ss.Context()); ok {
-			role, epoch := si.getRole()
-			fromStandby = si.handleRequestHeaders(md, role, epoch)
+			fromClusterMember = si.handleRequestHeaders(md)
 		}
-		if fromStandby {
+		if fromClusterMember {
 			if err := si.authenticate(ss.Context()); err != nil {
 				return err
 			}
@@ -199,7 +222,7 @@ func (si *serverinterceptor) Stream() grpc.StreamServerInterceptor {
 				return status.Error(codes.FailedPrecondition, "this server is a primary and is not currently accepting replication")
 			}
 			if role == RoleDetectedBrokenConfig {
-				// As a primary, we do not accept replication requests.
+				// In detected_brokne_config we do not accept replication requests.
 				return status.Error(codes.FailedPrecondition, "this server is currently in detected_broken_config and is not currently accepting replication")
 			}
 			return handler(srv, ss)
@@ -213,12 +236,11 @@ func (si *serverinterceptor) Stream() grpc.StreamServerInterceptor {
 
 func (si *serverinterceptor) Unary() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		fromStandby := false
+		fromClusterMember := false
 		if md, ok := metadata.FromIncomingContext(ctx); ok {
-			role, epoch := si.getRole()
-			fromStandby = si.handleRequestHeaders(md, role, epoch)
+			fromClusterMember = si.handleRequestHeaders(md)
 		}
-		if fromStandby {
+		if fromClusterMember {
 			if err := si.authenticate(ctx); err != nil {
 				return nil, err
 			}
@@ -232,7 +254,7 @@ func (si *serverinterceptor) Unary() grpc.UnaryServerInterceptor {
 				return nil, status.Error(codes.FailedPrecondition, "this server is a primary and is not currently accepting replication")
 			}
 			if role == RoleDetectedBrokenConfig {
-				// As a primary, we do not accept replication requests.
+				// In detected_broken_config we do not accept replication requests.
 				return nil, status.Error(codes.FailedPrecondition, "this server is currently in detected_broken_config and is not currently accepting replication")
 			}
 			return handler(ctx, req)
@@ -244,13 +266,14 @@ func (si *serverinterceptor) Unary() grpc.UnaryServerInterceptor {
 	}
 }
 
-func (si *serverinterceptor) handleRequestHeaders(header metadata.MD, role Role, epoch int) bool {
+func (si *serverinterceptor) handleRequestHeaders(header metadata.MD) bool {
+	role, epoch := si.getRole()
 	epochs := header.Get(clusterRoleEpochHeader)
 	roles := header.Get(clusterRoleHeader)
 	if len(epochs) > 0 && len(roles) > 0 {
-		if roles[0] == string(RolePrimary) && role == RolePrimary {
+		if roles[0] == string(RolePrimary) {
 			if reqepoch, err := strconv.Atoi(epochs[0]); err == nil {
-				if reqepoch == epoch {
+				if reqepoch == epoch && role == RolePrimary {
 					// Misconfiguration in the cluster means this
 					// server and its standby are marked as Primary
 					// at the same epoch. We will become standby
@@ -259,13 +282,17 @@ func (si *serverinterceptor) handleRequestHeaders(header metadata.MD, role Role,
 					si.lgr.Errorf("cluster: serverinterceptor: this server and its standby replica are both primary at the same epoch. force transitioning to detected_broken_config.")
 					si.roleSetter(string(RoleDetectedBrokenConfig), reqepoch)
 				} else if reqepoch > epoch {
-					// The client replicating to us thinks it is the primary at a higher epoch than us.
-					si.lgr.Warnf("cluster: serverinterceptor: this server is primary at epoch %d. the server replicating to it is primary at epoch %d. force transitioning to standby.", epoch, reqepoch)
+					if role == RolePrimary {
+						// The client replicating to us thinks it is the primary at a higher epoch than us.
+						si.lgr.Warnf("cluster: serverinterceptor: this server is primary at epoch %d. the server replicating to it is primary at epoch %d. force transitioning to standby.", epoch, reqepoch)
+					} else if role == RoleDetectedBrokenConfig {
+						si.lgr.Warnf("cluster: serverinterceptor: this server is detected_broken_config at epoch %d. the server replicating to it is primary at epoch %d. transitioning to standby.", epoch, reqepoch)
+					}
 					si.roleSetter(string(RoleStandby), reqepoch)
 				}
 			}
 		}
-		// returns true if the request was from a standby replica, false otherwise
+		// returns true if the request was from a cluster replica, false otherwise
 		return true
 	}
 	return false

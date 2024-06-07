@@ -33,6 +33,7 @@ import (
 )
 
 var GRPCDialProviderParam = "__DOLT__grpc_dial_provider"
+var GRPCUsernameAuthParam = "__DOLT__grpc_username"
 
 type GRPCRemoteConfig struct {
 	Endpoint    string
@@ -100,16 +101,23 @@ func (fact DoltRemoteFactory) CreateDB(ctx context.Context, nbf *types.NomsBinFo
 var NoCachingParameter = "__dolt__NO_CACHING"
 
 func (fact DoltRemoteFactory) newChunkStore(ctx context.Context, nbf *types.NomsBinFormat, urlObj *url.URL, params map[string]interface{}, dp GRPCDialProvider) (chunks.ChunkStore, error) {
+	var user string
+	wsValidate := false
+	if userParam := params[GRPCUsernameAuthParam]; userParam != nil {
+		user = userParam.(string)
+		wsValidate = true
+	}
 	cfg, err := dp.GetGRPCDialParams(grpcendpoint.Config{
-		Endpoint:     urlObj.Host,
-		Insecure:     fact.insecure,
-		WithEnvCreds: true,
+		Endpoint:           urlObj.Host,
+		Insecure:           fact.insecure,
+		UserIdForOsEnvAuth: user,
+		WithEnvCreds:       true,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	opts := append(cfg.DialOptions, grpc.WithChainUnaryInterceptor(remotestorage.EventsUnaryClientInterceptor(events.GlobalCollector)))
+	opts := append(cfg.DialOptions, grpc.WithChainUnaryInterceptor(remotestorage.EventsUnaryClientInterceptor(events.GlobalCollector())))
 	opts = append(opts, grpc.WithChainUnaryInterceptor(remotestorage.RetryingUnaryClientInterceptor))
 
 	conn, err := grpc.Dial(cfg.Endpoint, opts...)
@@ -118,15 +126,17 @@ func (fact DoltRemoteFactory) newChunkStore(ctx context.Context, nbf *types.Noms
 	}
 
 	csClient := remotesapi.NewChunkStoreServiceClient(conn)
-	cs, err := remotestorage.NewDoltChunkStoreFromPath(ctx, nbf, urlObj.Path, urlObj.Host, csClient)
+	cs, err := remotestorage.NewDoltChunkStoreFromPath(ctx, nbf, urlObj.Path, urlObj.Host, wsValidate, csClient)
 	if err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("could not access dolt url '%s': %w", urlObj.String(), err)
 	}
 	cs = cs.WithHTTPFetcher(cfg.HTTPFetcher)
+	cs.SetFinalizer(conn.Close)
 
 	if _, ok := params[NoCachingParameter]; ok {
 		cs = cs.WithNoopChunkCache()
 	}
 
-	return cs, err
+	return cs, nil
 }

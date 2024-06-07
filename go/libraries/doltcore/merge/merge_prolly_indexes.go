@@ -18,6 +18,8 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/dolthub/go-mysql-server/sql"
+
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
@@ -28,29 +30,21 @@ import (
 	"github.com/dolthub/dolt/go/store/val"
 )
 
-type confVals struct {
-	key      val.Tuple
-	ourVal   val.Tuple
-	theirVal val.Tuple
-	baseVal  val.Tuple
-}
-
 // mergeProllySecondaryIndexes merges the secondary indexes of the given |tbl|,
 // |mergeTbl|, and |ancTbl|. It stores the merged indexes into |tableToUpdate|
-// and returns its updated value.
+// and returns its updated value. If |forceIndexRebuild| is true, then all indexes
+// will be rebuilt from the table's data, instead of relying on incremental
+// changes from the other side of the merge to have been merged in before this
+// function was called. This is safer, but less efficient.
 func mergeProllySecondaryIndexes(
-	ctx context.Context,
-	tm TableMerger,
+	ctx *sql.Context,
+	tm *TableMerger,
 	leftSet, rightSet durable.IndexSet,
 	finalSch schema.Schema,
 	finalRows durable.Index,
 	artifacts *prolly.ArtifactsEditor,
+	forceIndexRebuild bool,
 ) (durable.IndexSet, error) {
-
-	ancSet, err := tm.ancTbl.GetIndexSet(ctx)
-	if err != nil {
-		return nil, err
-	}
 	mergedIndexSet, err := durable.NewIndexSet(ctx, tm.vrw, tm.ns)
 	if err != nil {
 		return nil, err
@@ -61,7 +55,7 @@ func mergeProllySecondaryIndexes(
 	tryGetIdx := func(sch schema.Schema, iS durable.IndexSet, indexName string) (prolly.Map, bool, error) {
 		ok := sch.Indexes().Contains(indexName)
 		if ok {
-			idx, err := iS.GetIndex(ctx, sch, indexName)
+			idx, err := iS.GetIndex(ctx, sch, nil, indexName)
 			if err != nil {
 				return prolly.Map{}, false, err
 			}
@@ -76,22 +70,24 @@ func mergeProllySecondaryIndexes(
 
 	// Schema merge can introduce new constraints/uniqueness checks.
 	for _, index := range finalSch.Indexes().AllIndexes() {
-
 		left, rootOK, err := tryGetIdx(tm.leftSch, leftSet, index.Name())
 		if err != nil {
 			return nil, err
 		}
-		_, mergeOK, err := tryGetIdx(tm.rightSch, rightSet, index.Name())
-		if err != nil {
-			return nil, err
-		}
-		_, ancOK, err := tryGetIdx(tm.ancSch, ancSet, index.Name())
-		if err != nil {
-			return nil, err
+
+		// If the left (destination) side of the merge doesn't have an index it is supposed to have,
+		// then a full rebuild for this index is required.
+		rebuildRequired := !rootOK
+
+		// If the index existed on the left (destination) side, before this merge, and differs
+		// from the final version we need for the merged schema, then it needs to be rebuilt.
+		leftIndexDefinition := tm.leftSch.Indexes().GetByName(index.Name())
+		if leftIndexDefinition != nil && leftIndexDefinition.Equals(index) == false {
+			rebuildRequired = true
 		}
 
 		mergedIndex, err := func() (durable.Index, error) {
-			if !rootOK || !mergeOK || !ancOK {
+			if forceIndexRebuild || rebuildRequired {
 				return buildIndex(ctx, tm.vrw, tm.ns, finalSch, index, mergedM, artifacts, tm.rightSrc, tm.name)
 			}
 			return durable.IndexFromProllyMap(left), nil
@@ -109,7 +105,17 @@ func mergeProllySecondaryIndexes(
 	return mergedIndexSet, nil
 }
 
-func buildIndex(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, postMergeSchema schema.Schema, index schema.Index, m prolly.Map, artEditor *prolly.ArtifactsEditor, theirRootIsh doltdb.Rootish, tblName string) (durable.Index, error) {
+func buildIndex(
+	ctx *sql.Context,
+	vrw types.ValueReadWriter,
+	ns tree.NodeStore,
+	postMergeSchema schema.Schema,
+	index schema.Index,
+	m prolly.Map,
+	artEditor *prolly.ArtifactsEditor,
+	theirRootIsh doltdb.Rootish,
+	tblName string,
+) (durable.Index, error) {
 	if index.IsUnique() {
 		meta, err := makeUniqViolMeta(postMergeSchema, index)
 		if err != nil {
@@ -125,33 +131,26 @@ func buildIndex(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStor
 
 		pkMapping := ordinalMappingFromIndex(index)
 
-		mergedMap, err := creation.BuildUniqueProllyIndex(
-			ctx,
-			vrw,
-			ns,
-			postMergeSchema,
-			index,
-			m,
-			func(ctx context.Context, existingKey, newKey val.Tuple) (err error) {
-				eK := getPKFromSecondaryKey(kb, p, pkMapping, existingKey)
-				nK := getPKFromSecondaryKey(kb, p, pkMapping, newKey)
-				err = replaceUniqueKeyViolation(ctx, artEditor, m, eK, kd, theirRootIsh, vInfo, tblName)
-				if err != nil {
-					return err
-				}
-				err = replaceUniqueKeyViolation(ctx, artEditor, m, nK, kd, theirRootIsh, vInfo, tblName)
-				if err != nil {
-					return err
-				}
-				return nil
-			})
+		mergedMap, err := creation.BuildUniqueProllyIndex(ctx, vrw, ns, postMergeSchema, tblName, index, m, func(ctx context.Context, existingKey, newKey val.Tuple) (err error) {
+			eK := getPKFromSecondaryKey(kb, p, pkMapping, existingKey)
+			nK := getPKFromSecondaryKey(kb, p, pkMapping, newKey)
+			err = replaceUniqueKeyViolation(ctx, artEditor, m, eK, kd, theirRootIsh, vInfo, tblName)
+			if err != nil {
+				return err
+			}
+			err = replaceUniqueKeyViolation(ctx, artEditor, m, nK, kd, theirRootIsh, vInfo, tblName)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
 		return mergedMap, nil
 	}
 
-	mergedIndex, err := creation.BuildSecondaryProllyIndex(ctx, vrw, ns, postMergeSchema, index, m)
+	mergedIndex, err := creation.BuildSecondaryProllyIndex(ctx, vrw, ns, postMergeSchema, tblName, index, m)
 	if err != nil {
 		return nil, err
 	}
@@ -179,8 +178,4 @@ func applyEdit(ctx context.Context, idx MutableSecondaryIdx, key, from, to val.T
 		}
 	}
 	return nil
-}
-
-func emptyDiff(d tree.Diff) bool {
-	return d.Key == nil
 }

@@ -59,7 +59,7 @@ type DoltConflictsCatFunc struct {
 
 func getProllyRowMaps(ctx *sql.Context, vrw types.ValueReadWriter, ns tree.NodeStore, hash hash.Hash, tblName string) (prolly.Map, error) {
 	rootVal, err := doltdb.LoadRootValueFromRootIshAddr(ctx, vrw, ns, hash)
-	tbl, ok, err := rootVal.GetTable(ctx, tblName)
+	tbl, ok, err := rootVal.GetTable(ctx, doltdb.TableName{Name: tblName})
 	if err != nil {
 		return prolly.Map{}, err
 	}
@@ -101,7 +101,7 @@ func resolveProllyConflicts(ctx *sql.Context, tbl *doltdb.Table, tblName string,
 	if err != nil {
 		return nil, err
 	}
-	mutIdxs, err := merge.GetMutableSecondaryIdxs(ctx, sch, idxSet)
+	mutIdxs, err := merge.GetMutableSecondaryIdxs(ctx, sch, tblName, idxSet)
 	if err != nil {
 		return nil, err
 	}
@@ -310,8 +310,8 @@ func resolveNomsConflicts(ctx *sql.Context, opts editor.Options, tbl *doltdb.Tab
 	return resolvePkConflicts(ctx, opts, tbl, tblName, sch, conflicts)
 }
 
-func validateConstraintViolations(ctx *sql.Context, before, after *doltdb.RootValue, table string) error {
-	tables, err := after.GetTableNames(ctx)
+func validateConstraintViolations(ctx *sql.Context, before, after doltdb.RootValue, table string) error {
+	tables, err := after.GetTableNames(ctx, doltdb.DefaultSchemaName)
 	if err != nil {
 		return err
 	}
@@ -327,21 +327,81 @@ func validateConstraintViolations(ctx *sql.Context, before, after *doltdb.RootVa
 	return nil
 }
 
-func clearTableAndUpdateRoot(ctx *sql.Context, root *doltdb.RootValue, tbl *doltdb.Table, tblName string) (*doltdb.RootValue, error) {
+func clearTableAndUpdateRoot(ctx *sql.Context, root doltdb.RootValue, tbl *doltdb.Table, tblName string) (doltdb.RootValue, error) {
 	newTbl, err := tbl.ClearConflicts(ctx)
 	if err != nil {
 		return nil, err
 	}
-	newRoot, err := root.PutTable(ctx, tblName, newTbl)
+	newRoot, err := root.PutTable(ctx, doltdb.TableName{Name: tblName}, newTbl)
 	if err != nil {
 		return nil, err
 	}
 	return newRoot, nil
 }
 
-func ResolveConflicts(ctx *sql.Context, dSess *dsess.DoltSession, root *doltdb.RootValue, dbName string, ours bool, tblNames []string) error {
+func ResolveSchemaConflicts(ctx *sql.Context, ddb *doltdb.DoltDB, ws *doltdb.WorkingSet, resolveOurs bool, tables []string) (*doltdb.WorkingSet, error) {
+	if !ws.MergeActive() {
+		return ws, nil // no schema conflicts
+	}
+
+	// TODO: There's an issue with using `dolt conflicts resolve` for schema conflicts, since having
+	//       schema conflicts reported means that we haven't yet merged the table data. In some case,
+	//       such as when there have ONLY been schema changes and no data changes that need to be
+	//       merged, it is safe to use `dolt conflicts resolve`, but there are many other cases where the
+	//       data changes would not be merged and could surprise customers. So, we are being cautious to
+	//       prevent auto-resolution of schema changes with `dolt conflicts resolve` until we have a fix
+	//       for resolving schema changes AND merging data (including dealing with any data conflicts).
+	//       For more details, see: https://github.com/dolthub/dolt/issues/6616
+	if ws.MergeState().HasSchemaConflicts() {
+		return nil, fmt.Errorf("Unable to automatically resolve schema conflicts since data changes may " +
+			"not have been fully merged yet. " +
+			"To continue, abort this merge (dolt merge --abort) then apply ALTER TABLE statements to one " +
+			"side of this merge to get the two schemas in sync with the desired schema, then rerun the merge. " +
+			"To track resolution of this limitation, follow https://github.com/dolthub/dolt/issues/6616")
+	}
+
+	tblSet := set.NewStrSet(tables)
+	updates := make(map[string]*doltdb.Table)
+	err := ws.MergeState().IterSchemaConflicts(ctx, ddb, func(table string, conflict doltdb.SchemaConflict) error {
+		if !tblSet.Contains(table) {
+			return nil
+		}
+		ours, theirs := conflict.GetConflictingTables()
+		if resolveOurs {
+			updates[table] = ours
+		} else {
+			updates[table] = theirs
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var merged []string
+	root := ws.WorkingRoot()
+	for name, tbl := range updates {
+		if root, err = root.PutTable(ctx, doltdb.TableName{Name: name}, tbl); err != nil {
+			return nil, err
+		}
+		merged = append(merged, name)
+	}
+
+	// clear resolved schema conflicts
+	var unmerged []string
+	for _, tbl := range ws.MergeState().TablesWithSchemaConflicts() {
+		if tblSet.Contains(tbl) {
+			continue
+		}
+		unmerged = append(unmerged, tbl)
+	}
+
+	return ws.WithWorkingRoot(root).WithUnmergableTables(unmerged).WithMergedTables(merged), nil
+}
+
+func ResolveDataConflicts(ctx *sql.Context, dSess *dsess.DoltSession, root doltdb.RootValue, dbName string, ours bool, tblNames []string) error {
 	for _, tblName := range tblNames {
-		tbl, ok, err := root.GetTable(ctx, tblName)
+		tbl, ok, err := root.GetTable(ctx, doltdb.TableName{Name: tblName})
 		if err != nil {
 			return err
 		}
@@ -352,7 +412,7 @@ func ResolveConflicts(ctx *sql.Context, dSess *dsess.DoltSession, root *doltdb.R
 		if has, err := tbl.HasConflicts(ctx); err != nil {
 			return err
 		} else if !has {
-			return nil
+			continue
 		}
 
 		sch, err := tbl.GetSchema(ctx)
@@ -378,7 +438,10 @@ func ResolveConflicts(ctx *sql.Context, dSess *dsess.DoltSession, root *doltdb.R
 				if err != nil {
 					return err
 				}
-				opts := state.WriteSession.GetOptions()
+				var opts editor.Options
+				if ws := state.WriteSession(); ws != nil {
+					opts = ws.GetOptions()
+				}
 				tbl, err = resolveNomsConflicts(ctx, opts, tbl, tblName, sch)
 			}
 			if err != nil {
@@ -398,7 +461,7 @@ func ResolveConflicts(ctx *sql.Context, dSess *dsess.DoltSession, root *doltdb.R
 
 		root = newRoot
 	}
-	return dSess.SetRoot(ctx, dbName, root)
+	return dSess.SetWorkingRoot(ctx, dbName, root)
 }
 
 func DoDoltConflictsResolve(ctx *sql.Context, args []string) (int, error) {
@@ -413,9 +476,14 @@ func DoDoltConflictsResolve(ctx *sql.Context, args []string) (int, error) {
 	}
 
 	dSess := dsess.DSessFromSess(ctx.Session)
-	roots, ok := dSess.GetRoots(ctx, dbName)
-	if !ok {
-		return 1, fmt.Errorf("Could not load database %s", dbName)
+	ws, err := dSess.WorkingSet(ctx, dbName)
+	if err != nil {
+		return 0, err
+	}
+
+	ddb, _ := dSess.GetDoltDB(ctx, dbName)
+	if err != nil {
+		return 0, err
 	}
 
 	ours := apr.Contains(cli.OursFlag)
@@ -431,17 +499,21 @@ func DoDoltConflictsResolve(ctx *sql.Context, args []string) (int, error) {
 	}
 
 	// get all tables in conflict
-	root := roots.Working
 	tbls := apr.Args
 	if len(tbls) == 1 && tbls[0] == "." {
-		if allTables, err := root.TablesInConflict(ctx); err != nil {
-			return 1, err
-		} else {
-			tbls = allTables
+		all, err := ws.WorkingRoot().GetTableNames(ctx, doltdb.DefaultSchemaName)
+		if err != nil {
+			return 1, nil
 		}
+		tbls = all
 	}
 
-	err = ResolveConflicts(ctx, dSess, root, dbName, ours, tbls)
+	ws, err = ResolveSchemaConflicts(ctx, ddb, ws, ours, tbls)
+	if err != nil {
+		return 1, err
+	}
+
+	err = ResolveDataConflicts(ctx, dSess, ws.WorkingRoot(), dbName, ours, tbls)
 	if err != nil {
 		return 1, err
 	}

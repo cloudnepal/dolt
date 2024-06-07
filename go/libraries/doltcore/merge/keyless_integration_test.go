@@ -106,22 +106,25 @@ func TestKeylessMerge(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			dEnv := dtu.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
-			root, err = root.CreateEmptyTable(ctx, tblName, keylessSch)
+			root, err = doltdb.CreateEmptyTable(ctx, root, doltdb.TableName{Name: tblName}, keylessSch)
 			require.NoError(t, err)
 			err = dEnv.UpdateWorkingRoot(ctx, root)
 			require.NoError(t, err)
+			cliCtx, err := cmd.NewArgFreeCliContext(ctx, dEnv)
+			require.NoError(t, err)
 
 			for _, c := range test.setup {
-				exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv)
+				exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
 				require.Equal(t, 0, exitCode)
 			}
 
 			root, err = dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
-			tbl, _, err := root.GetTable(ctx, tblName)
+			tbl, _, err := root.GetTable(ctx, doltdb.TableName{Name: tblName})
 			require.NoError(t, err)
 
 			assertKeylessRows(t, ctx, tbl, test.expected)
@@ -242,14 +245,19 @@ func TestKeylessMergeConflicts(t *testing.T) {
 	setupTest := func(t *testing.T, ctx context.Context, dEnv *env.DoltEnv, cc []testCommand) {
 		root, err := dEnv.WorkingRoot(ctx)
 		require.NoError(t, err)
-		root, err = root.CreateEmptyTable(ctx, tblName, keylessSch)
+		root, err = doltdb.CreateEmptyTable(ctx, root, doltdb.TableName{Name: tblName}, keylessSch)
 		require.NoError(t, err)
 		err = dEnv.UpdateWorkingRoot(ctx, root)
 		require.NoError(t, err)
+		cliCtx, err := cmd.NewArgFreeCliContext(ctx, dEnv)
+		require.NoError(t, err)
 
 		for _, c := range cc {
-			exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv)
-			require.Equal(t, 0, exitCode)
+			exitCode := c.cmd.Exec(ctx, c.cmd.Name(), c.args, dEnv, cliCtx)
+			// allow merge to fail with conflicts
+			if _, ok := c.cmd.(cmd.MergeCmd); !ok {
+				require.Equal(t, 0, exitCode)
+			}
 		}
 	}
 
@@ -257,11 +265,12 @@ func TestKeylessMergeConflicts(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			dEnv := dtu.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 			setupTest(t, ctx, dEnv, test.setup)
 
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
-			tbl, _, err := root.GetTable(ctx, tblName)
+			tbl, _, err := root.GetTable(ctx, doltdb.TableName{Name: tblName})
 			require.NoError(t, err)
 			assertConflicts(t, ctx, tbl, test.conflicts)
 		})
@@ -270,34 +279,40 @@ func TestKeylessMergeConflicts(t *testing.T) {
 
 		t.Run(test.name+"_resolved_ours", func(t *testing.T) {
 			dEnv := dtu.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 
 			setupTest(t, ctx, dEnv, test.setup)
+			cliCtx, verr := cmd.NewArgFreeCliContext(ctx, dEnv)
+			require.NoError(t, verr)
 
 			resolve := cnfcmds.ResolveCmd{}
 			args := []string{"--ours", tblName}
-			exitCode := resolve.Exec(ctx, resolve.Name(), args, dEnv)
+			exitCode := resolve.Exec(ctx, resolve.Name(), args, dEnv, cliCtx)
 			require.Equal(t, 0, exitCode)
 
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
-			tbl, _, err := root.GetTable(ctx, tblName)
+			tbl, _, err := root.GetTable(ctx, doltdb.TableName{Name: tblName})
 			require.NoError(t, err)
 
 			assertKeylessRows(t, ctx, tbl, test.oursExpected)
 		})
 		t.Run(test.name+"_resolved_theirs", func(t *testing.T) {
 			dEnv := dtu.CreateTestEnv()
+			defer dEnv.DoltDB.Close()
 
 			setupTest(t, ctx, dEnv, test.setup)
+			cliCtx, verr := cmd.NewArgFreeCliContext(ctx, dEnv)
+			require.NoError(t, verr)
 
 			resolve := cnfcmds.ResolveCmd{}
 			args := []string{"--theirs", tblName}
-			exitCode := resolve.Exec(ctx, resolve.Name(), args, dEnv)
+			exitCode := resolve.Exec(ctx, resolve.Name(), args, dEnv, cliCtx)
 			require.Equal(t, 0, exitCode)
 
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
-			tbl, _, err := root.GetTable(ctx, tblName)
+			tbl, _, err := root.GetTable(ctx, doltdb.TableName{Name: tblName})
 			require.NoError(t, err)
 
 			assertKeylessRows(t, ctx, tbl, test.theirsExpected)
@@ -403,7 +418,7 @@ func mustGetRowValueFromTable(t *testing.T, ctx context.Context, tbl *doltdb.Tab
 func mustGetRowValueFromRootIsh(t *testing.T, ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, rootIsh hash.Hash, tblName string, key val.Tuple) val.Tuple {
 	rv, err := doltdb.LoadRootValueFromRootIshAddr(ctx, vrw, ns, rootIsh)
 	require.NoError(t, err)
-	tbl, ok, err := rv.GetTable(ctx, tblName)
+	tbl, ok, err := rv.GetTable(ctx, doltdb.TableName{Name: tblName})
 	require.NoError(t, err)
 	require.True(t, ok)
 

@@ -54,7 +54,7 @@ type exportOptions struct {
 	srcOptions interface{}
 }
 
-func (m exportOptions) checkOverwrite(ctx context.Context, root *doltdb.RootValue, fs filesys.ReadableFS) (bool, error) {
+func (m exportOptions) checkOverwrite(ctx context.Context, root doltdb.RootValue, fs filesys.ReadableFS) (bool, error) {
 	if _, isStream := m.dest.(mvdata.StreamDataLocation); isStream {
 		return false, nil
 	}
@@ -134,9 +134,7 @@ func parseExportArgs(ap *argparser.ArgParser, commandStr string, args []string) 
 	tableName := apr.Arg(0)
 	if !doltdb.IsValidTableName(tableName) {
 		usage()
-		cli.PrintErrln(
-			color.RedString("'%s' is not a valid table name\n", tableName),
-			"table names must match the regular expression:", doltdb.TableNameRegexStr)
+		cli.PrintErrln(color.RedString("'%s' is not a valid table name", tableName))
 		return nil, errhand.BuildDError("invalid table name").Build()
 	}
 
@@ -171,7 +169,7 @@ func (cmd ExportCmd) Docs() *cli.CommandDocumentation {
 }
 
 func (cmd ExportCmd) ArgParser() *argparser.ArgParser {
-	ap := argparser.NewArgParser()
+	ap := argparser.NewArgParserWithMaxArgs(cmd.Name(), 2)
 	ap.ArgListHelp = append(ap.ArgListHelp, [2]string{"table", "The table being exported."})
 	ap.ArgListHelp = append(ap.ArgListHelp, [2]string{"file", "The file being output to."})
 	ap.SupportsFlag(forceParam, "f", "If data already exists in the destination, the force flag will allow the target to be overwritten.")
@@ -185,7 +183,7 @@ func (cmd ExportCmd) EventType() eventsapi.ClientEventType {
 }
 
 // Exec executes the command
-func (cmd ExportCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv) int {
+func (cmd ExportCmd) Exec(ctx context.Context, commandStr string, args []string, dEnv *env.DoltEnv, cliCtx cli.CliContext) int {
 	ap := cmd.ArgParser()
 	_, usage := cli.HelpAndUsagePrinters(cli.CommandDocsForCommandString(commandStr, exportDocs, ap))
 
@@ -220,7 +218,7 @@ func (cmd ExportCmd) Exec(ctx context.Context, commandStr string, args []string,
 	return 0
 }
 
-func getTableWriter(ctx context.Context, root *doltdb.RootValue, dEnv *env.DoltEnv, rdSchema schema.Schema, exOpts *exportOptions) (table.SqlRowWriter, errhand.VerboseError) {
+func getTableWriter(ctx context.Context, root doltdb.RootValue, dEnv *env.DoltEnv, rdSchema schema.Schema, exOpts *exportOptions) (table.SqlRowWriter, errhand.VerboseError) {
 	ow, err := exOpts.checkOverwrite(ctx, root, dEnv.FS)
 	if err != nil {
 		return nil, errhand.VerboseErrorFromError(err)

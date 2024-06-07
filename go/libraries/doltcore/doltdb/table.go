@@ -18,8 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
-	"strings"
 	"unicode"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -32,50 +30,40 @@ import (
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/types"
+	"github.com/dolthub/dolt/go/store/val"
 )
 
-const (
-	// TableNameRegexStr is the regular expression that valid tables must match.
-	TableNameRegexStr = `^[a-zA-Z]{1}$|^[a-zA-Z_]+[-_0-9a-zA-Z]*[0-9a-zA-Z]+$`
-	// ForeignKeyNameRegexStr is the regular expression that valid foreign keys must match.
-	// From the unquoted identifiers: https://dev.mysql.com/doc/refman/8.0/en/identifiers.html
-	// We also allow the '-' character from quoted identifiers.
-	ForeignKeyNameRegexStr = `^[-$_0-9a-zA-Z]+$`
-	// IndexNameRegexStr is the regular expression that valid indexes must match.
-	// From the unquoted identifiers: https://dev.mysql.com/doc/refman/8.0/en/identifiers.html
-	// We also allow the '-' character from quoted identifiers.
-	IndexNameRegexStr = "^[-`$_0-9a-zA-Z]+$"
-)
+var ErrNoConflictsResolved = errors.New("no conflicts resolved")
 
-var (
-	tableNameRegex      = regexp.MustCompile(TableNameRegexStr)
-	foreignKeyNameRegex = regexp.MustCompile(ForeignKeyNameRegexStr)
-	indexNameRegex      = regexp.MustCompile(IndexNameRegexStr)
+const dolt_row_hash_tag = 0
 
-	ErrNoConflictsResolved = errors.New("no conflicts resolved")
-)
-
-// IsValidTableName returns true if the name matches the regular expression TableNameRegexStr.
-// Table names must be composed of 1 or more letters and non-initial numerals, as well as the characters _ and -
+// IsValidTableName checks if name is a valid identifer, and doesn't end with space characters
 func IsValidTableName(name string) bool {
+	if len(name) == 0 || unicode.IsSpace(rune(name[len(name)-1])) {
+		return false
+	}
+	return IsValidIdentifier(name)
+}
+
+// IsValidIdentifier returns true according to MySQL's quoted identifier rules.
+// Docs here: https://dev.mysql.com/doc/refman/8.0/en/identifiers.html
+func IsValidIdentifier(name string) bool {
 	// Ignore all leading digits
-	name = strings.TrimLeftFunc(name, unicode.IsDigit)
-	return tableNameRegex.MatchString(name)
-}
-
-// IsValidForeignKeyName returns true if the name matches the regular expression ForeignKeyNameRegexStr.
-func IsValidForeignKeyName(name string) bool {
-	return foreignKeyNameRegex.MatchString(name)
-}
-
-// IsValidIndexName returns true if the name matches the regular expression IndexNameRegexStr.
-func IsValidIndexName(name string) bool {
-	return indexNameRegex.MatchString(name)
+	if len(name) == 0 {
+		return false
+	}
+	for _, c := range name {
+		if c == 0x0000 || c > 0xFFFF {
+			return false
+		}
+	}
+	return true
 }
 
 // Table is a struct which holds row data, as well as a reference to its schema.
 type Table struct {
-	table durable.Table
+	table            durable.Table
+	overriddenSchema schema.Schema
 }
 
 // NewNomsTable creates a noms Struct which stores row data, index data, and schema.
@@ -96,6 +84,11 @@ func NewTable(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore,
 		return nil, err
 	}
 	return &Table{table: dt}, nil
+}
+
+// NewTableFromDurable creates a table from the given durable object.
+func NewTableFromDurable(table durable.Table) *Table {
+	return &Table{table: table}
 }
 
 func NewEmptyTable(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, sch schema.Schema) (*Table, error) {
@@ -127,6 +120,17 @@ func (t *Table) ValueReadWriter() types.ValueReadWriter {
 
 func (t *Table) NodeStore() tree.NodeStore {
 	return durable.NodeStoreFromTable(t.table)
+}
+
+// OverrideSchema sets |sch| as the schema for this table, causing rows from this table to be transformed
+// into that schema when they are read from this table.
+func (t *Table) OverrideSchema(sch schema.Schema) {
+	t.overriddenSchema = sch
+}
+
+// GetOverriddenSchema returns the overridden schema if one has been set, otherwise it returns nil.
+func (t *Table) GetOverriddenSchema() schema.Schema {
+	return t.overriddenSchema
 }
 
 // SetConflicts sets the merge conflicts for this table.
@@ -332,7 +336,7 @@ func tableFromRootIsh(ctx context.Context, vrw types.ValueReadWriter, ns tree.No
 	if err != nil {
 		return nil, false, err
 	}
-	tbl, ok, err := rv.GetTable(ctx, tblName)
+	tbl, ok, err := rv.GetTable(ctx, TableName{Name: tblName})
 	if err != nil {
 		return nil, false, err
 	}
@@ -355,7 +359,7 @@ func (t *Table) GetConstraintViolationsSchema(ctx context.Context) (schema.Schem
 	}
 
 	typeType, err := typeinfo.FromSqlType(
-		gmstypes.MustCreateEnumType([]string{"foreign key", "unique index", "check constraint"}, sql.Collation_Default))
+		gmstypes.MustCreateEnumType([]string{"foreign key", "unique index", "check constraint", "not null"}, sql.Collation_Default))
 	if err != nil {
 		return nil, err
 	}
@@ -370,18 +374,19 @@ func (t *Table) GetConstraintViolationsSchema(ctx context.Context) (schema.Schem
 
 	colColl := schema.NewColCollection()
 
-	if t.Format() == types.Format_DOLT {
-		// the commit hash or working set hash of the right side during merge
-		colColl = colColl.Append(schema.NewColumn("from_root_ish", 0, types.StringKind, false))
-		colColl = colColl.Append(typeCol)
-		colColl = colColl.Append(sch.GetPKCols().GetColumns()...)
-		colColl = colColl.Append(sch.GetNonPKCols().GetColumns()...)
-		colColl = colColl.Append(infoCol)
+	// the commit hash or working set hash of the right side during merge
+	colColl = colColl.Append(schema.NewColumn("from_root_ish", 0, types.StringKind, false))
+	colColl = colColl.Append(typeCol)
+	if schema.IsKeyless(sch) {
+		// If this is a keyless table, we need to add a new column for the keyless table's generated row hash.
+		// We need to add this internal row hash value, in order to guarantee a unique primary key in the
+		// constraint violations table.
+		colColl = colColl.Append(schema.NewColumn("dolt_row_hash", dolt_row_hash_tag, types.BlobKind, true))
 	} else {
-		colColl = colColl.Append(typeCol)
-		colColl = colColl.Append(sch.GetAllCols().GetColumns()...)
-		colColl = colColl.Append(infoCol)
+		colColl = colColl.Append(sch.GetPKCols().GetColumns()...)
 	}
+	colColl = colColl.Append(sch.GetNonPKCols().GetColumns()...)
+	colColl = colColl.Append(infoCol)
 
 	return schema.SchemaFromCols(colColl)
 }
@@ -416,6 +421,18 @@ func (t *Table) GetSchema(ctx context.Context) (schema.Schema, error) {
 // GetSchemaHash returns the hash of this table's schema.
 func (t *Table) GetSchemaHash(ctx context.Context) (hash.Hash, error) {
 	return t.table.GetSchemaHash(ctx)
+}
+
+func SchemaHashesEqual(ctx context.Context, t1, t2 *Table) (bool, error) {
+	t1Hash, err := t1.GetSchemaHash(ctx)
+	if err != nil {
+		return false, err
+	}
+	t2Hash, err := t2.GetSchemaHash(ctx)
+	if err != nil {
+		return false, err
+	}
+	return t1Hash == t2Hash, nil
 }
 
 // UpdateSchema updates the table with the schema given and returns the updated table. The original table is unchanged.
@@ -472,6 +489,10 @@ func (t *Table) GetNomsRowData(ctx context.Context) (types.Map, error) {
 // GetRowData retrieves the underlying map which is a map from a primary key to a list of field values.
 func (t *Table) GetRowData(ctx context.Context) (durable.Index, error) {
 	return t.table.GetTableRows(ctx)
+}
+
+func (t *Table) GetRowDataWithDescriptors(ctx context.Context, kd, vd val.TupleDesc) (durable.Index, error) {
+	return t.table.GetTableRowsWithDescriptors(ctx, kd, vd)
 }
 
 // GetRowDataHash returns the hash.Hash of the row data index.
@@ -561,7 +582,7 @@ func (t *Table) GetNomsIndexRowData(ctx context.Context, indexName string) (type
 		return types.EmptyMap, err
 	}
 
-	idx, err := indexes.GetIndex(ctx, sch, indexName)
+	idx, err := indexes.GetIndex(ctx, sch, nil, indexName)
 	if err != nil {
 		return types.EmptyMap, err
 	}
@@ -581,7 +602,7 @@ func (t *Table) GetIndexRowData(ctx context.Context, indexName string) (durable.
 		return nil, err
 	}
 
-	return indexes.GetIndex(ctx, sch, indexName)
+	return indexes.GetIndex(ctx, sch, nil, indexName)
 }
 
 // SetIndexRows replaces the current row data for the given index and returns an updated Table.
@@ -653,7 +674,9 @@ func (t *Table) GetAutoIncrementValue(ctx context.Context) (uint64, error) {
 	return t.table.GetAutoIncrement(ctx)
 }
 
-// SetAutoIncrementValue sets the current AUTO_INCREMENT value for this table.
+// SetAutoIncrementValue sets the current AUTO_INCREMENT value for this table. This method does not verify that the
+// value given is greater than current table values. Setting it lower than current table values will result in
+// incorrect key generation on future inserts, causing duplicate key errors.
 func (t *Table) SetAutoIncrementValue(ctx context.Context, val uint64) (*Table, error) {
 	table, err := t.table.SetAutoIncrement(ctx, val)
 	if err != nil {
@@ -682,6 +705,6 @@ func (t *Table) AddColumnToRows(ctx context.Context, newCol string, newSchema sc
 	return &Table{table: newTable}, nil
 }
 
-func (t *Table) DebugString(ctx context.Context) string {
-	return t.table.DebugString(ctx)
+func (t *Table) DebugString(ctx context.Context, ns tree.NodeStore) string {
+	return t.table.DebugString(ctx, ns)
 }

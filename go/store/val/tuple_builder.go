@@ -17,6 +17,7 @@ package val
 import (
 	"time"
 
+	"github.com/dolthub/go-mysql-server/sql/analyzer/analyzererrors"
 	"github.com/shopspring/decimal"
 
 	"github.com/dolthub/dolt/go/store/hash"
@@ -31,9 +32,30 @@ const (
 // It's used to construct index tuples from another index's tuples.
 type OrdinalMapping []int
 
+// NewIdentityOrdinalMapping returns a new OrdinalMapping that maps every ordinal to itself.
+func NewIdentityOrdinalMapping(size int) OrdinalMapping {
+	newMapping := make(OrdinalMapping, size)
+	for i := 0; i < size; i++ {
+		newMapping[i] = i
+	}
+	return newMapping
+}
+
+// MapOrdinal returns the ordinal of the field in the source tuple that maps to the |to| ordinal in the destination tuple.
 func (om OrdinalMapping) MapOrdinal(to int) (from int) {
 	from = om[to]
 	return
+}
+
+// IsIdentityMapping returns true if this mapping is the identity mapping (i.e. every position is mapped
+// to the same position and no columns are reordered).
+func (om OrdinalMapping) IsIdentityMapping() bool {
+	for i, mapping := range om {
+		if i != mapping {
+			return false
+		}
+	}
+	return true
 }
 
 type TupleBuilder struct {
@@ -80,6 +102,19 @@ func (tb *TupleBuilder) BuildPrefix(pool pool.BuffPool, k int) (tup Tuple) {
 	values := tb.fields[:k]
 	tup = NewTuple(pool, values...)
 	tb.Recycle()
+	return
+}
+
+// BuildPrefixNoRecycle materializes a prefix Tuple from the first |k| fields
+// but does not call Recycle.
+func (tb *TupleBuilder) BuildPrefixNoRecycle(pool pool.BuffPool, k int) (tup Tuple) {
+	for i, typ := range tb.Desc.Types[:k] {
+		if !typ.Nullable && tb.fields[i] == nil {
+			panic("cannot write NULL to non-NULL field")
+		}
+	}
+	values := tb.fields[:k]
+	tup = NewTuple(pool, values...)
 	return
 }
 
@@ -258,13 +293,21 @@ func (tb *TupleBuilder) PutSet(i int, v uint64) {
 }
 
 // PutString writes a string to the ith field of the Tuple being built.
-func (tb *TupleBuilder) PutString(i int, v string) {
+func (tb *TupleBuilder) PutString(i int, v string) error {
 	tb.Desc.expectEncoding(i, StringEnc)
 	sz := ByteSize(len(v)) + 1
+	offSz := 0
+	if i > 0 {
+		offSz = 2 * int(uint16Size)
+	}
+	if int(tb.pos)+len(v)+offSz > int(MaxTupleDataSize) {
+		return analyzererrors.ErrInvalidRowLength.New(MaxTupleDataSize, int(tb.pos)+len(v)+int(offsetsSize(i)))
+	}
 	tb.ensureCapacity(sz)
 	tb.fields[i] = tb.buf[tb.pos : tb.pos+sz]
 	writeString(tb.fields[i], v)
 	tb.pos += sz
+	return nil
 }
 
 // PutByteString writes a []byte to the ith field of the Tuple being built.
@@ -297,6 +340,13 @@ func (tb *TupleBuilder) PutGeometry(i int, v []byte) {
 	tb.pos += sz
 }
 
+// PutGeometryAddr writes a Geometry's address ref to the ith field
+func (tb *TupleBuilder) PutGeometryAddr(i int, v hash.Hash) {
+	tb.Desc.expectEncoding(i, GeomAddrEnc)
+	tb.ensureCapacity(hash.ByteLen)
+	tb.putAddr(i, v)
+}
+
 // PutHash128 writes a hash128 to the ith field of the Tuple being built.
 func (tb *TupleBuilder) PutHash128(i int, v []byte) {
 	tb.Desc.expectEncoding(i, Hash128Enc)
@@ -304,6 +354,23 @@ func (tb *TupleBuilder) PutHash128(i int, v []byte) {
 	tb.fields[i] = tb.buf[tb.pos : tb.pos+hash128Size]
 	writeHash128(tb.fields[i], v)
 	tb.pos += hash128Size
+}
+
+// PutExtended writes a []byte to the ith field of the Tuple being built.
+func (tb *TupleBuilder) PutExtended(i int, v []byte) {
+	tb.Desc.expectEncoding(i, ExtendedEnc)
+	sz := ByteSize(len(v))
+	tb.ensureCapacity(sz)
+	tb.fields[i] = tb.buf[tb.pos : tb.pos+sz]
+	writeExtended(tb.Desc.Handlers[i], tb.fields[i], v)
+	tb.pos += sz
+}
+
+// PutExtendedAddr writes a []byte to the ith field of the Tuple being built.
+func (tb *TupleBuilder) PutExtendedAddr(i int, v hash.Hash) {
+	tb.Desc.expectEncoding(i, ExtendedAddrEnc)
+	tb.ensureCapacity(hash.ByteLen)
+	tb.putAddr(i, v)
 }
 
 // PutRaw writes a []byte to the ith field of the Tuple being built.

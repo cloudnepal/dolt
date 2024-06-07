@@ -9,7 +9,7 @@ teardown() {
     teardown_common
 }
 
-@test "conflict-detection: merge non-existant branch errors" {
+@test "conflict-detection: merge non-existent branch errors" {
     run dolt merge batmans-parents
     [ $status -eq 1 ]
     [[ "$output" =~ "branch not found" ]] || false
@@ -43,7 +43,7 @@ SQL
 
     run dolt merge other -m "merge"
     [ "$status" -ne 0 ]
-    [[ "$output" =~ "error: Your local changes to the following tables would be overwritten by merge:" ]] || false
+    [[ "$output" =~ "error: local changes would be stomped by merge:" ]] || false
     [[ "$output" =~ "test" ]] || false
     [[ "$output" =~ "Please commit your changes before you merge." ]] || false
 
@@ -154,7 +154,7 @@ SQL
     dolt commit -m "changed pk=0 all cells to 11"
     dolt checkout main
     run dolt merge change-cell -m "merge"
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 1 ]
     [[ "$output" =~ "CONFLICT" ]] || false
     run dolt status
     [[ "$output" =~ "You have unmerged tables." ]] || false
