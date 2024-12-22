@@ -603,8 +603,8 @@ func TestIndexedAccess(t *testing.T, e enginetest.QueryEngine, harness enginetes
 }
 
 func analyzeQuery(ctx *sql.Context, e enginetest.QueryEngine, query string) (sql.Node, error) {
-	binder := planbuilder.New(ctx, e.EngineAnalyzer().Catalog, sql.NewMysqlParser())
-	parsed, _, _, qFlags, err := binder.Parse(query, false)
+	binder := planbuilder.New(ctx, e.EngineAnalyzer().Catalog, e.EngineEventScheduler(), nil)
+	parsed, _, _, qFlags, err := binder.Parse(query, nil, false)
 	if err != nil {
 		return nil, err
 	}

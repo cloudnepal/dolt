@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dolthub/go-mysql-server/server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/stretchr/testify/require"
 
@@ -60,6 +61,18 @@ func BenchmarkOltpPointSelect(b *testing.B) {
 	})
 }
 
+func BenchmarkTableScan(b *testing.B) {
+	benchmarkSysbenchQuery(b, func(int) string {
+		return "SELECT * FROM sbtest1"
+	})
+}
+
+func BenchmarkOltpIndexScan(b *testing.B) {
+	benchmarkSysbenchQuery(b, func(int) string {
+		return "SELECT * FROM sbtest1 WHERE k > 0"
+	})
+}
+
 func BenchmarkOltpJoinScan(b *testing.B) {
 	benchmarkSysbenchQuery(b, func(int) string {
 		return `select a.id, a.k 
@@ -90,14 +103,39 @@ func BenchmarkSelectRandomPoints(b *testing.B) {
 	})
 }
 
+func BenchmarkSelectRandomRanges(b *testing.B) {
+	benchmarkSysbenchQuery(b, func(int) string {
+		var sb strings.Builder
+		sb.Grow(120)
+		sb.WriteString("SELECT count(k) FROM sbtest1 WHERE ")
+		sep := ""
+		for i := 1; i < 10; i++ {
+			start := rand.Intn(tableSize)
+			fmt.Fprintf(&sb, "%sk between %s and %s", sep, strconv.Itoa(start), strconv.Itoa(start+5))
+			sep = " OR "
+		}
+		sb.WriteString(";")
+		return sb.String()
+	})
+}
+
 func benchmarkSysbenchQuery(b *testing.B, getQuery func(int) string) {
 	ctx, eng := setupBenchmark(b, dEnv)
 	for i := 0; i < b.N; i++ {
-		_, iter, err := eng.Query(ctx, getQuery(i))
+		schema, iter, _, err := eng.Query(ctx, getQuery(i))
 		require.NoError(b, err)
+		i := 0
+		buf := sql.NewByteBuffer(16000)
 		for {
-			if _, err = iter.Next(ctx); err != nil {
+			i++
+			row, err := iter.Next(ctx)
+			if err != nil {
 				break
+			}
+			outputRow, err := server.RowToSQL(ctx, schema, row, nil, buf)
+			_ = outputRow
+			if i%128 == 0 {
+				buf.Reset()
 			}
 		}
 		require.Error(b, io.EOF)

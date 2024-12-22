@@ -35,6 +35,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/dustin/go-humanize"
+	"github.com/fatih/color"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
@@ -266,7 +267,7 @@ func (nbs *NomsBlockStore) UpdateManifest(ctx context.Context, updates map[hash.
 			return contents, nil
 		}
 
-		contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix)
+		contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix, nil)
 
 		// ensure we don't drop existing appendices
 		if contents.appendix != nil && len(contents.appendix) > 0 {
@@ -423,7 +424,7 @@ func fromManifestAppendixOptionNewContents(upstream manifestContents, appendixSp
 		newAppendixSpecs := append([]tableSpec{}, upstreamAppendixSpecs...)
 		contents.appendix = append(newAppendixSpecs, appendixSpecs...)
 
-		contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix)
+		contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix, nil)
 		return contents, nil
 	case ManifestAppendixOption_Set:
 		if len(appendixSpecs) < 1 {
@@ -438,7 +439,7 @@ func fromManifestAppendixOptionNewContents(upstream manifestContents, appendixSp
 		// append new appendix specs to contents.appendix
 		contents.appendix = append([]tableSpec{}, appendixSpecs...)
 
-		contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix)
+		contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix, nil)
 		return contents, nil
 	default:
 		return manifestContents{}, ErrUnsupportedManifestAppendixOption
@@ -480,7 +481,7 @@ func OverwriteStoreManifest(ctx context.Context, store *NomsBlockStore, root has
 		s := tableSpec{name: h, chunkCount: c}
 		contents.specs = append(contents.specs, s)
 	}
-	contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix)
+	contents.lock = generateLockHash(contents.root, contents.specs, contents.appendix, nil)
 
 	store.mm.LockForUpdate()
 	defer func() {
@@ -1037,6 +1038,34 @@ func (nbs *NomsBlockStore) HasMany(ctx context.Context, hashes hash.HashSet) (ha
 	return nbs.hasMany(toHasRecords(hashes))
 }
 
+func (nbs *NomsBlockStore) hasManyInSources(srcs []hash.Hash, hashes hash.HashSet) (hash.HashSet, error) {
+	if hashes.Size() == 0 {
+		return nil, nil
+	}
+
+	t1 := time.Now()
+	defer nbs.stats.HasLatency.SampleTimeSince(t1)
+	nbs.stats.AddressesPerHas.SampleLen(hashes.Size())
+
+	nbs.mu.RLock()
+	defer nbs.mu.RUnlock()
+
+	records := toHasRecords(hashes)
+
+	_, err := nbs.tables.hasManyInSources(srcs, records)
+	if err != nil {
+		return nil, err
+	}
+
+	absent := hash.HashSet{}
+	for _, r := range records {
+		if !r.has {
+			absent.Insert(*r.a)
+		}
+	}
+	return absent, nil
+}
+
 func (nbs *NomsBlockStore) hasMany(reqs []hasRecord) (hash.HashSet, error) {
 	tables, remaining, err := func() (tables chunkReader, remaining bool, err error) {
 		tables = nbs.tables
@@ -1279,7 +1308,7 @@ func (nbs *NomsBlockStore) updateManifest(ctx context.Context, current, last has
 	newContents := manifestContents{
 		nbfVers:  nbs.upstream.nbfVers,
 		root:     current,
-		lock:     generateLockHash(current, specs, appendixSpecs),
+		lock:     generateLockHash(current, specs, appendixSpecs, nil),
 		gcGen:    nbs.upstream.gcGen,
 		specs:    specs,
 		appendix: appendixSpecs,
@@ -1569,56 +1598,93 @@ func (nbs *NomsBlockStore) EndGC() {
 	nbs.cond.Broadcast()
 }
 
-func (nbs *NomsBlockStore) MarkAndSweepChunks(ctx context.Context, hashes <-chan []hash.Hash, dest chunks.ChunkStore) error {
+func (nbs *NomsBlockStore) MarkAndSweepChunks(ctx context.Context, hashes <-chan []hash.Hash, dest chunks.ChunkStore, mode chunks.GCMode) (chunks.GCFinalizer, error) {
+	return markAndSweepChunks(ctx, hashes, nbs, nbs, dest, mode)
+}
+
+func markAndSweepChunks(ctx context.Context, hashes <-chan []hash.Hash, nbs *NomsBlockStore, src NBSCompressedChunkStore, dest chunks.ChunkStore, mode chunks.GCMode) (chunks.GCFinalizer, error) {
 	ops := nbs.SupportedOperations()
 	if !ops.CanGC || !ops.CanPrune {
-		return chunks.ErrUnsupportedOperation
+		return nil, chunks.ErrUnsupportedOperation
 	}
 
 	precheck := func() error {
 		nbs.mu.RLock()
 		defer nbs.mu.RUnlock()
 
-		// check to see if the specs have changed since last gc. If they haven't bail early.
-		gcGenCheck := generateLockHash(nbs.upstream.root, nbs.upstream.specs, nbs.upstream.appendix)
+		// Check to see if the specs have changed since last gc. If they haven't bail early.
+		gcGenCheck := generateLockHash(nbs.upstream.root, nbs.upstream.specs, nbs.upstream.appendix, []byte("full"))
 		if nbs.upstream.gcGen == gcGenCheck {
+			fmt.Fprintf(color.Error, "check against full gcGen passed; nothing to collect")
 			return chunks.ErrNothingToCollect
 		}
-
+		if mode != chunks.GCMode_Full {
+			// Allow a non-full GC to match the no-op work check as well.
+			gcGenCheck := generateLockHash(nbs.upstream.root, nbs.upstream.specs, nbs.upstream.appendix, nil)
+			if nbs.upstream.gcGen == gcGenCheck {
+				fmt.Fprintf(color.Error, "check against nil gcGen passed; nothing to collect")
+				return chunks.ErrNothingToCollect
+			}
+		}
 		return nil
 	}
 	err := precheck()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	destNBS := nbs
+	var destNBS *NomsBlockStore
 	if dest != nil {
 		switch typed := dest.(type) {
 		case *NomsBlockStore:
 			destNBS = typed
 		case NBSMetricWrapper:
 			destNBS = typed.nbs
+		default:
+			return nil, fmt.Errorf("cannot MarkAndSweep into a non-NomsBlockStore ChunkStore: %w", chunks.ErrUnsupportedOperation)
 		}
+	} else {
+		destNBS = nbs
 	}
 
-	specs, err := nbs.copyMarkedChunks(ctx, hashes, destNBS)
+	specs, err := copyMarkedChunks(ctx, hashes, src, destNBS)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 
-	if destNBS == nbs {
-		return nbs.swapTables(ctx, specs)
-	} else {
-		fileIdToNumChunks := tableSpecsToMap(specs)
-		return destNBS.AddTableFilesToManifest(ctx, fileIdToNumChunks)
-	}
+	return gcFinalizer{
+		nbs:   destNBS,
+		specs: specs,
+		mode:  mode,
+	}, nil
 }
 
-func (nbs *NomsBlockStore) copyMarkedChunks(ctx context.Context, keepChunks <-chan []hash.Hash, dest *NomsBlockStore) ([]tableSpec, error) {
+type gcFinalizer struct {
+	nbs   *NomsBlockStore
+	specs []tableSpec
+	mode  chunks.GCMode
+}
+
+func (gcf gcFinalizer) AddChunksToStore(ctx context.Context) (chunks.HasManyFunc, error) {
+	fileIdToNumChunks := tableSpecsToMap(gcf.specs)
+	var addrs []hash.Hash
+	for _, spec := range gcf.specs {
+		addrs = append(addrs, spec.name)
+	}
+	f := func(ctx context.Context, hashes hash.HashSet) (hash.HashSet, error) {
+		return gcf.nbs.hasManyInSources(addrs, hashes)
+	}
+	return f, gcf.nbs.AddTableFilesToManifest(ctx, fileIdToNumChunks)
+}
+
+func (gcf gcFinalizer) SwapChunksInStore(ctx context.Context) error {
+	return gcf.nbs.swapTables(ctx, gcf.specs, gcf.mode)
+}
+
+func copyMarkedChunks(ctx context.Context, keepChunks <-chan []hash.Hash, src NBSCompressedChunkStore, dest *NomsBlockStore) ([]tableSpec, error) {
 	tfp, ok := dest.p.(tableFilePersister)
 	if !ok {
 		return nil, fmt.Errorf("NBS does not support copying garbage collection")
@@ -1642,7 +1708,7 @@ LOOP:
 			mu := new(sync.Mutex)
 			hashset := hash.NewHashSet(hs...)
 			found := 0
-			err := nbs.GetManyCompressed(ctx, hashset, func(ctx context.Context, c CompressedChunk) {
+			err := src.GetManyCompressed(ctx, hashset, func(ctx context.Context, c CompressedChunk) {
 				mu.Lock()
 				defer mu.Unlock()
 				if addErr != nil {
@@ -1667,7 +1733,29 @@ LOOP:
 	return gcc.copyTablesToDir(ctx, tfp)
 }
 
-func (nbs *NomsBlockStore) swapTables(ctx context.Context, specs []tableSpec) (err error) {
+func (nbs *NomsBlockStore) IterateAllChunks(ctx context.Context, cb func(chunk chunks.Chunk)) error {
+	for _, v := range nbs.tables.novel {
+		err := v.iterateAllChunks(ctx, cb)
+		if err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	for _, v := range nbs.tables.upstream {
+		err := v.iterateAllChunks(ctx, cb)
+		if err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (nbs *NomsBlockStore) swapTables(ctx context.Context, specs []tableSpec, mode chunks.GCMode) (err error) {
 	nbs.mu.Lock()
 	defer nbs.mu.Unlock()
 
@@ -1679,12 +1767,18 @@ func (nbs *NomsBlockStore) swapTables(ctx context.Context, specs []tableSpec) (e
 		}
 	}()
 
-	newLock := generateLockHash(nbs.upstream.root, specs, []tableSpec{})
+	newLock := generateLockHash(nbs.upstream.root, specs, []tableSpec{}, nil)
+	var extra []byte
+	if mode == chunks.GCMode_Full {
+		extra = []byte("full")
+	}
+	newGCGen := generateLockHash(nbs.upstream.root, specs, []tableSpec{}, extra)
+
 	newContents := manifestContents{
 		nbfVers: nbs.upstream.nbfVers,
 		root:    nbs.upstream.root,
 		lock:    newLock,
-		gcGen:   newLock,
+		gcGen:   newGCGen,
 		specs:   specs,
 	}
 

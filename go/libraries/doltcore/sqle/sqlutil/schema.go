@@ -30,8 +30,8 @@ import (
 // ParseCreateTableStatement will parse a CREATE TABLE ddl statement and use it to create a Dolt Schema. A RootValue
 // is used to generate unique tags for the Schema
 func ParseCreateTableStatement(ctx *sql.Context, root doltdb.RootValue, engine *sqle.Engine, query string) (string, schema.Schema, error) {
-	binder := planbuilder.New(ctx, engine.Analyzer.Catalog, engine.Parser)
-	parsed, _, _, _, err := binder.Parse(query, false)
+	binder := planbuilder.New(ctx, engine.Analyzer.Catalog, engine.EventScheduler, engine.Parser)
+	parsed, _, _, _, err := binder.Parse(query, nil, false)
 	if err != nil {
 		return "", nil, err
 	}
@@ -40,7 +40,9 @@ func ParseCreateTableStatement(ctx *sql.Context, root doltdb.RootValue, engine *
 		return "", nil, fmt.Errorf("expected create table, found %T", create)
 	}
 
-	sch, err := ToDoltSchema(ctx, root, create.Name(), create.PkSchema(), nil, create.Collation)
+	// NOTE: We don't support setting a schema name here since this code is only intended to be used from the Dolt
+	//       codebase, and will not work correctly from Doltgres.
+	sch, err := ToDoltSchema(ctx, root, doltdb.TableName{Name: create.Name()}, create.PkSchema(), nil, create.Collation)
 	if err != nil {
 		return "", nil, err
 	}

@@ -40,7 +40,10 @@ func getPreviousKey(ctx context.Context, cur *cursor) ([]byte, error) {
 	if !cur2.Valid() {
 		return nil, nil
 	}
-	key := cur2.parent.CurrentKey()
+	key := cur2.CurrentKey()
+	if len(key) == 0 {
+		key = cur2.parent.CurrentKey()
+	}
 	err = errorIfNotSupportedLocation(key)
 	if err != nil {
 		return nil, err
@@ -53,24 +56,40 @@ func getPreviousKey(ctx context.Context, cur *cursor) ([]byte, error) {
 // in the document. If the location does not exist in the document, the resulting JsonCursor
 // will be at the location where the value would be if it was inserted.
 func newJsonCursor(ctx context.Context, ns NodeStore, root Node, startKey jsonLocation, forRemoval bool) (jCur *JsonCursor, found bool, err error) {
-	cur, err := newCursorAtKey(ctx, ns, root, startKey.key, jsonLocationOrdering{})
+	jcur, err := newJsonCursorAtStartOfChunk(ctx, ns, root, startKey.key)
 	if err != nil {
 		return nil, false, err
 	}
+	found, err = jcur.AdvanceToLocation(ctx, startKey, forRemoval)
+	return jcur, found, err
+}
+
+func newJsonCursorAtStartOfChunk(ctx context.Context, ns NodeStore, root Node, startKey []byte) (jCur *JsonCursor, err error) {
+	cur, err := newCursorAtKey(ctx, ns, root, startKey, jsonLocationOrdering{})
+	if err != nil {
+		return nil, err
+	}
+	return newJsonCursorFromCursor(ctx, cur)
+}
+
+func newJsonCursorFromCursor(ctx context.Context, cur *cursor) (*JsonCursor, error) {
 	previousKey, err := getPreviousKey(ctx, cur)
 	if err != nil {
-		return nil, false, err
+		return nil, err
+	}
+	if !cur.isLeaf() {
+		nd, err := fetchChild(ctx, cur.nrw, cur.currentRef())
+		if err != nil {
+			return nil, err
+		}
+		return newJsonCursorFromCursor(ctx, &cursor{nd: nd, parent: cur, nrw: cur.nrw})
 	}
 	jsonBytes := cur.currentValue()
 	jsonDecoder := ScanJsonFromMiddleWithKey(jsonBytes, previousKey)
 
 	jcur := JsonCursor{cur: cur, jsonScanner: jsonDecoder}
 
-	found, err = jcur.AdvanceToLocation(ctx, startKey, forRemoval)
-	if err != nil {
-		return nil, found, err
-	}
-	return &jcur, found, nil
+	return &jcur, nil
 }
 
 func (j JsonCursor) Valid() bool {
@@ -176,20 +195,28 @@ func (j *JsonCursor) AdvanceToLocation(ctx context.Context, path jsonLocation, f
 	return true, nil
 }
 
+func (j *JsonCursor) advanceCursor(ctx context.Context) error {
+	err := j.cur.advance(ctx)
+	if err != nil {
+		return err
+	}
+	if !j.cur.Valid() {
+		// We hit the end of the tree. This shouldn't happen.
+		return io.EOF
+	}
+	j.jsonScanner = ScanJsonFromMiddle(j.cur.currentValue(), j.jsonScanner.currentPath)
+	return nil
+}
+
 func (j *JsonCursor) AdvanceToNextLocation(ctx context.Context) (crossedBoundary bool, err error) {
 	err = j.jsonScanner.AdvanceToNextLocation()
 	if err == io.EOF {
 		crossedBoundary = true
 		// We hit the end of the chunk, load the next one
-		err = j.cur.advance(ctx)
+		err = j.advanceCursor(ctx)
 		if err != nil {
-			return
+			return false, err
 		}
-		if !j.cur.Valid() {
-			// We hit the end of the tree. This shouldn't happen.
-			return true, io.EOF
-		}
-		j.jsonScanner = ScanJsonFromMiddle(j.cur.currentValue(), j.jsonScanner.currentPath)
 		return true, j.jsonScanner.AdvanceToNextLocation()
 	} else if err != nil {
 		return
@@ -202,6 +229,12 @@ func (j *JsonCursor) GetCurrentPath() jsonLocation {
 	return j.jsonScanner.currentPath
 }
 
-func (j *JsonCursor) nextCharacter() byte {
-	return j.jsonScanner.jsonBuffer[j.jsonScanner.valueOffset]
+func (j *JsonCursor) nextCharacter(ctx context.Context) (byte, error) {
+	if j.jsonScanner.atEndOfChunk() {
+		err := j.advanceCursor(ctx)
+		if err != nil {
+			return 255, err
+		}
+	}
+	return j.jsonScanner.jsonBuffer[j.jsonScanner.valueOffset], nil
 }

@@ -234,12 +234,14 @@ func newOnHeapTableIndex(indexBuff []byte, offsetsBuff1 []byte, count uint32, to
 		return onHeapTableIndex{}, ErrWrongBufferSize
 	}
 
-	tuples := indexBuff[:prefixTupleSize*count]
-	lengths := indexBuff[prefixTupleSize*count : prefixTupleSize*count+lengthSize*count]
-	suffixes := indexBuff[prefixTupleSize*count+lengthSize*count : indexSize(count)]
+	cnt64 := uint64(count)
+
+	tuples := indexBuff[:prefixTupleSize*cnt64]
+	lengths := indexBuff[prefixTupleSize*cnt64 : prefixTupleSize*cnt64+lengthSize*cnt64]
+	suffixes := indexBuff[prefixTupleSize*cnt64+lengthSize*cnt64 : indexSize(count)]
 	footer := indexBuff[indexSize(count):]
 
-	chunks2 := count / 2
+	chunks2 := cnt64 / 2
 
 	r := NewOffsetsReader(bytes.NewReader(lengths))
 	_, err := io.ReadFull(r, offsetsBuff1)
@@ -285,7 +287,7 @@ func newOnHeapTableIndex(indexBuff []byte, offsetsBuff1 []byte, count uint32, to
 
 func (ti onHeapTableIndex) entrySuffixMatches(idx uint32, h *hash.Hash) (bool, error) {
 	ord := ti.ordinalAt(idx)
-	o := ord * hash.SuffixLen
+	o := uint64(ord) * hash.SuffixLen
 	b := ti.suffixes[o : o+hash.SuffixLen]
 	return bytes.Equal(h[hash.PrefixLen:], b), nil
 }
@@ -296,7 +298,7 @@ func (ti onHeapTableIndex) indexEntry(idx uint32, a *hash.Hash) (entry indexEntr
 	if a != nil {
 		binary.BigEndian.PutUint64(a[:], prefix)
 
-		o := int64(hash.SuffixLen * ord)
+		o := hash.SuffixLen * uint64(ord)
 		b := ti.suffixes[o : o+hash.SuffixLen]
 		copy(a[hash.PrefixLen:], b)
 	}
@@ -369,7 +371,7 @@ func (ti onHeapTableIndex) findPrefix(prefix uint64) (idx uint32) {
 }
 
 func (ti onHeapTableIndex) tupleAt(idx uint32) (prefix uint64, ord uint32) {
-	off := int64(prefixTupleSize * idx)
+	off := prefixTupleSize * int64(idx)
 	b := ti.prefixTuples[off : off+prefixTupleSize]
 
 	prefix = binary.BigEndian.Uint64(b[:])
@@ -378,13 +380,13 @@ func (ti onHeapTableIndex) tupleAt(idx uint32) (prefix uint64, ord uint32) {
 }
 
 func (ti onHeapTableIndex) prefixAt(idx uint32) uint64 {
-	off := int64(prefixTupleSize * idx)
+	off := prefixTupleSize * int64(idx)
 	b := ti.prefixTuples[off : off+hash.PrefixLen]
 	return binary.BigEndian.Uint64(b)
 }
 
 func (ti onHeapTableIndex) ordinalAt(idx uint32) uint32 {
-	off := int64(prefixTupleSize*idx) + hash.PrefixLen
+	off := prefixTupleSize*int64(idx) + hash.PrefixLen
 	b := ti.prefixTuples[off : off+ordinalSize]
 	return binary.BigEndian.Uint32(b)
 }
@@ -394,10 +396,10 @@ func (ti onHeapTableIndex) offsetAt(ord uint32) uint64 {
 	chunks1 := ti.count - ti.count/2
 	var b []byte
 	if ord < chunks1 {
-		off := int64(offsetSize * ord)
+		off := offsetSize * int64(ord)
 		b = ti.offsets1[off : off+offsetSize]
 	} else {
-		off := int64(offsetSize * (ord - chunks1))
+		off := offsetSize * int64(ord-chunks1)
 		b = ti.offsets2[off : off+offsetSize]
 	}
 	return binary.BigEndian.Uint64(b)
@@ -406,7 +408,7 @@ func (ti onHeapTableIndex) offsetAt(ord uint32) uint64 {
 func (ti onHeapTableIndex) ordinals() ([]uint32, error) {
 	// todo: |o| is not accounted for in the memory quota
 	o := make([]uint32, ti.count)
-	for i, off := uint32(0), 0; i < ti.count; i, off = i+1, off+prefixTupleSize {
+	for i, off := uint32(0), uint64(0); i < ti.count; i, off = i+1, off+prefixTupleSize {
 		b := ti.prefixTuples[off+hash.PrefixLen : off+prefixTupleSize]
 		o[i] = binary.BigEndian.Uint32(b)
 	}
@@ -416,7 +418,7 @@ func (ti onHeapTableIndex) ordinals() ([]uint32, error) {
 func (ti onHeapTableIndex) prefixes() ([]uint64, error) {
 	// todo: |p| is not accounted for in the memory quota
 	p := make([]uint64, ti.count)
-	for i, off := uint32(0), 0; i < ti.count; i, off = i+1, off+prefixTupleSize {
+	for i, off := uint32(0), uint64(0); i < ti.count; i, off = i+1, off+prefixTupleSize {
 		b := ti.prefixTuples[off : off+hash.PrefixLen]
 		p[i] = binary.BigEndian.Uint64(b)
 	}
@@ -425,13 +427,14 @@ func (ti onHeapTableIndex) prefixes() ([]uint64, error) {
 
 func (ti onHeapTableIndex) hashAt(idx uint32) hash.Hash {
 	// Get tuple
-	off := int64(prefixTupleSize * idx)
+	off := prefixTupleSize * int64(idx)
 	tuple := ti.prefixTuples[off : off+prefixTupleSize]
 
 	// Get prefix, ordinal, and suffix
 	prefix := tuple[:hash.PrefixLen]
-	ord := binary.BigEndian.Uint32(tuple[hash.PrefixLen:]) * hash.SuffixLen
-	suffix := ti.suffixes[ord : ord+hash.SuffixLen] // suffix is 12 bytes
+	ord := binary.BigEndian.Uint32(tuple[hash.PrefixLen:])
+	suffixOffset := uint64(ord) * hash.SuffixLen
+	suffix := ti.suffixes[suffixOffset : suffixOffset+hash.SuffixLen]
 
 	// Combine prefix and suffix to get hash
 	buf := [hash.ByteLen]byte{}

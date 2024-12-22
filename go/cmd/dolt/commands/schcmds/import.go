@@ -330,7 +330,7 @@ func putEmptyTableWithSchema(ctx context.Context, tblName string, root doltdb.Ro
 		return nil, errhand.BuildDError("error: failed to get table.").AddCause(err).Build()
 	}
 
-	empty, err := durable.NewEmptyIndex(ctx, root.VRW(), root.NodeStore(), sch)
+	empty, err := durable.NewEmptyPrimaryIndex(ctx, root.VRW(), root.NodeStore(), sch)
 	if err != nil {
 		return nil, errhand.BuildDError("error: failed to get table.").AddCause(err).Build()
 	}
@@ -428,6 +428,7 @@ func CombineColCollections(ctx context.Context, root doltdb.RootValue, inferredC
 		return nil, verr
 	}
 
+	// NOTE: This code is only used in the import codepath for Dolt, so we don't use a schema to qualify the table name
 	newCols, err := doltdb.GenerateTagsForNewColColl(ctx, root, impOpts.tableName, newCols)
 	if err != nil {
 		return nil, errhand.BuildDError("failed to generate new schema").AddCause(err).Build()

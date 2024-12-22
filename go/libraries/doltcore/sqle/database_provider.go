@@ -36,6 +36,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dfunctions"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dprocedures"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtablefunctions"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/resolve"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqlserver"
 	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
@@ -126,6 +127,11 @@ func NewDoltDatabaseProviderWithDatabases(defaultBranch string, fs filesys.Files
 		funcs[strings.ToLower(fn.FunctionName())] = fn
 	}
 
+	tableFuncs := make(map[string]sql.TableFunction, len(dtablefunctions.DoltTableFunctions))
+	for _, fn := range dtablefunctions.DoltTableFunctions {
+		tableFuncs[strings.ToLower(fn.Name())] = fn
+	}
+
 	externalProcedures := sql.NewExternalStoredProcedureRegistry()
 	for _, esp := range dprocedures.DoltProcedures {
 		externalProcedures.Register(esp)
@@ -142,6 +148,7 @@ func NewDoltDatabaseProviderWithDatabases(defaultBranch string, fs filesys.Files
 		dbLocations:            dbLocations,
 		databases:              dbs,
 		functions:              funcs,
+		tableFunctions:         tableFuncs,
 		externalProcedures:     externalProcedures,
 		mu:                     &sync.RWMutex{},
 		fs:                     fs,
@@ -411,16 +418,51 @@ func (p *DoltDatabaseProvider) CreateDatabase(ctx *sql.Context, name string) err
 	return p.CreateCollatedDatabase(ctx, name, sql.Collation_Default)
 }
 
-func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name string, collation sql.CollationID) (err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func commitTransaction(ctx *sql.Context, dSess *dsess.DoltSession, rsc *doltdb.ReplicationStatusController) error {
+	currentTx := ctx.GetTransaction()
 
+	err := dSess.CommitTransaction(ctx, currentTx)
+	if err != nil {
+		return err
+	}
+	newTx, err := dSess.StartTransaction(ctx, sql.ReadWrite)
+	if err != nil {
+		return err
+	}
+	ctx.SetTransaction(newTx)
+
+	if rsc != nil {
+		dsess.WaitForReplicationController(ctx, *rsc)
+	}
+
+	return nil
+}
+
+func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name string, collation sql.CollationID) (err error) {
 	exists, isDir := p.fs.Exists(name)
 	if exists && isDir {
 		return sql.ErrDatabaseExists.New(name)
 	} else if exists {
 		return fmt.Errorf("Cannot create DB, file exists at %s", name)
 	}
+
+	sess := dsess.DSessFromSess(ctx.Session)
+	var rsc doltdb.ReplicationStatusController
+
+	// before we create a new database, we need to implicitly commit any current transaction, because we'll begin a new
+	// one after we create the new DB
+	err = commitTransaction(ctx, sess, &rsc)
+	if err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	needUnlock := true
+	defer func() {
+		if needUnlock {
+			p.mu.Unlock()
+		}
+	}()
 
 	err = p.fs.MkDirs(name)
 	if err != nil {
@@ -440,7 +482,6 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 	}
 
 	// TODO: fill in version appropriately
-	sess := dsess.DSessFromSess(ctx.Session)
 	newEnv := env.Load(ctx, env.GetCurrentUserHomeDir, newFs, p.dbFactoryUrl, "TODO")
 
 	newDbStorageFormat := types.Format_Default
@@ -448,6 +489,8 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 	if err != nil {
 		return err
 	}
+
+	updatedCollation, updatedSchemas := false, false
 
 	// Set the collation
 	if collation != sql.Collation_Default {
@@ -466,6 +509,8 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 		if err = newEnv.UpdateStagedRoot(ctx, newRoot); err != nil {
 			return err
 		}
+
+		updatedCollation = true
 	}
 
 	// If the search path is enabled, we need to create our initial schema object (public and pg_catalog are available
@@ -488,6 +533,12 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 		if err != nil {
 			return err
 		}
+		workingRoot, err = workingRoot.CreateDatabaseSchema(ctx, schema.DatabaseSchema{
+			Name: doltdb.DoltNamespace,
+		})
+		if err != nil {
+			return err
+		}
 
 		if err = newEnv.UpdateWorkingRoot(ctx, workingRoot); err != nil {
 			return err
@@ -495,9 +546,60 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 		if err = newEnv.UpdateStagedRoot(ctx, workingRoot); err != nil {
 			return err
 		}
+
+		updatedSchemas = true
 	}
 
-	return p.registerNewDatabase(ctx, name, newEnv)
+	err = p.registerNewDatabase(ctx, name, newEnv)
+	if err != nil {
+		return err
+	}
+
+	// Since we just created this database, we need to commit the current transaction so that the new database is
+	// usable in this session.
+
+	// We need to unlock the provider early to avoid a deadlock with the commit
+	needUnlock = false
+	p.mu.Unlock()
+
+	err = commitTransaction(ctx, sess, &rsc)
+	if err != nil {
+		return err
+	}
+
+	needsDoltCommit := updatedSchemas || updatedCollation
+	if needsDoltCommit {
+		// After making changes to the working set for the DB, create a new dolt commit so that any newly created
+		// branches have those changes
+		// TODO: it would be better if there weren't a commit for this database where these changes didn't exist, but
+		//  we always create an empty commit as part of initializing a repo right now, and you cannot amend the initial
+		//  commit
+		roots, ok := sess.GetRoots(ctx, name)
+		if !ok {
+			return fmt.Errorf("unable to get roots for database %s", name)
+		}
+
+		t := ctx.QueryTime()
+		userName := ctx.Client().User
+		userEmail := fmt.Sprintf("%s@%s", ctx.Client().User, ctx.Client().Address)
+
+		pendingCommit, err := sess.NewPendingCommit(ctx, name, roots, actions.CommitStagedProps{
+			Message: "CREATE DATABASE",
+			Date:    t,
+			Name:    userName,
+			Email:   userEmail,
+		})
+		if err != nil {
+			return err
+		}
+
+		_, err = sess.DoltCommit(ctx, name, sess.GetTransaction(), pendingCommit)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 type InitDatabaseHook func(ctx *sql.Context, pro *DoltDatabaseProvider, name string, env *env.DoltEnv, db dsess.SqlDatabase) error
@@ -1289,12 +1391,12 @@ func (p *DoltDatabaseProvider) SessionDatabase(ctx *sql.Context, name string) (d
 }
 
 // Function implements the FunctionProvider interface
-func (p *DoltDatabaseProvider) Function(_ *sql.Context, name string) (sql.Function, error) {
+func (p *DoltDatabaseProvider) Function(_ *sql.Context, name string) (sql.Function, bool) {
 	fn, ok := p.functions[strings.ToLower(name)]
 	if !ok {
-		return nil, sql.ErrFunctionNotFound.New(name)
+		return nil, false
 	}
-	return fn, nil
+	return fn, true
 }
 
 func (p *DoltDatabaseProvider) Register(d sql.ExternalStoredProcedureDetails) {
@@ -1312,32 +1414,11 @@ func (p *DoltDatabaseProvider) ExternalStoredProcedures(_ *sql.Context, name str
 }
 
 // TableFunction implements the sql.TableFunctionProvider interface
-func (p *DoltDatabaseProvider) TableFunction(_ *sql.Context, name string) (sql.TableFunction, error) {
-	// TODO: Clean this up and store table functions in a map, similar to regular functions.
-	switch strings.ToLower(name) {
-	case "dolt_diff":
-		return &DiffTableFunction{}, nil
-	case "dolt_diff_stat":
-		return &DiffStatTableFunction{}, nil
-	case "dolt_diff_summary":
-		return &DiffSummaryTableFunction{}, nil
-	case "dolt_log":
-		return &LogTableFunction{}, nil
-	case "dolt_patch":
-		return &PatchTableFunction{}, nil
-	case "dolt_schema_diff":
-		return &SchemaDiffTableFunction{}, nil
-	case "dolt_reflog":
-		return &ReflogTableFunction{}, nil
-	case "dolt_query_diff":
-		return &QueryDiffTableFunction{}, nil
+func (p *DoltDatabaseProvider) TableFunction(_ *sql.Context, name string) (sql.TableFunction, bool) {
+	if fun, ok := p.tableFunctions[strings.ToLower(name)]; ok {
+		return fun, true
 	}
-
-	if fun, ok := p.tableFunctions[name]; ok {
-		return fun, nil
-	}
-
-	return nil, sql.ErrTableFunctionNotFound.New(name)
+	return nil, false
 }
 
 // ensureReplicaHeadExists tries to pull the latest version of a remote branch. Will fail if the branch

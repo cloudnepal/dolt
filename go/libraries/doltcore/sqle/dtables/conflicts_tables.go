@@ -28,16 +28,16 @@ import (
 )
 
 // NewConflictsTable returns a new ConflictsTable instance
-func NewConflictsTable(ctx *sql.Context, tblName string, srcTbl sql.Table, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
-	tbl, tblName, ok, err := doltdb.GetTableInsensitive(ctx, root, doltdb.TableName{Name: tblName})
+func NewConflictsTable(ctx *sql.Context, tblName doltdb.TableName, srcTable sql.Table, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
+	var tbl *doltdb.Table
+	var err error
+	tbl, tblName, err = getTableInsensitiveOrError(ctx, root, tblName)
 	if err != nil {
 		return nil, err
-	} else if !ok {
-		return nil, sql.ErrTableNotFound.New(tblName)
 	}
 
 	if types.IsFormat_DOLT(tbl.Format()) {
-		upd, ok := srcTbl.(sql.UpdatableTable)
+		upd, ok := srcTable.(sql.UpdatableTable)
 		if !ok {
 			return nil, fmt.Errorf("%s can not have conflicts because it is not updateable", tblName)
 		}
@@ -47,14 +47,14 @@ func NewConflictsTable(ctx *sql.Context, tblName string, srcTbl sql.Table, root 
 	return newNomsConflictsTable(ctx, tbl, tblName, root, rs)
 }
 
-func newNomsConflictsTable(ctx *sql.Context, tbl *doltdb.Table, tblName string, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
+func newNomsConflictsTable(ctx *sql.Context, tbl *doltdb.Table, tblName doltdb.TableName, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
 	rd, err := merge.NewConflictReader(ctx, tbl, tblName)
 	if err != nil {
 		return nil, err
 	}
 	confSch := rd.GetSchema()
 
-	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConfTablePrefix+tblName, confSch)
+	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConfTablePrefix+tblName.Name, confSch)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +74,7 @@ var _ sql.DeletableTable = ConflictsTable{}
 
 // ConflictsTable is a sql.Table implementation that provides access to the conflicts that exist for a user table
 type ConflictsTable struct {
-	tblName string
+	tblName doltdb.TableName
 	sqlSch  sql.PrimaryKeySchema
 	root    doltdb.RootValue
 	tbl     *doltdb.Table
@@ -88,12 +88,12 @@ type RootSetter interface {
 
 // Name returns the name of the table
 func (ct ConflictsTable) Name() string {
-	return doltdb.DoltConfTablePrefix + ct.tblName
+	return doltdb.DoltConfTablePrefix + ct.tblName.Name
 }
 
 // String returns a string identifying the table
 func (ct ConflictsTable) String() string {
-	return doltdb.DoltConfTablePrefix + ct.tblName
+	return doltdb.DoltConfTablePrefix + ct.tblName.Name
 }
 
 // Schema returns the sql.Schema of the table
@@ -203,7 +203,7 @@ func (cd *conflictDeleter) Close(ctx *sql.Context) error {
 		return err
 	}
 
-	updatedRoot, err := cd.ct.root.PutTable(ctx, doltdb.TableName{Name: cd.ct.tblName}, updatedTbl)
+	updatedRoot, err := cd.ct.root.PutTable(ctx, cd.ct.tblName, updatedTbl)
 
 	if err != nil {
 		return err

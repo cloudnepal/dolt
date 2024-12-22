@@ -95,7 +95,7 @@ import (
      -Total Uncompressed Chunk Data is the sum of the uncompressed byte lengths of all contained chunk byte slices.
      -Magic Number is the first 8 bytes of the SHA256 hash of "https://github.com/attic-labs/nbs".
 
-    NOTE: Unsigned integer quanities, hashes and hash suffix are all encoded big-endian
+    NOTE: Unsigned integer quantities, hashes and hash suffix are all encoded big-endian
 
 
   Looking up Chunks in an NBS Table
@@ -240,6 +240,15 @@ type chunkSource interface {
 
 	// currentSize returns the current total physical size of the chunkSource.
 	currentSize() uint64
+
+	// scanAllChunks will call the provided function for each chunk in the chunkSource. This is currently used
+	// to perform integrity checks, and the chunk passed in will have the address from the index, and the content
+	// loaded. This iterator doesn't have a way to stop the iteration other than the context being canceled.
+	//
+	// If there is a failure reading the chunk, the error will be returned - note that this can happen in the middle of
+	// the scan, and will likely mean that the scan didn't complete. Note that errors returned by this method are not
+	// related to the callback - if the callback discovers an error, it must manage that out of band.
+	iterateAllChunks(context.Context, func(chunk chunks.Chunk)) error
 }
 
 type chunkSources []chunkSource

@@ -15,6 +15,7 @@
 package dtables
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 
@@ -27,31 +28,32 @@ import (
 // TableOfTablesWithViolations is a sql.Table implementation that implements a system table which shows the
 // tables that contain constraint violations.
 type TableOfTablesWithViolations struct {
-	root doltdb.RootValue
+	tableName string
+	root      doltdb.RootValue
 }
 
 var _ sql.Table = (*TableOfTablesWithViolations)(nil)
 
 // NewTableOfTablesConstraintViolations creates a TableOfTablesWithViolations.
-func NewTableOfTablesConstraintViolations(ctx *sql.Context, root doltdb.RootValue) sql.Table {
-	return &TableOfTablesWithViolations{root: root}
+func NewTableOfTablesConstraintViolations(ctx *sql.Context, tableName string, root doltdb.RootValue) sql.Table {
+	return &TableOfTablesWithViolations{tableName: tableName, root: root}
 }
 
 // Name implements the interface sql.Table.
 func (totwv *TableOfTablesWithViolations) Name() string {
-	return doltdb.TableOfTablesWithViolationsName
+	return totwv.tableName
 }
 
 // String implements the interface sql.Table.
 func (totwv *TableOfTablesWithViolations) String() string {
-	return doltdb.TableOfTablesWithViolationsName
+	return totwv.tableName
 }
 
 // Schema implements the interface sql.Table.
 func (totwv *TableOfTablesWithViolations) Schema() sql.Schema {
 	return []*sql.Column{
-		{Name: "table", Type: types.Text, Source: doltdb.TableOfTablesWithViolationsName, PrimaryKey: true},
-		{Name: "num_violations", Type: types.Uint64, Source: doltdb.TableOfTablesWithViolationsName, PrimaryKey: false},
+		{Name: "table", Type: types.Text, Source: totwv.tableName, PrimaryKey: true},
+		{Name: "num_violations", Type: types.Uint64, Source: totwv.tableName, PrimaryKey: false},
 	}
 }
 
@@ -78,9 +80,9 @@ func (totwv *TableOfTablesWithViolations) Partitions(ctx *sql.Context) (sql.Part
 
 // PartitionRows implements the interface sql.Table.
 func (totwv *TableOfTablesWithViolations) PartitionRows(ctx *sql.Context, part sql.Partition) (sql.RowIter, error) {
-	tblName := string(part.Key())
+	tblName := decodeTableName(part.Key())
 	var rows []sql.Row
-	tbl, _, ok, err := doltdb.GetTableInsensitive(ctx, totwv.root, doltdb.TableName{Name: tblName})
+	tbl, ok, err := totwv.root.GetTable(ctx, tblName)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +93,7 @@ func (totwv *TableOfTablesWithViolations) PartitionRows(ctx *sql.Context, part s
 	if err != nil {
 		return nil, err
 	}
-	rows = append(rows, sql.Row{tblName, n})
+	rows = append(rows, sql.Row{tblName.Name, n})
 	return sql.RowsToRowIter(rows...), nil
 }
 
@@ -119,11 +121,24 @@ func (t *tableOfTablesPartitionIter) Close(context *sql.Context) error {
 }
 
 // tableOfTablesPartition is a partition returned from tableOfTablesPartitionIter, which is just a table name.
-type tableOfTablesPartition string
+type tableOfTablesPartition doltdb.TableName
 
-var _ sql.Partition = tableOfTablesPartition("")
+var _ sql.Partition = tableOfTablesPartition(doltdb.TableName{})
 
 // Key implements the interface sql.Partition.
 func (t tableOfTablesPartition) Key() []byte {
-	return []byte(t)
+	return encodeTableName(doltdb.TableName(t))
+}
+
+func encodeTableName(name doltdb.TableName) []byte {
+	b := bytes.Buffer{}
+	b.WriteString(name.Schema)
+	b.WriteByte(0)
+	b.WriteString(name.Name)
+	return b.Bytes()
+}
+
+func decodeTableName(b []byte) doltdb.TableName {
+	parts := bytes.SplitN(b, []byte{0}, 2)
+	return doltdb.TableName{Schema: string(parts[0]), Name: string(parts[1])}
 }

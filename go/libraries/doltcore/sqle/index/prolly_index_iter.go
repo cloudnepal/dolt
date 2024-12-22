@@ -68,7 +68,7 @@ func newProllyIndexIter(
 	primary := durable.ProllyMapFromIndex(dprimary)
 	kd, _ := primary.Descriptors()
 	pkBld := val.NewTupleBuilder(kd)
-	pkMap := ordinalMappingFromIndex(idx)
+	pkMap := OrdinalMappingFromIndex(idx)
 	keyProj, valProj, ordProj := projectionMappings(idx.Schema(), projections)
 
 	iter := prollyIndexIter{
@@ -135,7 +135,7 @@ func (p prollyIndexIter) Close(*sql.Context) error {
 	return nil
 }
 
-func ordinalMappingFromIndex(idx DoltIndex) (m val.OrdinalMapping) {
+func OrdinalMappingFromIndex(idx DoltIndex) (m val.OrdinalMapping) {
 	def := idx.Schema().Indexes().GetByName(idx.ID())
 	pks := def.PrimaryKeyTags()
 	if len(pks) == 0 { // keyless index
@@ -292,23 +292,29 @@ type prollyKeylessIndexIter struct {
 
 var _ sql.RowIter = prollyKeylessIndexIter{}
 
-func newProllyKeylessIndexIter(
-	ctx *sql.Context,
-	idx DoltIndex,
-	rng prolly.Range,
-	pkSch sql.PrimaryKeySchema,
-	projections []uint64,
-	rows, dsecondary durable.Index,
-) (prollyKeylessIndexIter, error) {
+func newProllyKeylessIndexIter(ctx *sql.Context, idx DoltIndex, rng prolly.Range, doltgresRange *DoltgresRange, pkSch sql.PrimaryKeySchema, projections []uint64, rows, dsecondary durable.Index, reverse bool) (prollyKeylessIndexIter, error) {
 	secondary := durable.ProllyMapFromIndex(dsecondary)
-	indexIter, err := secondary.IterRange(ctx, rng)
-	if err != nil {
-		return prollyKeylessIndexIter{}, err
+	var indexIter prolly.MapIter
+	var err error
+	if doltgresRange == nil {
+		if reverse {
+			indexIter, err = secondary.IterRangeReverse(ctx, rng)
+		} else {
+			indexIter, err = secondary.IterRange(ctx, rng)
+		}
+		if err != nil {
+			return prollyKeylessIndexIter{}, err
+		}
+	} else {
+		indexIter, err = doltgresProllyMapIterator(ctx, secondary.KeyDesc(), secondary.NodeStore(), secondary.Tuples().Root, *doltgresRange)
+		if err != nil {
+			return prollyKeylessIndexIter{}, err
+		}
 	}
 
 	clustered := durable.ProllyMapFromIndex(rows)
 	keyDesc, valDesc := clustered.Descriptors()
-	indexMap := ordinalMappingFromIndex(idx)
+	indexMap := OrdinalMappingFromIndex(idx)
 	keyBld := val.NewTupleBuilder(keyDesc)
 	sch := idx.Schema()
 	_, vm, om := projectionMappings(sch, projections)

@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"runtime"
 	"strings"
 
 	sqle "github.com/dolthub/go-mysql-server"
@@ -282,7 +281,7 @@ func processFilterQuery(ctx context.Context, dEnv *env.DoltEnv, root doltdb.Root
 		return nil, err
 	}
 
-	scanner := NewSqlStatementScanner(strings.NewReader(query))
+	scanner := newStreamScanner(strings.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +294,7 @@ func processFilterQuery(ctx context.Context, dEnv *env.DoltEnv, root doltdb.Root
 		}
 
 		err = func() error {
-			_, itr, err := eng.Query(sqlCtx, q)
+			_, itr, _, err := eng.Query(sqlCtx, q)
 			if err != nil {
 				return err
 			}
@@ -370,8 +369,7 @@ func rebaseSqlEngine(ctx context.Context, dEnv *env.DoltEnv, root doltdb.RootVal
 		return nil, nil, err
 	}
 
-	parallelism := runtime.GOMAXPROCS(0)
-	azr := analyzer.NewBuilder(pro).WithParallelism(parallelism).Build()
+	azr := analyzer.NewDefault(pro)
 
 	err = db.SetRoot(sqlCtx, root)
 	if err != nil {

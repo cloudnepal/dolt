@@ -21,7 +21,6 @@ import (
 	"sync/atomic"
 
 	"github.com/dolthub/go-mysql-server/sql"
-	"github.com/dolthub/go-mysql-server/sql/analyzer"
 	"github.com/dolthub/go-mysql-server/sql/analyzer/analyzererrors"
 	"github.com/dolthub/go-mysql-server/sql/plan"
 	"github.com/dolthub/go-mysql-server/sql/planbuilder"
@@ -132,13 +131,13 @@ func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan 
 		return err
 	}
 
-	_, _, err = s.se.Query(s.sqlCtx, "START TRANSACTION")
+	_, _, _, err = s.se.Query(s.sqlCtx, "START TRANSACTION")
 	if err != nil {
 		return err
 	}
 
 	if s.disableFks {
-		_, _, err = s.se.Query(s.sqlCtx, "SET FOREIGN_KEY_CHECKS = 0")
+		_, _, _, err = s.se.Query(s.sqlCtx, "SET FOREIGN_KEY_CHECKS = 0")
 		if err != nil {
 			return err
 		}
@@ -229,7 +228,7 @@ func (s *SqlEngineTableWriter) WriteRows(ctx context.Context, inputChannel chan 
 }
 
 func (s *SqlEngineTableWriter) Commit(ctx context.Context) error {
-	_, _, err := s.se.Query(s.sqlCtx, "COMMIT")
+	_, _, _, err := s.se.Query(s.sqlCtx, "COMMIT")
 	return err
 }
 
@@ -244,7 +243,7 @@ func (s *SqlEngineTableWriter) TableSchema() sql.PrimaryKeySchema {
 // forceDropTableIfNeeded drop the given table in case the -f parameter is passed.
 func (s *SqlEngineTableWriter) forceDropTableIfNeeded() error {
 	if s.force {
-		_, _, err := s.se.Query(s.sqlCtx, fmt.Sprintf("DROP TABLE IF EXISTS `%s`", s.tableName))
+		_, _, _, err := s.se.Query(s.sqlCtx, fmt.Sprintf("DROP TABLE IF EXISTS `%s`", s.tableName))
 		return err
 	}
 
@@ -257,7 +256,7 @@ func (s *SqlEngineTableWriter) createOrEmptyTableIfNeeded() error {
 	case CreateOp:
 		return s.createTable()
 	case ReplaceOp:
-		_, _, err := s.se.Query(s.sqlCtx, fmt.Sprintf("TRUNCATE TABLE `%s`", s.tableName))
+		_, _, _, err := s.se.Query(s.sqlCtx, fmt.Sprintf("TRUNCATE TABLE `%s`", s.tableName))
 		return err
 	default:
 		return nil
@@ -283,7 +282,7 @@ func (s *SqlEngineTableWriter) createTable() error {
 	}
 
 	createTable := sql.GenerateCreateTableStatement(s.tableName, sqlCols, "", sql.CharacterSet_utf8mb4.String(), sql.Collation_Default.String(), "")
-	_, iter, err := s.se.Query(s.sqlCtx, createTable)
+	_, iter, _, err := s.se.Query(s.sqlCtx, createTable)
 	if err != nil {
 		return err
 	}
@@ -312,9 +311,9 @@ func (s *SqlEngineTableWriter) getInsertNode(inputChannel chan sql.Row, replace 
 	}
 
 	sqlEngine := s.se.GetUnderlyingEngine()
-	binder := planbuilder.New(s.sqlCtx, sqlEngine.Analyzer.Catalog, sqlEngine.Parser)
+	binder := planbuilder.New(s.sqlCtx, sqlEngine.Analyzer.Catalog, sqlEngine.EventScheduler, sqlEngine.Parser)
 	insert := fmt.Sprintf("insert into `%s` (%s) VALUES (%s)%s", s.tableName, colNames, values, duplicate)
-	parsed, _, _, qFlags, err := binder.Parse(insert, false)
+	parsed, _, _, qFlags, err := binder.Parse(insert, nil, false)
 	if err != nil {
 		return nil, fmt.Errorf("error constructing import query '%s': %w", insert, err)
 	}
@@ -342,8 +341,6 @@ func (s *SqlEngineTableWriter) getInsertNode(inputChannel chan sql.Row, replace 
 	if err != nil {
 		return nil, err
 	}
-
-	analyzed = analyzer.StripPassthroughNodes(analyzed)
 
 	// Get the first insert (wrapped with the error handler)
 	transform.Inspect(analyzed, func(node sql.Node) bool {

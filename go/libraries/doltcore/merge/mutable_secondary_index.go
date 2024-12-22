@@ -35,9 +35,6 @@ func GetMutableSecondaryIdxs(ctx *sql.Context, ourSch, sch schema.Schema, tableN
 			return nil, err
 		}
 		m := durable.ProllyMapFromIndex(idx)
-		if schema.IsKeyless(sch) {
-			m = prolly.ConvertToSecondaryKeylessIndex(m)
-		}
 		mods[i], err = NewMutableSecondaryIdx(ctx, m, ourSch, sch, tableName, index)
 		if err != nil {
 			return nil, err
@@ -75,8 +72,13 @@ func GetMutableSecondaryIdxsWithPending(ctx *sql.Context, ourSch, sch schema.Sch
 		// If the schema has changed, don't reuse the index.
 		// TODO: This isn't technically required, but correctly handling updating secondary indexes when only some
 		// of the table's rows have been updated is difficult to get right.
-		// Dropping the index is potentially slower but guarenteed to be correct.
-		if !m.KeyDesc().Equals(index.Schema().GetKeyDescriptorWithNoConversion()) {
+		// Dropping the index is potentially slower but guaranteed to be correct.
+		idxKeyDesc := m.KeyDesc()
+		if schema.IsKeyless(sch) {
+			idxKeyDesc = idxKeyDesc.PrefixDesc(idxKeyDesc.Count() - 1)
+		}
+
+		if !idxKeyDesc.Equals(index.Schema().GetKeyDescriptorWithNoConversion()) {
 			continue
 		}
 
@@ -84,9 +86,6 @@ func GetMutableSecondaryIdxsWithPending(ctx *sql.Context, ourSch, sch schema.Sch
 			continue
 		}
 
-		if schema.IsKeyless(sch) {
-			m = prolly.ConvertToSecondaryKeylessIndex(m)
-		}
 		newMutableSecondaryIdx, err := NewMutableSecondaryIdx(ctx, m, ourSch, sch, tableName, index)
 		if err != nil {
 			return nil, err

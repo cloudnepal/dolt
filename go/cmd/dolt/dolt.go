@@ -43,6 +43,7 @@ import (
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands/admin"
+	"github.com/dolthub/dolt/go/cmd/dolt/commands/ci"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands/cnfcmds"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands/credcmds"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands/cvcmds"
@@ -109,6 +110,7 @@ var doltSubCommands = []cli.Command{
 	indexcmds.Commands,
 	commands.ReadTablesCmd{},
 	commands.GarbageCollectionCmd{},
+	commands.FsckCmd{},
 	commands.FilterBranchCmd{},
 	commands.MergeBaseCmd{},
 	commands.RootsCmd{},
@@ -125,6 +127,7 @@ var doltSubCommands = []cli.Command{
 	commands.ReflogCmd{},
 	commands.RebaseCmd{},
 	commands.ArchiveCmd{},
+	ci.Commands,
 }
 
 var commandsWithoutCliCtx = []cli.Command{
@@ -151,6 +154,7 @@ var commandsWithoutCliCtx = []cli.Command{
 	&commands.Assist{},
 	commands.ProfileCmd{},
 	commands.ArchiveCmd{},
+	commands.FsckCmd{},
 }
 
 var commandsWithoutGlobalArgSupport = []cli.Command{
@@ -164,6 +168,7 @@ var commandsWithoutGlobalArgSupport = []cli.Command{
 	sqlserver.SqlServerCmd{VersionStr: doltversion.Version},
 	commands.VersionCmd{VersionStr: doltversion.Version},
 	commands.ConfigCmd{},
+	ci.Commands,
 }
 
 // commands that do not need write access for the current directory
@@ -426,7 +431,7 @@ func runMain() int {
 			case featureVersionFlag:
 				var err error
 				if len(args) == 0 {
-					err = fmt.Errorf("missing argument for the --feature-version flag")
+					err = errors.New("missing argument for the --feature-version flag")
 				} else {
 					if featureVersion, err := strconv.Atoi(args[1]); err == nil {
 						doltdb.DoltFeatureVersion = doltdb.FeatureVersion(featureVersion)
@@ -510,6 +515,11 @@ func runMain() int {
 		return 1
 	}
 
+	if dEnv.CfgLoadErr != nil {
+		cli.PrintErrln(color.RedString("Failed to load the global config. %v", dEnv.CfgLoadErr))
+		return 1
+	}
+
 	strMetricsDisabled := dEnv.Config.GetStringOrDefault(config.MetricsDisabled, "false")
 	var metricsEmitter events.Emitter
 	metricsEmitter = events.NewFileEmitter(homeDir, dbfactory.DoltDir)
@@ -520,10 +530,6 @@ func runMain() int {
 
 	events.SetGlobalCollector(events.NewCollector(doltversion.Version, metricsEmitter))
 
-	if dEnv.CfgLoadErr != nil {
-		cli.PrintErrln(color.RedString("Failed to load the global config. %v", dEnv.CfgLoadErr))
-		return 1
-	}
 	globalConfig, ok := dEnv.Config.GetConfig(env.GlobalConfig)
 	if !ok {
 		cli.PrintErrln(color.RedString("Failed to get global config"))
@@ -736,12 +742,12 @@ If you're interested in running this command against a remote host, hit us up on
 
 	if noValidRepository && isValidRepositoryRequired {
 		return func(ctx context.Context) (cli.Queryist, *sql.Context, func(), error) {
-			err := fmt.Errorf("The current directory is not a valid dolt repository.")
+			err := errors.New("The current directory is not a valid dolt repository.")
 			if errors.Is(rootEnv.DBLoadError, nbs.ErrUnsupportedTableFileFormat) {
 				// This is fairly targeted and specific to allow for better error messaging. We should consider
 				// breaking this out into its own function if we add more conditions.
 
-				err = fmt.Errorf("The data in this database is in an unsupported format. Please upgrade to the latest version of Dolt.")
+				err = errors.New("The data in this database is in an unsupported format. Please upgrade to the latest version of Dolt.")
 			}
 
 			return nil, nil, nil, err
@@ -888,7 +894,7 @@ func parseGlobalArgsAndSubCommandName(globalConfig config.ReadWriteConfig, args 
 	if err != nil {
 		if err == config.ErrConfigParamNotFound {
 			if hasProfile {
-				return nil, nil, "", fmt.Errorf("no profiles found")
+				return nil, nil, "", errors.New("no profiles found")
 			} else {
 				return apr, remaining, subcommandName, nil
 			}

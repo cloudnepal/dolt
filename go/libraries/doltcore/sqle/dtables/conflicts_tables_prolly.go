@@ -15,7 +15,6 @@
 package dtables
 
 import (
-	"context"
 	"encoding/base64"
 	"fmt"
 
@@ -36,7 +35,14 @@ import (
 	"github.com/dolthub/dolt/go/store/val"
 )
 
-func newProllyConflictsTable(ctx *sql.Context, tbl *doltdb.Table, sourceUpdatableTbl sql.UpdatableTable, tblName string, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
+func newProllyConflictsTable(
+	ctx *sql.Context,
+	tbl *doltdb.Table,
+	sourceUpdatableTbl sql.UpdatableTable,
+	tblName doltdb.TableName,
+	root doltdb.RootValue,
+	rs RootSetter,
+) (sql.Table, error) {
 	arts, err := tbl.GetArtifacts(ctx)
 	if err != nil {
 		return nil, err
@@ -51,7 +57,7 @@ func newProllyConflictsTable(ctx *sql.Context, tbl *doltdb.Table, sourceUpdatabl
 	if err != nil {
 		return nil, err
 	}
-	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConfTablePrefix+tblName, confSch)
+	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConfTablePrefix+tblName.Name, confSch)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +80,7 @@ func newProllyConflictsTable(ctx *sql.Context, tbl *doltdb.Table, sourceUpdatabl
 // ProllyConflictsTable is a sql.Table implementation that uses the merge
 // artifacts table to persist and read conflicts.
 type ProllyConflictsTable struct {
-	tblName                   string
+	tblName                   doltdb.TableName
 	sqlSch                    sql.PrimaryKeySchema
 	baseSch, ourSch, theirSch schema.Schema
 	root                      doltdb.RootValue
@@ -89,11 +95,11 @@ var _ sql.UpdatableTable = ProllyConflictsTable{}
 var _ sql.DeletableTable = ProllyConflictsTable{}
 
 func (ct ProllyConflictsTable) Name() string {
-	return doltdb.DoltConfTablePrefix + ct.tblName
+	return doltdb.DoltConfTablePrefix + ct.tblName.Name
 }
 
 func (ct ProllyConflictsTable) String() string {
-	return doltdb.DoltConfTablePrefix + ct.tblName
+	return doltdb.DoltConfTablePrefix + ct.tblName.Name
 }
 
 func (ct ProllyConflictsTable) Schema() sql.Schema {
@@ -113,8 +119,7 @@ func (ct ProllyConflictsTable) PartitionRows(ctx *sql.Context, part sql.Partitio
 }
 
 func (ct ProllyConflictsTable) Updater(ctx *sql.Context) sql.RowUpdater {
-	ourUpdater := ct.sqlTable.Updater(ctx)
-	return newProllyConflictOurTableUpdater(ourUpdater, ct.versionMappings, ct.baseSch, ct.ourSch, ct.theirSch)
+	return newProllyConflictOurTableUpdater(ctx, ct)
 }
 
 func (ct ProllyConflictsTable) Deleter(ctx *sql.Context) sql.RowDeleter {
@@ -123,7 +128,7 @@ func (ct ProllyConflictsTable) Deleter(ctx *sql.Context) sql.RowDeleter {
 
 type prollyConflictRowIter struct {
 	itr     prolly.ConflictArtifactIter
-	tblName string
+	tblName doltdb.TableName
 	vrw     types.ValueReadWriter
 	ns      tree.NodeStore
 	ourRows prolly.Map
@@ -397,20 +402,20 @@ func (itr *prollyConflictRowIter) nextConflictVals(ctx *sql.Context) (c conf, er
 
 // loadTableMaps loads the maps specified in the metadata if they are different from
 // the currently loaded maps. |baseHash| and |theirHash| are table hashes.
-func (itr *prollyConflictRowIter) loadTableMaps(ctx context.Context, baseHash, theirHash hash.Hash) error {
+func (itr *prollyConflictRowIter) loadTableMaps(ctx *sql.Context, baseHash, theirHash hash.Hash) error {
 	if itr.baseHash.Compare(baseHash) != 0 {
 		rv, err := doltdb.LoadRootValueFromRootIshAddr(ctx, itr.vrw, itr.ns, baseHash)
 		if err != nil {
 			return err
 		}
-		baseTbl, ok, err := rv.GetTable(ctx, doltdb.TableName{Name: itr.tblName})
+		baseTbl, ok, err := rv.GetTable(ctx, itr.tblName)
 		if err != nil {
 			return err
 		}
 
 		var idx durable.Index
 		if !ok {
-			idx, err = durable.NewEmptyIndex(ctx, itr.vrw, itr.ns, itr.ourSch)
+			idx, err = durable.NewEmptyPrimaryIndex(ctx, itr.vrw, itr.ns, itr.ourSch)
 		} else {
 			idx, err = baseTbl.GetRowData(ctx)
 		}
@@ -428,7 +433,8 @@ func (itr *prollyConflictRowIter) loadTableMaps(ctx context.Context, baseHash, t
 		if err != nil {
 			return err
 		}
-		theirTbl, ok, err := rv.GetTable(ctx, doltdb.TableName{Name: itr.tblName})
+
+		theirTbl, ok, err := rv.GetTable(ctx, itr.tblName)
 		if err != nil {
 			return err
 		}
@@ -462,11 +468,12 @@ type prollyConflictOurTableUpdater struct {
 	schemaOK                  bool
 }
 
-func newProllyConflictOurTableUpdater(ourUpdater sql.RowUpdater, versionMappings *versionMappings, baseSch, ourSch, theirSch schema.Schema) *prollyConflictOurTableUpdater {
+func newProllyConflictOurTableUpdater(ctx *sql.Context, ct ProllyConflictsTable) *prollyConflictOurTableUpdater {
+	ourUpdater := ct.sqlTable.Updater(ctx)
 	return &prollyConflictOurTableUpdater{
 		srcUpdater:      ourUpdater,
-		versionMappings: versionMappings,
-		pkOrdinals:      ourSch.GetPkOrdinals(),
+		versionMappings: ct.versionMappings,
+		pkOrdinals:      ct.ourSch.GetPkOrdinals(),
 	}
 }
 
@@ -653,7 +660,7 @@ func (cd *prollyConflictDeleter) Close(ctx *sql.Context) error {
 		return err
 	}
 
-	updatedRoot, err := cd.ct.root.PutTable(ctx, doltdb.TableName{Name: cd.ct.tblName}, updatedTbl)
+	updatedRoot, err := cd.ct.root.PutTable(ctx, cd.ct.tblName, updatedTbl)
 	if err != nil {
 		return err
 	}

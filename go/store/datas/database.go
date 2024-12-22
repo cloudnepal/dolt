@@ -97,6 +97,10 @@ type Database interface {
 	// `opts.Meta`.
 	Tag(ctx context.Context, ds Dataset, commitAddr hash.Hash, opts TagOptions) (Dataset, error)
 
+	// SetTuple puts an arbitrary byte array into the chunkstore.
+	// The dataset reference keys access to the value.
+	SetTuple(ctx context.Context, ds Dataset, val []byte) (Dataset, error)
+
 	// UpdateStashList updates the stash list dataset only with given address hash to the updated stash list.
 	// The new/updated stash list address should be obtained before calling this function depending on
 	// whether add or remove a stash actions have been performed. This function does not perform any actions
@@ -194,7 +198,7 @@ type GarbageCollector interface {
 
 	// GC traverses the database starting at the Root and removes
 	// all unreferenced data from persistent storage.
-	GC(ctx context.Context, oldGenRefs, newGenRefs hash.HashSet, safepointF func() error) error
+	GC(ctx context.Context, mode types.GCMode, oldGenRefs, newGenRefs hash.HashSet, safepointF func() error) error
 }
 
 // CanUsePuller returns true if a datas.Puller can be used to pull data from one Database into another.  Not all

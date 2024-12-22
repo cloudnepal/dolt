@@ -41,7 +41,7 @@ func (k prollyKeylessWriter) Name() string {
 	return k.name
 }
 
-func (k prollyKeylessWriter) Map(ctx context.Context) (prolly.Map, error) {
+func (k prollyKeylessWriter) Map(ctx context.Context) (prolly.MapInterface, error) {
 	return k.mut.Map(ctx)
 }
 
@@ -202,7 +202,7 @@ func (writer prollyKeylessSecondaryWriter) Name() string {
 }
 
 // Map implements the interface indexWriter.
-func (writer prollyKeylessSecondaryWriter) Map(ctx context.Context) (prolly.Map, error) {
+func (writer prollyKeylessSecondaryWriter) Map(ctx context.Context) (prolly.MapInterface, error) {
 	return writer.mut.Map(ctx)
 }
 
@@ -258,7 +258,7 @@ func (writer prollyKeylessSecondaryWriter) Insert(ctx context.Context, sqlRow sq
 
 	if writer.unique {
 		prefixKey := writer.prefixBld.Build(sharePool)
-		err := writer.checkForUniqueKeyError(ctx, prefixKey)
+		err := writer.checkForUniqueKeyError(ctx, prefixKey, sqlRow)
 		if err != nil {
 			return err
 		}
@@ -269,7 +269,7 @@ func (writer prollyKeylessSecondaryWriter) Insert(ctx context.Context, sqlRow sq
 	return writer.mut.Put(ctx, indexKey, val.EmptyTuple)
 }
 
-func (writer prollyKeylessSecondaryWriter) checkForUniqueKeyError(ctx context.Context, prefixKey val.Tuple) error {
+func (writer prollyKeylessSecondaryWriter) checkForUniqueKeyError(ctx context.Context, prefixKey val.Tuple, sqlRow sql.Row) error {
 	for i := 0; i < writer.prefixBld.Desc.Count(); i++ {
 		if writer.prefixBld.Desc.IsNull(i, prefixKey) {
 			return nil
@@ -286,7 +286,12 @@ func (writer prollyKeylessSecondaryWriter) checkForUniqueKeyError(ctx context.Co
 		return err
 	}
 	if err == nil {
-		keyStr := FormatKeyForUniqKeyErr(prefixKey, writer.prefixBld.Desc)
+		remappedSqlRow := make(sql.Row, len(sqlRow))
+		for to := range writer.keyMap {
+			from := writer.keyMap.MapOrdinal(to)
+			remappedSqlRow[to] = writer.trimKeyPart(to, sqlRow[from])
+		}
+		keyStr := FormatKeyForUniqKeyErr(prefixKey, writer.prefixBld.Desc, remappedSqlRow)
 		writer.hashBld.PutRaw(0, k.GetField(k.Count()-1))
 		existingKey := writer.hashBld.Build(sharePool)
 		return secondaryUniqueKeyError{keyStr: keyStr, existingKey: existingKey}

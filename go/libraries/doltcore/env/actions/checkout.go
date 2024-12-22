@@ -18,13 +18,14 @@ import (
 	"context"
 	"time"
 
-	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
-	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
-	"github.com/dolthub/dolt/go/libraries/utils/set"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/resolve"
+	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
@@ -87,10 +88,40 @@ func MoveTablesFromHeadToWorking(ctx context.Context, roots doltdb.Roots, tbls [
 	return roots, nil
 }
 
+// FindTableInRoots resolves a table by looking in all three roots (working,
+// staged, head) in that order.
+func FindTableInRoots(ctx *sql.Context, roots doltdb.Roots, name string) (doltdb.TableName, *doltdb.Table, bool, error) {
+	tbl, root, tblExists, err := resolve.Table(ctx, roots.Working, name)
+	if err != nil {
+		return doltdb.TableName{}, nil, false, err
+	}
+	if tblExists {
+		return tbl, root, true, nil
+	}
+
+	tbl, root, tblExists, err = resolve.Table(ctx, roots.Staged, name)
+	if err != nil {
+		return doltdb.TableName{}, nil, false, err
+	}
+	if tblExists {
+		return tbl, root, true, nil
+	}
+
+	tbl, root, tblExists, err = resolve.Table(ctx, roots.Head, name)
+	if err != nil {
+		return doltdb.TableName{}, nil, false, err
+	}
+	if tblExists {
+		return tbl, root, true, nil
+	}
+
+	return doltdb.TableName{}, nil, false, nil
+}
+
 // RootsForBranch returns the roots needed for a branch checkout. |roots.Head| should be the pre-checkout head. The
 // returned roots struct has |Head| set to |branchRoot|.
 func RootsForBranch(ctx context.Context, roots doltdb.Roots, branchRoot doltdb.RootValue, force bool) (doltdb.Roots, error) {
-	conflicts := set.NewStrSet([]string{})
+	conflicts := doltdb.NewTableNameSet(nil)
 	if roots.Head == nil {
 		roots.Working = branchRoot
 		roots.Staged = branchRoot
@@ -109,7 +140,7 @@ func RootsForBranch(ctx context.Context, roots doltdb.Roots, branchRoot doltdb.R
 	}
 
 	if conflicts.Size() > 0 {
-		return doltdb.Roots{}, ErrCheckoutWouldOverwrite{conflicts.AsSlice()}
+		return doltdb.Roots{}, ErrCheckoutWouldOverwrite{conflicts.AsStringSlice()}
 	}
 
 	workingForeignKeys, err := moveForeignKeys(ctx, roots.Head, branchRoot, roots.Working, force)
@@ -148,7 +179,7 @@ func RootsForBranch(ctx context.Context, roots doltdb.Roots, branchRoot doltdb.R
 
 // CleanOldWorkingSet resets the source branch's working set to the branch head, leaving the source branch unchanged
 func CleanOldWorkingSet(
-	ctx context.Context,
+	ctx *sql.Context,
 	dbData env.DbData,
 	doltDb *doltdb.DoltDB,
 	username, email string,
@@ -243,26 +274,25 @@ func BranchHeadRoot(ctx context.Context, db *doltdb.DoltDB, brName string) (dolt
 // When moving between branches, changes in the working set should travel with you.
 // Working set changes cannot be moved if the table differs between the old and new head,
 // in this case, we throw a conflict and error (as per Git).
-func moveModifiedTables(ctx context.Context, oldRoot, newRoot, changedRoot doltdb.RootValue, conflicts *set.StrSet, force bool) (map[string]hash.Hash, error) {
-	resultMap := make(map[string]hash.Hash)
-	// TODO: schema name
-	tblNames, err := newRoot.GetTableNames(ctx, doltdb.DefaultSchemaName)
+func moveModifiedTables(ctx context.Context, oldRoot, newRoot, changedRoot doltdb.RootValue, conflicts *doltdb.TableNameSet, force bool) (map[doltdb.TableName]hash.Hash, error) {
+	resultMap := make(map[doltdb.TableName]hash.Hash)
+	tblNames, err := doltdb.UnionTableNames(ctx, newRoot)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, tblName := range tblNames {
-		oldHash, _, err := oldRoot.GetTableHash(ctx, doltdb.TableName{Name: tblName})
+		oldHash, _, err := oldRoot.GetTableHash(ctx, tblName)
 		if err != nil {
 			return nil, err
 		}
 
-		newHash, _, err := newRoot.GetTableHash(ctx, doltdb.TableName{Name: tblName})
+		newHash, _, err := newRoot.GetTableHash(ctx, tblName)
 		if err != nil {
 			return nil, err
 		}
 
-		changedHash, _, err := changedRoot.GetTableHash(ctx, doltdb.TableName{Name: tblName})
+		changedHash, _, err := changedRoot.GetTableHash(ctx, tblName)
 		if err != nil {
 			return nil, err
 		}
@@ -278,20 +308,19 @@ func moveModifiedTables(ctx context.Context, oldRoot, newRoot, changedRoot doltd
 		}
 	}
 
-	// TODO: schema names
-	tblNames, err = changedRoot.GetTableNames(ctx, doltdb.DefaultSchemaName)
+	tblNames, err = doltdb.UnionTableNames(ctx, changedRoot)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, tblName := range tblNames {
 		if _, exists := resultMap[tblName]; !exists {
-			oldHash, _, err := oldRoot.GetTableHash(ctx, doltdb.TableName{Name: tblName})
+			oldHash, _, err := oldRoot.GetTableHash(ctx, tblName)
 			if err != nil {
 				return nil, err
 			}
 
-			changedHash, _, err := changedRoot.GetTableHash(ctx, doltdb.TableName{Name: tblName})
+			changedHash, _, err := changedRoot.GetTableHash(ctx, tblName)
 			if err != nil {
 				return nil, err
 			}
@@ -445,8 +474,8 @@ func mergeForeignKeyChanges(
 
 // writeTableHashes writes new table hash values for the root given and returns it.
 // This is an inexpensive and convenient way of replacing all the tables at once.
-func writeTableHashes(ctx context.Context, head doltdb.RootValue, tblHashes map[string]hash.Hash) (doltdb.RootValue, error) {
-	names, err := head.GetTableNames(ctx, doltdb.DefaultSchemaName)
+func writeTableHashes(ctx context.Context, head doltdb.RootValue, tblHashes map[doltdb.TableName]hash.Hash) (doltdb.RootValue, error) {
+	names, err := doltdb.UnionTableNames(ctx, head)
 	if err != nil {
 		return nil, err
 	}
@@ -454,8 +483,7 @@ func writeTableHashes(ctx context.Context, head doltdb.RootValue, tblHashes map[
 	var toDrop []doltdb.TableName
 	for _, name := range names {
 		if _, ok := tblHashes[name]; !ok {
-			// TODO: schema support
-			toDrop = append(toDrop, doltdb.TableName{Name: name})
+			toDrop = append(toDrop, name)
 		}
 	}
 

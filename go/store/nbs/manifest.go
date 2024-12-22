@@ -119,7 +119,7 @@ type manifestContents struct {
 	gcGen        hash.Hash
 	specs        []tableSpec
 
-	// An appendix is a list of |tableSpecs| that track an auxillary collection of
+	// An appendix is a list of |tableSpecs| that track an auxiliary collection of
 	// table files used _only_ for query performance optimizations. These appendix |tableSpecs| can be safely
 	// managed with nbs.UpdateManifestWithAppendix, however generation and removal of the actual table files
 	// the appendix |tableSpecs| reference is done manually. All appendix |tableSpecs| will be prepended to the
@@ -501,7 +501,7 @@ func formatSpecs(specs []tableSpec, tableInfo []string) {
 // persisted manifest against the lock hash it saw last time it loaded the
 // contents of a manifest. If they do not match, the client must not update
 // the persisted manifest.
-func generateLockHash(root hash.Hash, specs []tableSpec, appendix []tableSpec) hash.Hash {
+func generateLockHash(root hash.Hash, specs []tableSpec, appendix []tableSpec, extra []byte) hash.Hash {
 	blockHash := sha512.New()
 	blockHash.Write(root[:])
 	for _, spec := range appendix {
@@ -511,6 +511,11 @@ func generateLockHash(root hash.Hash, specs []tableSpec, appendix []tableSpec) h
 	for _, spec := range specs {
 		blockHash.Write(spec.name[:])
 	}
+	if len(extra) > 0 {
+		blockHash.Write([]byte{0})
+		blockHash.Write(extra)
+	}
+	blockHash.Write([]byte{0})
 	var h []byte
 	h = blockHash.Sum(h) // Appends hash to h
 	return hash.New(h[:hash.ByteLen])

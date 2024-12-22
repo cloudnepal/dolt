@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/expression"
@@ -29,18 +30,6 @@ import (
 	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/val"
 )
-
-func rowIterTableLookupJoin(
-	srcIter prolly.MapIter,
-	dstIter index.SecondaryLookupIterGen,
-	mapping *lookupMapping,
-	rowJoiner *prollyToSqlJoiner,
-	srcFilter, dstFilter, joinFilter sql.Expression,
-	isLeftJoin bool,
-	excludeNulls bool,
-) (sql.RowIter, error) {
-	return newLookupKvIter(srcIter, dstIter, mapping, rowJoiner, srcFilter, dstFilter, joinFilter, isLeftJoin, excludeNulls)
-}
 
 type lookupJoinKvIter struct {
 	srcIter prolly.MapIter
@@ -211,7 +200,7 @@ type lookupMapping struct {
 	pool pool.BuffPool
 }
 
-func newLookupKeyMapping(ctx context.Context, sourceSch schema.Schema, src prolly.Map, tgtKeyDesc val.TupleDesc, keyExprs []sql.Expression) *lookupMapping {
+func newLookupKeyMapping(ctx context.Context, sourceSch schema.Schema, tgtKeyDesc val.TupleDesc, keyExprs []sql.Expression, ns tree.NodeStore) *lookupMapping {
 	keyless := schema.IsKeyless(sourceSch)
 	// |split| is an index into the schema separating the key and value fields
 	var split int
@@ -232,7 +221,10 @@ func newLookupKeyMapping(ctx context.Context, sourceSch schema.Schema, src proll
 		switch e := e.(type) {
 		case *expression.GetField:
 			// map the schema order index to the physical storage index
-			col := sourceSch.GetAllCols().NameToCol[e.Name()]
+			col, ok := sourceSch.GetAllCols().LowerNameToCol[strings.ToLower(e.Name())]
+			if !ok {
+				return nil
+			}
 			if col.IsPartOfPK {
 				srcMapping[i] = sourceSch.GetPKCols().TagToIdx[col.Tag]
 			} else if keyless {
@@ -250,12 +242,12 @@ func newLookupKeyMapping(ctx context.Context, sourceSch schema.Schema, src proll
 	litDesc := val.NewTupleDescriptor(litTypes...)
 	litTb := val.NewTupleBuilder(litDesc)
 	for i, j := range litMappings {
-		tree.PutField(ctx, src.NodeStore(), litTb, i, keyExprs[j].(*expression.Literal).Value())
+		tree.PutField(ctx, ns, litTb, i, keyExprs[j].(*expression.Literal).Value())
 	}
 
 	var litTuple val.Tuple
 	if litDesc.Count() > 0 {
-		litTuple = litTb.Build(src.Pool())
+		litTuple = litTb.Build(ns.Pool())
 	}
 
 	return &lookupMapping{
@@ -263,17 +255,20 @@ func newLookupKeyMapping(ctx context.Context, sourceSch schema.Schema, src proll
 		srcMapping: srcMapping,
 		litTuple:   litTuple,
 		litKd:      litDesc,
-		srcKd:      src.KeyDesc(),
-		srcVd:      src.ValDesc(),
+		srcKd:      sourceSch.GetKeyDescriptor(),
+		srcVd:      sourceSch.GetValueDescriptor(),
 		targetKb:   val.NewTupleBuilder(tgtKeyDesc),
-		ns:         src.NodeStore(),
-		pool:       src.Pool(),
+		ns:         ns,
+		pool:       ns.Pool(),
 	}
 }
 
 // valid returns whether the source and destination key types
 // are type compatible
 func (m *lookupMapping) valid() bool {
+	if m == nil {
+		return false
+	}
 	var litIdx int
 	for to := range m.srcMapping {
 		from := m.srcMapping.MapOrdinal(to)

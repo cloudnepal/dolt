@@ -1078,6 +1078,11 @@ var MergeScripts = []queries.ScriptTest{
 				Expected: []sql.Row{{1}},
 			},
 			{
+				// Test case-insensitive table name
+				Query:    "SELECT count(*) from dolt_conflicts_TeST",
+				Expected: []sql.Row{{1}},
+			},
+			{
 				Query:    "CALL DOLT_MERGE('--abort')",
 				Expected: []sql.Row{{"", 0, 0, "merge aborted"}},
 			},
@@ -1273,6 +1278,11 @@ var MergeScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_child;",
+				Expected: []sql.Row{{"foreign key", 1, 1}},
+			},
+			{
+				// Test case-insensitive table name
+				Query:    "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_CHILD;",
 				Expected: []sql.Row{{"foreign key", 1, 1}},
 			},
 			{
@@ -1651,7 +1661,7 @@ var MergeScripts = []queries.ScriptTest{
 				Expected: []sql.Row{{doltCommit, 1, 0, "merge successful"}},
 			},
 			{
-				Query:    "INSERT INTO t VALUES (NULL,5),(6,6),(NULL,7);",
+				Query:    "INSERT INTO t(c0) VALUES (5),(6),(7);",
 				Expected: []sql.Row{{types.OkResult{RowsAffected: 3, InsertID: 5}}},
 			},
 			{
@@ -1688,7 +1698,7 @@ var MergeScripts = []queries.ScriptTest{
 				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
 			},
 			{
-				Query:    "INSERT INTO t VALUES (NULL,6),(7,7),(NULL,8);",
+				Query:    "INSERT INTO t(c0) VALUES (6),(7),(8);",
 				Expected: []sql.Row{{types.OkResult{RowsAffected: 3, InsertID: 6}}},
 			},
 			{
@@ -2435,6 +2445,86 @@ var MergeScripts = []queries.ScriptTest{
 			{
 				Query:    "SELECT * FROM t;",
 				Expected: []sql.Row{{1, "one"}, {2, "two"}, {3, "three"}},
+			},
+		},
+	},
+	{
+		// Ensure that column defaults are normalized to the same thing, so they merge with no issue
+		Name: "merge with float column default",
+		SetUpScript: []string{
+			"create table t (f float);",
+			"call dolt_commit('-Am', 'setup');",
+			"call dolt_branch('other');",
+			"alter table t modify column f float default '1.00';",
+			"call dolt_commit('-Am', 'change default on main');",
+			"call dolt_checkout('other');",
+			"alter table t modify column f float default '1.000000000';",
+			"call dolt_commit('-Am', 'change default on other');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('main')",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+		},
+	},
+	{
+		// Ensure that column defaults are normalized to the same thing, so they merge with no issue
+		Name: "merge with float 1.23 column default",
+		SetUpScript: []string{
+			"create table t (f float);",
+			"call dolt_commit('-Am', 'setup');",
+			"call dolt_branch('other');",
+			"alter table t modify column f float default '1.23000';",
+			"call dolt_commit('-Am', 'change default on main');",
+			"call dolt_checkout('other');",
+			"alter table t modify column f float default '1.23000000000';",
+			"call dolt_commit('-Am', 'change default on other');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('main')",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+		},
+	},
+	{
+		// Ensure that column defaults are normalized to the same thing, so they merge with no issue
+		Name: "merge with decimal 1.23 column default",
+		SetUpScript: []string{
+			"create table t (d decimal(20, 10));",
+			"call dolt_commit('-Am', 'setup');",
+			"call dolt_branch('other');",
+			"alter table t modify column d decimal(20, 10) default '1.23000';",
+			"call dolt_commit('-Am', 'change default on main');",
+			"call dolt_checkout('other');",
+			"alter table t modify column d decimal(20, 10) default '1.23000000000';",
+			"call dolt_commit('-Am', 'change default on other');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('main')",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
+			},
+		},
+	},
+	{
+		// Ensure that column defaults are normalized to the same thing, so they merge with no issue
+		Name: "merge with different types",
+		SetUpScript: []string{
+			"create table t (f float);",
+			"call dolt_commit('-Am', 'setup');",
+			"call dolt_branch('other');",
+			"alter table t modify column f float default 1.23;",
+			"call dolt_commit('-Am', 'change default on main');",
+			"call dolt_checkout('other');",
+			"alter table t modify column f float default '1.23';",
+			"call dolt_commit('-Am', 'change default on other');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_merge('main')",
+				Expected: []sql.Row{{doltCommit, 0, 0, "merge successful"}},
 			},
 		},
 	},
@@ -3737,7 +3827,7 @@ var SchemaConflictScripts = []queries.ScriptTest{
 		SetUpScript: []string{
 			"set @@autocommit=1;",
 			"create table t (pk int primary key, c0 varchar(20))",
-			"call dolt_commit('-Am', 'added tabele t')",
+			"call dolt_commit('-Am', 'added table t')",
 			"call dolt_checkout('-b', 'other')",
 			"alter table t modify column c0 int",
 			"call dolt_commit('-am', 'altered t on branch other')",
@@ -3765,7 +3855,7 @@ var SchemaConflictScripts = []queries.ScriptTest{
 		SetUpScript: []string{
 			"set @@autocommit=0;",
 			"create table t (pk int primary key, c0 varchar(20))",
-			"call dolt_commit('-Am', 'added tabele t')",
+			"call dolt_commit('-Am', 'added table t')",
 			"call dolt_checkout('-b', 'other')",
 			"alter table t modify column c0 int",
 			"call dolt_commit('-am', 'altered t on branch other')",
@@ -3932,7 +4022,7 @@ var OldFormatMergeConflictsAndCVsScripts = []queries.ScriptTest{
 			},
 			{
 				Query:    "CALL DOLT_MERGE('branch3');",
-				Expected: []sql.Row{{"", 0, 1, "conficts found"}},
+				Expected: []sql.Row{{"", 0, 1, "conflicts found"}},
 			},
 			{
 				Query:    "SELECT violation_type, pk, parent_fk from dolt_constraint_violations_child;",

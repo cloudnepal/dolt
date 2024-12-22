@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sqle
+package dtablefunctions
 
 import (
 	"bytes"
@@ -35,6 +35,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/resolve"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlfmt"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
 	"github.com/dolthub/dolt/go/store/types"
@@ -45,6 +46,7 @@ var _ sql.ExecSourceRel = (*PatchTableFunction)(nil)
 var _ sql.IndexAddressable = (*PatchTableFunction)(nil)
 var _ sql.IndexedTable = (*PatchTableFunction)(nil)
 var _ sql.TableNode = (*PatchTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*PatchTableFunction)(nil)
 
 const (
 	diffTypeSchema = "schema"
@@ -145,19 +147,21 @@ func (p *PatchTableFunction) PartitionRows(ctx *sql.Context, partition sql.Parti
 
 	// If tableNameExpr defined, return a single table patch result
 	if p.tableNameExpr != nil {
-		fromTblExists, err := fromRefDetails.root.HasTable(ctx, doltdb.TableName{Name: tableName})
-		if err != nil {
-			return nil, err
-		}
-		toTblExists, err := toRefDetails.root.HasTable(ctx, doltdb.TableName{Name: tableName})
-		if err != nil {
-			return nil, err
-		}
-		if !fromTblExists && !toTblExists {
-			return nil, sql.ErrTableNotFound.New(tableName)
+		delta := findMatchingDelta(tableDeltas, tableName)
+		if delta.FromTable == nil && delta.ToTable == nil {
+			_, _, fromTblExists, err := resolve.Table(ctx, fromRefDetails.root, tableName)
+			if err != nil {
+				return nil, err
+			}
+			_, _, toTblExists, err := resolve.Table(ctx, toRefDetails.root, tableName)
+			if err != nil {
+				return nil, err
+			}
+			if !fromTblExists && !toTblExists {
+				return nil, sql.ErrTableNotFound.New(tableName)
+			}
 		}
 
-		delta := findMatchingDelta(tableDeltas, tableName)
 		tableDeltas = []diff.TableDelta{delta}
 	}
 
@@ -301,11 +305,11 @@ func (p *PatchTableFunction) WithChildren(children ...sql.Node) (sql.Node, error
 	return p, nil
 }
 
-// CheckPrivileges implements the interface sql.Node.
-func (p *PatchTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (p *PatchTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
 	if p.tableNameExpr != nil {
 		if !sqltypes.IsText(p.tableNameExpr.Type()) {
-			return false
+			return ExpressionIsDeferred(p.tableNameExpr)
 		}
 
 		tableNameVal, err := p.tableNameExpr.Eval(p.ctx, nil)
@@ -422,7 +426,7 @@ func (p *PatchTableFunction) WithDatabase(database sql.Database) (sql.Node, erro
 
 // Name implements the sql.TableFunction interface
 func (p *PatchTableFunction) Name() string {
-	return p.String()
+	return "dolt_patch"
 }
 
 // RowIter implements the sql.ExecSourceRel interface
@@ -475,7 +479,7 @@ func (p *PatchTableFunction) evaluateArguments() (interface{}, interface{}, inte
 }
 
 type patchNode struct {
-	tblName          string
+	tblName          doltdb.TableName
 	schemaPatchStmts []string
 	dataPatchStmts   []string
 }
@@ -500,7 +504,7 @@ func getPatchNodes(ctx *sql.Context, dbData env.DbData, tableDeltas []diff.Table
 			}
 			alterDBCollStmt := sqlfmt.AlterDatabaseCollateStmt(dbName, fromColl, toColl)
 			patches = append(patches, &patchNode{
-				tblName:          td.FromName.Name,
+				tblName:          td.FromName,
 				schemaPatchStmts: []string{alterDBCollStmt},
 				dataPatchStmts:   []string{},
 			})
@@ -529,7 +533,7 @@ func getPatchNodes(ctx *sql.Context, dbData env.DbData, tableDeltas []diff.Table
 			}
 		}
 
-		patches = append(patches, &patchNode{tblName: tblName.Name, schemaPatchStmts: schemaStmts, dataPatchStmts: dataStmts})
+		patches = append(patches, &patchNode{tblName: tblName, schemaPatchStmts: schemaStmts, dataPatchStmts: dataStmts})
 	}
 
 	return patches, nil
@@ -632,7 +636,7 @@ func getDiffQuery(ctx *sql.Context, dbData env.DbData, td diff.TableDelta, fromR
 	diffQuerySqlSch, projections := getDiffQuerySqlSchemaAndProjections(diffPKSch.Schema, columnsWithDiff)
 
 	dp := dtables.NewDiffPartition(td.ToTable, td.FromTable, toRefDetails.hashStr, fromRefDetails.hashStr, toRefDetails.commitTime, fromRefDetails.commitTime, td.ToSch, td.FromSch)
-	ri := dtables.NewDiffPartitionRowIter(*dp, dbData.Ddb, j)
+	ri := dtables.NewDiffPartitionRowIter(dp, dbData.Ddb, j)
 
 	return diffQuerySqlSch, projections, ri, nil
 }
@@ -739,7 +743,12 @@ func (itr *patchTableFunctionRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 			return nil, err
 		} else {
 			itr.statementIdx++
-			r := sql.Row{itr.statementIdx, itr.fromRef, itr.toRef, itr.currentPatch.tblName}
+			r := sql.Row{
+				itr.statementIdx,                  // statement_order
+				itr.fromRef,                       // from_commit_hash
+				itr.toRef,                         // to_commit_hash
+				itr.currentPatch.tblName.String(), // table_name
+			}
 			return r.Append(row), nil
 		}
 	}
@@ -789,7 +798,10 @@ func (p *patchStatementsRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 		diffType = diffTypeData
 	}
 
-	return sql.Row{diffType, stmt}, nil
+	return sql.Row{
+		diffType, // diff_type
+		stmt,     // statement
+	}, nil
 }
 
 func (p *patchStatementsRowIter) Close(_ *sql.Context) error {

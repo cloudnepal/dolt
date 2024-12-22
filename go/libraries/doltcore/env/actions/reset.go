@@ -19,19 +19,20 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/dolthub/dolt/go/store/datas"
+	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
-	"github.com/dolthub/dolt/go/libraries/utils/argparser"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/resolve"
+	"github.com/dolthub/dolt/go/store/datas"
 )
 
 // resetHardTables resolves a new HEAD commit from a refSpec and updates working set roots by
 // resetting the table contexts for tracked tables. New tables are ignored. Returns new HEAD
 // Commit and Roots.
-func resetHardTables(ctx context.Context, dbData env.DbData, cSpecStr string, roots doltdb.Roots) (*doltdb.Commit, doltdb.Roots, error) {
+func resetHardTables(ctx *sql.Context, dbData env.DbData, cSpecStr string, roots doltdb.Roots) (*doltdb.Commit, doltdb.Roots, error) {
 	ddb := dbData.Ddb
 	rsr := dbData.Rsr
 
@@ -73,11 +74,9 @@ func resetHardTables(ctx context.Context, dbData env.DbData, cSpecStr string, ro
 	if err != nil {
 		return nil, doltdb.Roots{}, err
 	}
+
 	// untracked tables exist in |working| but not in |staged|
-	staged, err := roots.Staged.GetTableNames(ctx, doltdb.DefaultSchemaName)
-	if err != nil {
-		return nil, doltdb.Roots{}, err
-	}
+	staged := GetAllTableNames(ctx, roots.Staged)
 	for _, name := range staged {
 		delete(untracked, name)
 	}
@@ -100,38 +99,33 @@ func resetHardTables(ctx context.Context, dbData env.DbData, cSpecStr string, ro
 	}
 
 	for name := range untracked {
-		tbl, _, err := roots.Working.GetTable(ctx, doltdb.TableName{Name: name})
+		tbl, exists, err := roots.Working.GetTable(ctx, name)
 		if err != nil {
 			return nil, doltdb.Roots{}, err
 		}
-		newWkRoot, err = newWkRoot.PutTable(ctx, doltdb.TableName{Name: name}, tbl)
+		if !exists {
+			return nil, doltdb.Roots{}, fmt.Errorf("untracked table %s does not exist in working set", name)
+		}
+
+		newWkRoot, err = newWkRoot.PutTable(ctx, name, tbl)
 		if err != nil {
 			return nil, doltdb.Roots{}, fmt.Errorf("failed to write table back to database: %s", err)
 		}
 	}
 
 	// need to save the state of files that aren't tracked
-	untrackedTables := make(map[string]*doltdb.Table)
-	wTblNames, err := roots.Working.GetTableNames(ctx, doltdb.DefaultSchemaName)
-
-	if err != nil {
-		return nil, doltdb.Roots{}, err
-	}
+	untrackedTables := make(map[doltdb.TableName]*doltdb.Table)
+	wTblNames := GetAllTableNames(ctx, roots.Working)
 
 	for _, tblName := range wTblNames {
-		untrackedTables[tblName], _, err = roots.Working.GetTable(ctx, doltdb.TableName{Name: tblName})
+		untrackedTables[tblName], _, err = roots.Working.GetTable(ctx, tblName)
 
 		if err != nil {
 			return nil, doltdb.Roots{}, err
 		}
 	}
 
-	headTblNames, err := roots.Staged.GetTableNames(ctx, doltdb.DefaultSchemaName)
-
-	if err != nil {
-		return nil, doltdb.Roots{}, err
-	}
-
+	headTblNames := GetAllTableNames(ctx, roots.Staged)
 	for _, tblName := range headTblNames {
 		delete(untrackedTables, tblName)
 	}
@@ -142,9 +136,18 @@ func resetHardTables(ctx context.Context, dbData env.DbData, cSpecStr string, ro
 	return newHead, roots, nil
 }
 
+func GetAllTableNames(ctx context.Context, root doltdb.RootValue) []doltdb.TableName {
+	tableNames := make([]doltdb.TableName, 0)
+	_ = root.IterTables(ctx, func(name doltdb.TableName, table *doltdb.Table, sch schema.Schema) (stop bool, err error) {
+		tableNames = append(tableNames, name)
+		return false, nil
+	})
+	return tableNames
+}
+
 // ResetHardTables resets the tables in working, staged, and head based on the given parameters. Returns the new
 // head commit and resulting roots
-func ResetHardTables(ctx context.Context, dbData env.DbData, cSpecStr string, roots doltdb.Roots) (*doltdb.Commit, doltdb.Roots, error) {
+func ResetHardTables(ctx *sql.Context, dbData env.DbData, cSpecStr string, roots doltdb.Roots) (*doltdb.Commit, doltdb.Roots, error) {
 	return resetHardTables(ctx, dbData, cSpecStr, roots)
 }
 
@@ -152,7 +155,7 @@ func ResetHardTables(ctx context.Context, dbData env.DbData, cSpecStr string, ro
 // The reset can be performed on a non-current branch and working set.
 // Returns an error if the reset fails.
 func ResetHard(
-	ctx context.Context,
+	ctx *sql.Context,
 	dbData env.DbData,
 	doltDb *doltdb.DoltDB,
 	username, email string,
@@ -198,13 +201,13 @@ func ResetHard(
 	return nil
 }
 
-func ResetSoftTables(ctx context.Context, dbData env.DbData, apr *argparser.ArgParseResults, roots doltdb.Roots) (doltdb.Roots, error) {
-	tables, err := getUnionedTables(ctx, tableNamesFromArgs(apr.Args), roots.Staged, roots.Head)
+func ResetSoftTables(ctx context.Context, tableNames []doltdb.TableName, roots doltdb.Roots) (doltdb.Roots, error) {
+	tables, err := getUnionedTables(ctx, tableNames, roots.Staged, roots.Head)
 	if err != nil {
 		return doltdb.Roots{}, err
 	}
 
-	err = ValidateTables(context.TODO(), tables, roots.Staged, roots.Head)
+	err = ValidateTables(ctx, tables, roots.Staged, roots.Head)
 	if err != nil {
 		return doltdb.Roots{}, err
 	}
@@ -215,14 +218,6 @@ func ResetSoftTables(ctx context.Context, dbData env.DbData, apr *argparser.ArgP
 	}
 
 	return roots, nil
-}
-
-func tableNamesFromArgs(args []string) []doltdb.TableName {
-	tbls := make([]doltdb.TableName, len(args))
-	for i, arg := range args {
-		tbls[i] = doltdb.TableName{Name: arg}
-	}
-	return tbls
 }
 
 // ResetSoftToRef matches the `git reset --soft <REF>` pattern. It returns a new Roots with the Staged and Head values
@@ -263,7 +258,7 @@ func ResetSoftToRef(ctx context.Context, dbData env.DbData, cSpecStr string) (do
 }
 
 func getUnionedTables(ctx context.Context, tables []doltdb.TableName, stagedRoot, headRoot doltdb.RootValue) ([]doltdb.TableName, error) {
-	if len(tables) == 0 || (len(tables) == 1 && tables[0].Name == ".") {
+	if len(tables) == 0 {
 		var err error
 		tables, err = doltdb.UnionTableNames(ctx, stagedRoot, headRoot)
 
@@ -277,7 +272,7 @@ func getUnionedTables(ctx context.Context, tables []doltdb.TableName, stagedRoot
 
 // CleanUntracked deletes untracked tables from the working root.
 // Evaluates untracked tables as: all working tables - all staged tables.
-func CleanUntracked(ctx context.Context, roots doltdb.Roots, tables []string, dryrun bool, force bool) (doltdb.Roots, error) {
+func CleanUntracked(ctx *sql.Context, roots doltdb.Roots, tables []string, dryrun bool, force bool) (doltdb.Roots, error) {
 	untrackedTables := make(map[doltdb.TableName]struct{})
 
 	var err error
@@ -290,21 +285,24 @@ func CleanUntracked(ctx context.Context, roots doltdb.Roots, tables []string, dr
 
 	for i := range tables {
 		name := tables[i]
-		_, _, err = roots.Working.GetTable(ctx, doltdb.TableName{Name: name})
+		resolvedName, _, tblExists, err := resolve.Table(ctx, roots.Working, name)
 		if err != nil {
 			return doltdb.Roots{}, err
 		}
-		untrackedTables[doltdb.TableName{Name: name}] = struct{}{}
+		if !tblExists {
+			return doltdb.Roots{}, fmt.Errorf("%w: '%s'", doltdb.ErrTableNotFound, name)
+		}
+		untrackedTables[resolvedName] = struct{}{}
 	}
 
 	// untracked tables = working tables - staged tables
-	headTblNames, err := roots.Staged.GetTableNames(ctx, doltdb.DefaultSchemaName)
+	headTblNames := GetAllTableNames(ctx, roots.Staged)
 	if err != nil {
 		return doltdb.Roots{}, err
 	}
 
 	for _, name := range headTblNames {
-		delete(untrackedTables, doltdb.TableName{Name: name})
+		delete(untrackedTables, name)
 	}
 
 	newRoot := roots.Working
@@ -328,11 +326,11 @@ func CleanUntracked(ctx context.Context, roots doltdb.Roots, tables []string, dr
 
 // mapColumnTags takes a map from table name to schema.Schema and generates
 // a map from column tags to table names (see RootValue.GetAllSchemas).
-func mapColumnTags(tables map[string]schema.Schema) (m map[uint64]string) {
+func mapColumnTags(tables map[doltdb.TableName]schema.Schema) (m map[uint64]string) {
 	m = make(map[uint64]string, len(tables))
 	for tbl, sch := range tables {
 		for _, tag := range sch.GetAllCols().Tags {
-			m[tag] = tbl
+			m[tag] = tbl.Name
 		}
 	}
 	return

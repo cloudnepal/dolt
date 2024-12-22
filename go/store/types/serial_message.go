@@ -191,9 +191,12 @@ func (sm SerialMessage) HumanReadableStringAtIndentationLevel(level int) string 
 		printWithIndendationLevel(level, ret, "}")
 		return ret.String()
 	case serial.AddressMapFileID:
-		keys, values, _, cnt, err := message.UnpackFields(serial.Message(sm))
+		fileId, keys, values, _, cnt, err := message.UnpackFields(serial.Message(sm))
 		if err != nil {
 			return fmt.Sprintf("error in HumanReadString(): %s", err)
+		}
+		if fileId != serial.AddressMapFileID {
+			panic(fmt.Sprintf("unexpected file ID, expected %s, got %s", serial.AddressMapFileID, fileId))
 		}
 		var b strings.Builder
 		b.Write([]byte("AddressMap {\n"))
@@ -297,10 +300,10 @@ func (sm SerialMessage) HumanReadableStringAtIndentationLevel(level int) string 
 		level += 1
 		numSecondaryIndexes := msg.SecondaryIndexesLength()
 		for i := 0; i < numSecondaryIndexes; i++ {
-			var index *serial.Index
-			_, _ = msg.TrySecondaryIndexes(index, i)
+			var index serial.Index
+			_, _ = msg.TrySecondaryIndexes(&index, i)
 			printWithIndendationLevel(level, ret, "{\n")
-			printIndex(level+1, ret, index)
+			printIndex(level+1, ret, &index)
 			printWithIndendationLevel(level, ret, "}\n")
 		}
 		level -= 1
@@ -388,10 +391,14 @@ func printIndex(level int, ret *strings.Builder, index *serial.Index) {
 }
 
 func OutputBlobNodeBytes(w *strings.Builder, indentationLevel int, msg serial.Message) error {
-	keys, values, treeLevel, count, err := message.UnpackFields(msg)
+	fileId, _, values, treeLevel, count, err := message.UnpackFields(msg)
 	if err != nil {
 		return err
 	}
+	if fileId != serial.BlobFileID {
+		return fmt.Errorf("unexpected file ID, expected %s, got %s", serial.BlobFileID, fileId)
+	}
+
 	isLeaf := treeLevel == 0
 
 	if isLeaf {
@@ -402,21 +409,8 @@ func OutputBlobNodeBytes(w *strings.Builder, indentationLevel int, msg serial.Me
 	}
 
 	for i := 0; i < int(count); i++ {
-		k := keys.GetItem(i, msg)
-		kt := val.Tuple(k)
-
-		w.Write([]byte("\n    { key: "))
-		for j := 0; j < kt.Count(); j++ {
-			if j > 0 {
-				w.Write([]byte(", "))
-			}
-
-			w.Write([]byte(hex.EncodeToString(kt.GetField(j))))
-		}
-
+		w.Write([]byte("\n    { ref: #"))
 		ref := hash.New(values.GetItem(i, msg))
-
-		w.Write([]byte(" ref: #"))
 		w.Write([]byte(ref.String()))
 		w.Write([]byte(" }"))
 	}
@@ -426,7 +420,10 @@ func OutputBlobNodeBytes(w *strings.Builder, indentationLevel int, msg serial.Me
 }
 
 func OutputProllyNodeBytes(w io.Writer, msg serial.Message) error {
-	keys, values, treeLevel, count, err := message.UnpackFields(msg)
+	fileId, keys, values, treeLevel, count, err := message.UnpackFields(msg)
+	if fileId != serial.ProllyTreeNodeFileID {
+		return fmt.Errorf("unexpected file ID, expected %s, got %s", serial.ProllyTreeNodeFileID, fileId)
+	}
 	if err != nil {
 		return err
 	}

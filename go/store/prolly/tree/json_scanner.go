@@ -38,7 +38,7 @@ type JsonScanner struct {
 	valueOffset int
 }
 
-var jsonParseError = fmt.Errorf("an error occurred while reading or writing JSON to/from the database. This is most likely a bug, but could indicate database corruption")
+var jsonParseError = fmt.Errorf("encountered invalid JSON while reading JSON from the database, or while preparing to write JSON to the database. This is most likely a bug in JSON diffing")
 
 func (j JsonScanner) Clone() JsonScanner {
 	return JsonScanner{
@@ -160,7 +160,7 @@ func (s *JsonScanner) acceptValue() error {
 const endOfFile byte = 0xFF
 
 // current returns the current byte being parsed, or 0xFF if we've reached the end of the file.
-// (Since the JSON is UTF-8, the 0xFF byte cannot otherwise appear within in.)
+// (Since the JSON is UTF-8, the 0xFF byte cannot otherwise appear within it.)
 func (s JsonScanner) current() byte {
 	if s.valueOffset >= len(s.jsonBuffer) {
 		return endOfFile

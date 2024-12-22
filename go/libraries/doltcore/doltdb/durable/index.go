@@ -87,7 +87,7 @@ func RefFromIndex(ctx context.Context, vrw types.ValueReadWriter, idx Index) (ty
 		return refFromNomsValue(ctx, vrw, idx.(nomsIndex).index)
 
 	case types.Format_DOLT:
-		b := shim.ValueFromMap(idx.(prollyIndex).index)
+		b := shim.ValueFromMap(MapFromIndex(idx))
 		return refFromNomsValue(ctx, vrw, b)
 
 	default:
@@ -96,11 +96,12 @@ func RefFromIndex(ctx context.Context, vrw types.ValueReadWriter, idx Index) (ty
 }
 
 // indexFromRef reads the types.Ref from storage and returns the Index it points to.
+// This is only used by noms format and can be removed.
 func indexFromRef(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, sch schema.Schema, r types.Ref) (Index, error) {
-	return indexFromAddr(ctx, vrw, ns, sch, r.TargetHash())
+	return indexFromAddr(ctx, vrw, ns, sch, r.TargetHash(), false)
 }
 
-func indexFromAddr(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, sch schema.Schema, addr hash.Hash) (Index, error) {
+func indexFromAddr(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, sch schema.Schema, addr hash.Hash, isKeylessTable bool) (Index, error) {
 	v, err := vrw.ReadValue(ctx, addr)
 	if err != nil {
 		return nil, err
@@ -111,19 +112,36 @@ func indexFromAddr(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeS
 		return IndexFromNomsMap(v.(types.Map), vrw, ns), nil
 
 	case types.Format_DOLT:
-		pm, err := shim.MapFromValue(v, sch, ns)
+		m, err := shim.MapInterfaceFromValue(v, sch, ns, isKeylessTable)
 		if err != nil {
 			return nil, err
 		}
-		return IndexFromProllyMap(pm), nil
+		return IndexFromMapInterface(m), nil
 
 	default:
 		return nil, errNbfUnknown
 	}
 }
 
-// NewEmptyIndex returns an index with no rows.
-func NewEmptyIndex(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, sch schema.Schema) (Index, error) {
+// NewEmptyPrimaryIndex creates a new empty Index for use as the primary index in a table.
+func NewEmptyPrimaryIndex(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, indexSchema schema.Schema) (Index, error) {
+	return newEmptyIndex(ctx, vrw, ns, indexSchema, false)
+}
+
+// NewEmptyForeignKeyIndex creates a new empty Index for use as a foreign key index.
+// Foreign keys cannot appear on keyless tables.
+func NewEmptyForeignKeyIndex(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, indexSchema schema.Schema) (Index, error) {
+	return newEmptyIndex(ctx, vrw, ns, indexSchema, false)
+}
+
+// NewEmptyIndexFromTableSchema creates a new empty Index described by a schema.Index.
+func NewEmptyIndexFromTableSchema(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, idx schema.Index, tableSchema schema.Schema) (Index, error) {
+	indexSchema := idx.Schema()
+	return newEmptyIndex(ctx, vrw, ns, indexSchema, schema.IsKeyless(tableSchema))
+}
+
+// newEmptyIndex returns an index with no rows.
+func newEmptyIndex(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeStore, sch schema.Schema, isKeylessSecondary bool) (Index, error) {
 	switch vrw.Format() {
 	case types.Format_LD_1:
 		m, err := types.NewMap(ctx, vrw)
@@ -134,15 +152,22 @@ func NewEmptyIndex(ctx context.Context, vrw types.ValueReadWriter, ns tree.NodeS
 
 	case types.Format_DOLT:
 		kd, vd := sch.GetMapDescriptors()
-		m, err := prolly.NewMapFromTuples(ctx, ns, kd, vd)
-		if err != nil {
-			return nil, err
+		if isKeylessSecondary {
+			kd = prolly.AddHashToSchema(kd)
 		}
-		return IndexFromProllyMap(m), nil
+		return NewEmptyProllyIndex(ctx, ns, kd, vd)
 
 	default:
 		return nil, errNbfUnknown
 	}
+}
+
+func NewEmptyProllyIndex(ctx context.Context, ns tree.NodeStore, kd, vd val.TupleDesc) (Index, error) {
+	m, err := prolly.NewMapFromTuples(ctx, ns, kd, vd)
+	if err != nil {
+		return nil, err
+	}
+	return IndexFromProllyMap(m), nil
 }
 
 type nomsIndex struct {
@@ -234,9 +259,28 @@ func ProllyMapFromIndex(i Index) prolly.Map {
 	return i.(prollyIndex).index
 }
 
+// MapFromIndex unwraps the Index and returns the underlying map as an interface.
+func MapFromIndex(i Index) prolly.MapInterfaceWithMutable {
+	switch indexType := i.(type) {
+	case prollyIndex:
+		return indexType.index
+	}
+	return i.(prollyIndex).index
+}
+
 // IndexFromProllyMap wraps a prolly.Map and returns it as an Index.
 func IndexFromProllyMap(m prolly.Map) Index {
 	return prollyIndex{index: m}
+}
+
+// IndexFromMapInterface wraps a prolly.MapInterface and returns it as an Index.
+func IndexFromMapInterface(m prolly.MapInterface) Index {
+	switch m := m.(type) {
+	case prolly.Map:
+		return IndexFromProllyMap(m)
+	default:
+		panic("unknown map type")
+	}
 }
 
 var _ Index = prollyIndex{}
@@ -278,7 +322,7 @@ func (i prollyIndex) AddColumnToRows(ctx context.Context, newCol string, newSche
 	colIdx, iCol := 0, 0
 	newSchema.GetNonPKCols().Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
 		last = false
-		if strings.ToLower(col.Name) == strings.ToLower(newCol) {
+		if strings.EqualFold(col.Name, newCol) {
 			last = true
 			colIdx = iCol
 		}
@@ -370,7 +414,7 @@ func NewIndexSetWithEmptyIndexes(ctx context.Context, vrw types.ValueReadWriter,
 		return nil, err
 	}
 	for _, index := range sch.Indexes().AllIndexes() {
-		empty, err := NewEmptyIndex(ctx, vrw, ns, index.Schema())
+		empty, err := NewEmptyIndexFromTableSchema(ctx, vrw, ns, index, sch)
 		if err != nil {
 			return nil, err
 		}
@@ -507,7 +551,7 @@ func (is doltDevIndexSet) GetIndex(ctx context.Context, tableSch schema.Schema, 
 	if idxSch == nil {
 		idxSch = idx.Schema()
 	}
-	return indexFromAddr(ctx, is.vrw, is.ns, idxSch, foundAddr)
+	return indexFromAddr(ctx, is.vrw, is.ns, idxSch, foundAddr, schema.IsKeyless(tableSch))
 }
 
 func (is doltDevIndexSet) PutIndex(ctx context.Context, name string, idx Index) (IndexSet, error) {

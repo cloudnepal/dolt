@@ -22,10 +22,12 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/stats"
+	"github.com/dolthub/go-mysql-server/sql/types"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statspro"
 	"github.com/dolthub/dolt/go/store/prolly"
+	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/val"
 )
 
@@ -33,6 +35,8 @@ import (
 // are approximate, but certainly shouldn't reach the square
 // of the expected size.
 const maxBucketFanout = 200 * 200
+
+var mcvsTypes = []sql.Type{types.Int64, types.Int64, types.Int64}
 
 func (n *NomsStatsDatabase) replaceStats(ctx context.Context, statsMap *prolly.MutableMap, dStats *statspro.DoltStats) error {
 	if err := deleteIndexRows(ctx, statsMap, dStats); err != nil {
@@ -42,6 +46,9 @@ func (n *NomsStatsDatabase) replaceStats(ctx context.Context, statsMap *prolly.M
 }
 
 func deleteIndexRows(ctx context.Context, statsMap *prolly.MutableMap, dStats *statspro.DoltStats) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	sch := schema.StatsTableDoltSchema
 	kd, _ := sch.GetMapDescriptors()
 
@@ -85,6 +92,9 @@ func deleteIndexRows(ctx context.Context, statsMap *prolly.MutableMap, dStats *s
 }
 
 func putIndexRows(ctx context.Context, statsMap *prolly.MutableMap, dStats *statspro.DoltStats) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	sch := schema.StatsTableDoltSchema
 	kd, vd := sch.GetMapDescriptors()
 
@@ -117,17 +127,25 @@ func putIndexRows(ctx context.Context, statsMap *prolly.MutableMap, dStats *stat
 		valueBuilder.PutInt64(4, int64(h.NullCount()))
 		valueBuilder.PutString(5, strings.Join(dStats.Columns(), ","))
 		valueBuilder.PutString(6, typesStr)
-		valueBuilder.PutString(7, stats.StringifyKey(h.UpperBound(), dStats.Statistic.Typs))
+		boundRow, err := EncodeRow(ctx, statsMap.NodeStore(), h.UpperBound(), dStats.Tb)
+		if err != nil {
+			return err
+		}
+		valueBuilder.PutString(7, string(boundRow))
 		valueBuilder.PutInt64(8, int64(h.BoundCount()))
 		valueBuilder.PutDatetime(9, statspro.DoltBucketCreated(h))
 		for i, r := range h.Mcvs() {
-			valueBuilder.PutString(10+i, stats.StringifyKey(r, dStats.Statistic.Typs))
+			mcvRow, err := EncodeRow(ctx, statsMap.NodeStore(), r, dStats.Tb)
+			if err != nil {
+				return err
+			}
+			valueBuilder.PutString(10+i, string(mcvRow))
 		}
 		var mcvCntsRow sql.Row
 		for _, v := range h.McvCounts() {
 			mcvCntsRow = append(mcvCntsRow, int(v))
 		}
-		valueBuilder.PutString(14, stats.StringifyKey(mcvCntsRow, dStats.Statistic.Typs))
+		valueBuilder.PutString(14, stats.StringifyKey(mcvCntsRow, mcvsTypes))
 
 		key := keyBuilder.Build(pool)
 		value := valueBuilder.Build(pool)
@@ -135,4 +153,29 @@ func putIndexRows(ctx context.Context, statsMap *prolly.MutableMap, dStats *stat
 		pos++
 	}
 	return nil
+}
+
+func EncodeRow(ctx context.Context, ns tree.NodeStore, r sql.Row, tb *val.TupleBuilder) ([]byte, error) {
+	for i, v := range r {
+		if v == nil {
+			continue
+		}
+		if err := tree.PutField(ctx, ns, tb, i, v); err != nil {
+			return nil, err
+		}
+	}
+	return tb.Build(ns.Pool()), nil
+}
+
+func DecodeRow(ctx context.Context, ns tree.NodeStore, s string, tb *val.TupleBuilder) (sql.Row, error) {
+	tup := []byte(s)
+	r := make(sql.Row, tb.Desc.Count())
+	var err error
+	for i, _ := range r {
+		r[i], err = tree.GetField(ctx, tb.Desc, i, tup, ns)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
 }

@@ -524,7 +524,7 @@ func (d *DoltSession) validateDoltCommit(ctx *sql.Context, dirtyBranchState *bra
 	currDbBaseName, rev := SplitRevisionDbName(currDb)
 	dirtyDbBaseName := dirtyBranchState.dbState.dbName
 
-	if strings.ToLower(currDbBaseName) != strings.ToLower(dirtyDbBaseName) {
+	if !strings.EqualFold(currDbBaseName, dirtyDbBaseName) {
 		return fmt.Errorf("no changes to dolt_commit on database %s", currDbBaseName)
 	}
 
@@ -540,7 +540,7 @@ func (d *DoltSession) validateDoltCommit(ctx *sql.Context, dirtyBranchState *bra
 		rev = dbState.checkedOutRevSpec
 	}
 
-	if strings.ToLower(rev) != strings.ToLower(dirtyBranchState.head) {
+	if !strings.EqualFold(rev, dirtyBranchState.head) {
 		return fmt.Errorf("no changes to dolt_commit on branch %s", rev)
 	}
 
@@ -561,6 +561,21 @@ func (d *DoltSession) dirtyWorkingSets() []*branchState {
 	}
 
 	return dirtyStates
+}
+
+// DirtyDatabases returns the names of databases who have outstanding changes in this session and need to be committed
+// in a SQL transaction before they are visible to other sessions.
+func (d *DoltSession) DirtyDatabases() []string {
+	var dbNames []string
+	for _, dbState := range d.dbStates {
+		for _, branchState := range dbState.heads {
+			if branchState.dirty {
+				dbNames = append(dbNames, dbState.dbName)
+				break
+			}
+		}
+	}
+	return dbNames
 }
 
 // CommitWorkingSet commits the working set for the transaction given, without creating a new dolt commit.
@@ -667,7 +682,12 @@ func (d *DoltSession) PendingCommitAllStaged(ctx *sql.Context, branchState *bran
 // NewPendingCommit returns a new |doltdb.PendingCommit| for the database named, using the roots given, adding any
 // merge parent from an in progress merge as appropriate. The session working set is not updated with these new roots,
 // but they are set in the returned |doltdb.PendingCommit|. If there are no changes staged, this method returns nil.
-func (d *DoltSession) NewPendingCommit(ctx *sql.Context, dbName string, roots doltdb.Roots, props actions.CommitStagedProps) (*doltdb.PendingCommit, error) {
+func (d *DoltSession) NewPendingCommit(
+	ctx *sql.Context,
+	dbName string,
+	roots doltdb.Roots,
+	props actions.CommitStagedProps,
+) (*doltdb.PendingCommit, error) {
 	branchState, ok, err := d.lookupDbState(ctx, dbName)
 	if err != nil {
 		return nil, err
@@ -705,6 +725,31 @@ func (d *DoltSession) newPendingCommit(ctx *sql.Context, branchState *branchStat
 			}
 
 			mergeParentCommits = append(mergeParentCommits, parentCommit)
+		}
+
+		// If the commit message isn't set and we're amending the previous commit,
+		// go ahead and set the commit message from the current HEAD
+		if props.Message == "" && props.Amend {
+			cs, err := doltdb.NewCommitSpec("HEAD")
+			if err != nil {
+				return nil, err
+			}
+
+			headRef, err := branchState.dbData.Rsr.CWBHeadRef()
+			if err != nil {
+				return nil, err
+			}
+			optCmt, err := branchState.dbData.Ddb.Resolve(ctx, cs, headRef)
+			commit, ok := optCmt.ToCommit()
+			if !ok {
+				return nil, doltdb.ErrGhostCommitEncountered
+			}
+
+			meta, err := commit.GetCommitMeta(ctx)
+			if err != nil {
+				return nil, err
+			}
+			props.Message = meta.Description
 		}
 
 		// TODO: This is not the correct way to write this commit as an amend. While this commit is running
@@ -952,11 +997,33 @@ func (d *DoltSession) SetWorkingRoot(ctx *sql.Context, dbName string, newRoot do
 	return d.SetWorkingSet(ctx, dbName, existingWorkingSet.WithWorkingRoot(newRoot))
 }
 
+// SetStagingRoot sets the staging root for the session's current database. This is useful when editing the staged
+// table without messing with the HEAD or working trees.
+func (d *DoltSession) SetStagingRoot(ctx *sql.Context, dbName string, newRoot doltdb.RootValue) error {
+	branchState, _, err := d.lookupDbState(ctx, dbName)
+	if err != nil {
+		return err
+	}
+
+	existingWorkingSet := branchState.WorkingSet()
+	if existingWorkingSet == nil {
+		return doltdb.ErrOperationNotSupportedInDetachedHead
+	}
+	if rootsEqual(branchState.roots().Staged, newRoot) {
+		return nil
+	}
+
+	if branchState.readOnly {
+		return fmt.Errorf("cannot set root on read-only session")
+	}
+	return d.SetWorkingSet(ctx, dbName, existingWorkingSet.WithStagedRoot(newRoot))
+}
+
 // SetRoots sets new roots for the session for the database named. Typically, clients should only set the working root,
 // via setRoot. This method is for clients that need to update more of the session state, such as the dolt_ functions.
 // Unlike setting the working root, this method always marks the database state dirty.
 func (d *DoltSession) SetRoots(ctx *sql.Context, dbName string, roots doltdb.Roots) error {
-	sessionState, _, err := d.LookupDbState(ctx, dbName)
+	sessionState, _, err := d.lookupDbState(ctx, dbName)
 	if err != nil {
 		return err
 	}
@@ -967,6 +1034,25 @@ func (d *DoltSession) SetRoots(ctx *sql.Context, dbName string, roots doltdb.Roo
 
 	workingSet := sessionState.WorkingSet().WithWorkingRoot(roots.Working).WithStagedRoot(roots.Staged)
 	return d.SetWorkingSet(ctx, dbName, workingSet)
+}
+
+func (d *DoltSession) ResetGlobals(ctx *sql.Context, dbName string, root doltdb.RootValue) error {
+	sessionState, _, err := d.lookupDbState(ctx, dbName)
+	if err != nil {
+		return err
+	}
+
+	tracker, err := sessionState.dbState.globalState.AutoIncrementTracker(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = tracker.InitWithRoots(ctx, root)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (d *DoltSession) SetFileSystem(fs filesys.Filesys) {
@@ -997,8 +1083,8 @@ func (d *DoltSession) SetWorkingSet(ctx *sql.Context, dbName string, ws *doltdb.
 		return err
 	}
 
-	if writeSess := branchState.WriteSession(); writeSess != nil {
-		err = writeSess.SetWorkingSet(ctx, ws)
+	if branchState.writeSession != nil {
+		err = branchState.writeSession.SetWorkingSet(ctx, ws)
 		if err != nil {
 			return err
 		}
@@ -1089,7 +1175,7 @@ func (d *DoltSession) SetSessionVariable(ctx *sql.Context, key string, value int
 		return sql.ErrSystemVariableReadOnly.New(key)
 	}
 
-	if strings.ToLower(key) == "foreign_key_checks" {
+	if strings.EqualFold(key, "foreign_key_checks") {
 		return d.setForeignKeyChecksSessionVar(ctx, key, value)
 	}
 
@@ -1286,7 +1372,7 @@ func (d *DoltSession) AddTemporaryTable(ctx *sql.Context, db string, tbl sql.Tab
 func (d *DoltSession) DropTemporaryTable(ctx *sql.Context, db, name string) {
 	tables := d.tempTables[strings.ToLower(db)]
 	for i, tbl := range d.tempTables[strings.ToLower(db)] {
-		if strings.ToLower(tbl.Name()) == strings.ToLower(name) {
+		if strings.EqualFold(tbl.Name(), name) {
 			tables = append(tables[:i], tables[i+1:]...)
 			break
 		}
@@ -1296,7 +1382,7 @@ func (d *DoltSession) DropTemporaryTable(ctx *sql.Context, db, name string) {
 
 func (d *DoltSession) GetTemporaryTable(ctx *sql.Context, db, name string) (sql.Table, bool) {
 	for _, tbl := range d.tempTables[strings.ToLower(db)] {
-		if strings.ToLower(tbl.Name()) == strings.ToLower(name) {
+		if strings.EqualFold(tbl.Name(), name) {
 			return tbl, true
 		}
 	}
@@ -1422,9 +1508,10 @@ func (d *DoltSession) dbSessionVarsStale(ctx *sql.Context, state *branchState) b
 	return d.dbCache.CacheSessionVars(state, dtx)
 }
 
-func (d DoltSession) WithGlobals(conf config.ReadWriteConfig) *DoltSession {
-	d.globalsConf = conf
-	return &d
+func (d *DoltSession) WithGlobals(conf config.ReadWriteConfig) *DoltSession {
+	nd := *d
+	nd.globalsConf = conf
+	return &nd
 }
 
 // PersistGlobal implements sql.PersistableSession
@@ -1568,12 +1655,15 @@ func getPersistedValue(conf config.ReadableConfig, k string) (interface{}, error
 	var res interface{}
 	switch value.(type) {
 	case int8:
+		v = asIntIfBoolValue(v)
 		var tmp int64
 		tmp, err = strconv.ParseInt(v, 10, 8)
 		res = int8(tmp)
 	case int, int16, int32, int64:
+		v = asIntIfBoolValue(v)
 		res, err = strconv.ParseInt(v, 10, 64)
 	case uint, uint8, uint16, uint32, uint64:
+		v = asIntIfBoolValue(v)
 		res, err = strconv.ParseUint(v, 10, 64)
 	case float32, float64:
 		res, err = strconv.ParseFloat(v, 64)
@@ -1590,6 +1680,17 @@ func getPersistedValue(conf config.ReadableConfig, k string) (interface{}, error
 	}
 
 	return res, nil
+}
+
+func asIntIfBoolValue(v string) string {
+	lower := strings.ToLower(v)
+	if lower == "true" {
+		return "1"
+	} else if lower == "false" {
+		return "0"
+	}
+
+	return v
 }
 
 // setPersistedValue casts and persists a key value pair assuming thread safety

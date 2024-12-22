@@ -48,6 +48,60 @@ func TestLookupJoin(t *testing.T) {
 			doRowexec: true,
 		},
 		{
+			name: "accept simple lookup join with indexable filters",
+			setup: []string{
+				"create table xy (x int primary key, y int)",
+				"create table ab (a int primary key, b int)",
+			},
+			join:      "select  /*+ LOOKUP_JOIN(xy,ab) */ * from xy join ab on x = a where a = 1 and x = 1",
+			doRowexec: true,
+		},
+		{
+			name: "accept simple lookup join with non-indexable filters",
+			setup: []string{
+				"create table xy (x int primary key, y int)",
+				"create table ab (a int primary key, b int)",
+			},
+			join:      "select  /*+ LOOKUP_JOIN(xy,ab) */ * from xy join ab on x = a where b = 1 and y = 1",
+			doRowexec: true,
+		},
+		{
+			name: "accept keyless lookup join",
+			setup: []string{
+				"create table xy (x int, y int, key x_idx(x) )",
+				"create table ab (a int, b int, key a_idx(a))",
+			},
+			join:      "select  /*+ LOOKUP_JOIN(xy,ab) */ * from xy join ab on x = a",
+			doRowexec: true,
+		},
+		{
+			name: "accept keyless lookup join with indexable filters",
+			setup: []string{
+				"create table xy (x int, y int, key x_idx(x) )",
+				"create table ab (a int, b int, key a_idx(a))",
+			},
+			join:      "select  /*+ LOOKUP_JOIN(xy,ab) */ * from xy join ab on x = a where a = 1 and x = 1",
+			doRowexec: true,
+		},
+		{
+			name: "accept keyless lookup join with non-indexable filters",
+			setup: []string{
+				"create table xy (x int, y int, key x_idx(x) )",
+				"create table ab (a int, b int, key a_idx(a))",
+			},
+			join:      "select  /*+ LOOKUP_JOIN(xy,ab) */ * from xy join ab on x = a where b = 1 and y = 1",
+			doRowexec: true,
+		},
+		{
+			name: "accept keys of different casing",
+			setup: []string{
+				"create table t1 (abc int primary key, def int)",
+				"create table t2 (GHI int primary key, JKL int)",
+			},
+			join:      "select  /*+ LOOKUP_JOIN(t1,t2) */ * from t1 join t2 on ABC = ghi",
+			doRowexec: true,
+		},
+		{
 			name: "reject type incompatibility",
 			setup: []string{
 				"create table xy (x int primary key, y int)",
@@ -112,14 +166,14 @@ func TestLookupJoin(t *testing.T) {
 			require.NoError(t, err)
 
 			for _, q := range tt.setup {
-				_, iter, err := engine.Query(ctx, q)
+				_, iter, _, err := engine.Query(ctx, q)
 				require.NoError(t, err)
 				_, err = sql.RowIterToRows(ctx, iter)
 				require.NoError(t, err)
 			}
 
-			binder := planbuilder.New(ctx, engine.EngineAnalyzer().Catalog, engine.Parser)
-			node, _, _, qFlags, err := binder.Parse(tt.join, false)
+			binder := planbuilder.New(ctx, engine.EngineAnalyzer().Catalog, engine.EventScheduler, engine.Parser)
+			node, _, _, qFlags, err := binder.Parse(tt.join, nil, false)
 			require.NoError(t, err)
 			node, err = engine.EngineAnalyzer().Analyze(ctx, node, nil, qFlags)
 			require.NoError(t, err)

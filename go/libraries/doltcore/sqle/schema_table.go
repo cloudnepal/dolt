@@ -201,8 +201,11 @@ func NewEmptySchemaTable() sql.Table {
 	return &SchemaTable{}
 }
 
-func NewSchemaTable(backingTable *WritableDoltTable) (sql.Table, error) {
-	return &SchemaTable{backingTable: backingTable}, nil
+func NewSchemaTable(backingTable sql.Table) *SchemaTable {
+	if backingTable == nil {
+		return &SchemaTable{}
+	}
+	return &SchemaTable{backingTable: backingTable.(*WritableDoltTable)}
 }
 
 // getOrCreateDoltSchemasTable returns the `dolt_schemas` table in `db`, creating it if it does not already exist.
@@ -391,7 +394,7 @@ func fragFromSchemasTable(ctx *sql.Context, tbl *WritableDoltTable, fragType str
 		}
 
 		// These columns are case insensitive, make sure to do a case-insensitive comparison
-		if strings.ToLower(sqlRow[typeIdx].(string)) == fragType && strings.ToLower(sqlRow[nameIdx].(string)) == name {
+		if strings.EqualFold(sqlRow[typeIdx].(string), fragType) && strings.EqualFold(sqlRow[nameIdx].(string), name) {
 			return sqlRow, true, nil
 		}
 	}

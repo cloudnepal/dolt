@@ -35,6 +35,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dolthub/go-mysql-server/sql/binlogreplication"
@@ -123,6 +124,47 @@ func TestBinlogReplicationSanityCheck(t *testing.T) {
 	requireReplicaResults(t, "select * from db01.tableT", [][]any{{"300"}})
 }
 
+// TestBinlogReplicationWithHundredsOfDatabases asserts that we can efficiently replicate the creation of hundreds of databases.
+func TestBinlogReplicationWithHundredsOfDatabases(t *testing.T) {
+	defer teardown(t)
+	startSqlServersWithDoltSystemVars(t, doltReplicaSystemVars)
+	startReplicationAndCreateTestDb(t, mySqlPort)
+
+	// Create a table on the primary and verify on the replica
+	primaryDatabase.MustExec("create table tableT (pk int primary key)")
+	waitForReplicaToCatchUp(t)
+	assertCreateTableStatement(t, replicaDatabase, "tableT",
+		"CREATE TABLE tableT ( pk int NOT NULL, PRIMARY KEY (pk)) "+
+			"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin")
+	assertRepoStateFileExists(t, "db01")
+
+	// Create a few hundred databases on the primary and let them replicate to the replica
+	dbCount := 300
+	startTime := time.Now()
+	for i := range dbCount {
+		dbName := fmt.Sprintf("db%03d", i)
+		primaryDatabase.MustExec(fmt.Sprintf("create database %s", dbName))
+	}
+	waitForReplicaToCatchUp(t)
+	endTime := time.Now()
+	logrus.Infof("Time to replicate %d databases: %v", dbCount, endTime.Sub(startTime))
+
+	// Spot check the presence of a database on the replica
+	assertRepoStateFileExists(t, "db042")
+
+	// Insert some data in one database
+	startTime = time.Now()
+	primaryDatabase.MustExec("use db042;")
+	primaryDatabase.MustExec("create table t (pk int primary key);")
+	primaryDatabase.MustExec("insert into t values (100), (101), (102);")
+
+	// Verify the results on the replica
+	waitForReplicaToCatchUp(t)
+	requireReplicaResults(t, "select * from db042.t;", [][]any{{"100"}, {"101"}, {"102"}})
+	endTime = time.Now()
+	logrus.Infof("Time to replicate inserts to 1 database (out of %d): %v", endTime.Sub(startTime), dbCount)
+}
+
 // TestAutoRestartReplica tests that a Dolt replica automatically starts up replication if
 // replication was running when the replica was shut down.
 func TestAutoRestartReplica(t *testing.T) {
@@ -201,7 +243,7 @@ func TestBinlogSystemUserIsLocked(t *testing.T) {
 	// Before starting replication, the system account does not exist
 	err = db.Ping()
 	require.Error(t, err)
-	require.ErrorContains(t, err, "User not found")
+	require.ErrorContains(t, err, "No authentication")
 
 	// After starting replication, the system account is locked
 	startReplicationAndCreateTestDb(t, mySqlPort)
@@ -272,6 +314,14 @@ func TestResetReplica(t *testing.T) {
 	require.Equal(t, "", status["Source_User"])
 	require.Equal(t, "No", status["Replica_IO_Running"])
 	require.Equal(t, "No", status["Replica_SQL_Running"])
+
+	// Now try querying the status using the older, deprecated 'show slave status' statement
+	// and spot check that the data is the same, but the column names have changed
+	status = querySlaveStatus(t)
+	require.Equal(t, "", status["Master_Host"])
+	require.Equal(t, "", status["Master_User"])
+	require.Equal(t, "No", status["Slave_IO_Running"])
+	require.Equal(t, "No", status["Slave_SQL_Running"])
 
 	rows, err = replicaDatabase.Queryx("select * from mysql.slave_master_info;")
 	require.NoError(t, err)
@@ -1179,6 +1229,19 @@ func requireResults(t *testing.T, db *sqlx.DB, query string, expectedResults [][
 // database. If any errors are encountered, this function will fail the current test.
 func queryReplicaStatus(t *testing.T) map[string]any {
 	rows, err := replicaDatabase.Queryx("SHOW REPLICA STATUS;")
+	require.NoError(t, err)
+	status := convertMapScanResultToStrings(readNextRow(t, rows))
+	require.NoError(t, rows.Close())
+	return status
+}
+
+// querySlaveStatus returns the results of `SHOW SLAVE STATUS` as a map, for the replica
+// database. If any errors are encountered, this function will fail the current test.
+// The queryReplicaStatus() function should generally be favored over this function for
+// getting the status of a replica. This function exists only to help test that the
+// deprecated 'show slave status' statement works.
+func querySlaveStatus(t *testing.T) map[string]any {
+	rows, err := replicaDatabase.Queryx("SHOW SLAVE STATUS;")
 	require.NoError(t, err)
 	status := convertMapScanResultToStrings(readNextRow(t, rows))
 	require.NoError(t, rows.Close())

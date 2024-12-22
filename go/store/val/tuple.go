@@ -18,7 +18,6 @@ import (
 	"math"
 
 	"github.com/dolthub/dolt/go/store/hash"
-
 	"github.com/dolthub/dolt/go/store/pool"
 )
 
@@ -48,7 +47,7 @@ const (
 //
 // Field offsets encode the byte-offset from the front of the Tuple to the beginning
 // of the corresponding field in the Tuple. The offset for the first field is always
-// zero and is therefor omitted. Offsets and the field count are little-endian
+// zero and is therefore omitted. Offsets and the field count are little-endian
 // encoded uint16 values.
 //
 // Tuples read and write field values as byte slices. Interpreting these encoded
@@ -124,7 +123,8 @@ func cloneTuple(pool pool.BuffPool, tup Tuple) Tuple {
 func allocateTuple(pool pool.BuffPool, bufSz ByteSize, fields int) (tup Tuple, offs offsets) {
 	offSz := offsetsSize(fields)
 	tup = pool.Get(uint64(bufSz + offSz + countSize))
-
+	// todo: this causes panics still
+	//tup = sql.SingletonBuf.GetFull(int(bufSz + offSz + countSize))
 	writeFieldCount(tup, fields)
 	offs = offsets(tup[bufSz : bufSz+offSz])
 

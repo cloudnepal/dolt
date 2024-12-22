@@ -26,7 +26,6 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/globalstate"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/store/pool"
-	"github.com/dolthub/dolt/go/store/prolly"
 	"github.com/dolthub/dolt/go/store/val"
 )
 
@@ -51,6 +50,8 @@ type prollyTableWriter struct {
 
 	flusher dsess.WriteSessionFlusher
 	setter  dsess.SessionRootSetter
+
+	targetStaging bool
 
 	errEncountered error
 }
@@ -77,14 +78,14 @@ func getSecondaryProllyIndexWriters(ctx context.Context, t *doltdb.Table, schSta
 		if err != nil {
 			return nil, err
 		}
-		idxMap := durable.ProllyMapFromIndex(idxRows)
+		idxMap := durable.MapFromIndex(idxRows)
 
 		keyDesc, _ := idxMap.Descriptors()
 
 		// mapping from secondary index key to primary key
 		writers[defName] = prollySecondaryIndexWriter{
 			name:          defName,
-			mut:           idxMap.Mutate(),
+			mut:           idxMap.MutateInterface(),
 			unique:        def.IsUnique,
 			prefixLengths: def.PrefixLengths,
 			idxCols:       def.Count,
@@ -116,7 +117,6 @@ func getSecondaryKeylessProllyWriters(ctx context.Context, t *doltdb.Table, schS
 			return nil, err
 		}
 		m := durable.ProllyMapFromIndex(idxRows)
-		m = prolly.ConvertToSecondaryKeylessIndex(m)
 
 		keyDesc, _ := m.Descriptors()
 
@@ -337,7 +337,7 @@ func (w *prollyTableWriter) table(ctx context.Context) (t *doltdb.Table, err err
 		return nil, err
 	}
 
-	t, err = w.tbl.UpdateRows(ctx, durable.IndexFromProllyMap(pm))
+	t, err = w.tbl.UpdateRows(ctx, durable.IndexFromMapInterface(pm))
 	if err != nil {
 		return nil, err
 	}
@@ -353,7 +353,7 @@ func (w *prollyTableWriter) table(ctx context.Context) (t *doltdb.Table, err err
 		if err != nil {
 			return nil, err
 		}
-		idx := durable.IndexFromProllyMap(sm)
+		idx := durable.IndexFromMapInterface(sm)
 
 		s, err = s.PutIndex(ctx, wrSecondary.Name(), idx)
 		if err != nil {
@@ -374,5 +374,10 @@ func (w *prollyTableWriter) flush(ctx *sql.Context) error {
 	if err != nil {
 		return err
 	}
-	return w.setter(ctx, w.dbName, ws.WorkingRoot())
+
+	if w.targetStaging {
+		return w.setter(ctx, w.dbName, ws.StagedRoot())
+	} else {
+		return w.setter(ctx, w.dbName, ws.WorkingRoot())
+	}
 }

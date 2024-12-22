@@ -21,10 +21,13 @@ import (
 	"time"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/vitess/go/sqltypes"
 	"gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema/typeinfo"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
@@ -130,9 +133,21 @@ func ProceduresTableSqlSchema() sql.PrimaryKeySchema {
 
 // The fixed dolt schema for the `dolt_procedures` table.
 func ProceduresTableSchema() schema.Schema {
+	// Max len is 8K - big enough to be useful, but not too big to exceed max total row len of 64K.
+	t, err := gmstypes.CreateStringWithDefaults(sqltypes.VarChar, typeinfo.MaxVarcharLength/2)
+	if err != nil {
+		panic(err) // should never happen. All constants.
+	}
+	ti := typeinfo.CreateVarStringTypeFromSqlType(t)
+
+	stmtCol, err := schema.NewColumnWithTypeInfo(doltdb.ProceduresTableCreateStmtCol, schema.DoltProceduresCreateStmtTag, ti, false, "", false, "")
+	if err != nil {
+		panic(err) // should never happen.
+	}
+
 	colColl := schema.NewColCollection(
 		schema.NewColumn(doltdb.ProceduresTableNameCol, schema.DoltProceduresNameTag, types.StringKind, true, schema.NotNullConstraint{}),
-		schema.NewColumn(doltdb.ProceduresTableCreateStmtCol, schema.DoltProceduresCreateStmtTag, types.StringKind, false),
+		stmtCol,
 		schema.NewColumn(doltdb.ProceduresTableCreatedAtCol, schema.DoltProceduresCreatedAtTag, types.TimestampKind, false),
 		schema.NewColumn(doltdb.ProceduresTableModifiedAtCol, schema.DoltProceduresModifiedAtTag, types.TimestampKind, false),
 		schema.NewColumn(doltdb.ProceduresTableSqlModeCol, schema.DoltProceduresSqlModeTag, types.StringKind, false),
@@ -320,9 +335,9 @@ func DoltProceduresGetAll(ctx *sql.Context, db Database, procedureName string) (
 
 	var lookup sql.IndexLookup
 	if procedureName == "" {
-		lookup, err = sql.NewIndexBuilder(idx).IsNotNull(ctx, nameExpr).Build(ctx)
+		lookup, err = sql.NewMySQLIndexBuilder(idx).IsNotNull(ctx, nameExpr).Build(ctx)
 	} else {
-		lookup, err = sql.NewIndexBuilder(idx).Equals(ctx, nameExpr, procedureName).Build(ctx)
+		lookup, err = sql.NewMySQLIndexBuilder(idx).Equals(ctx, nameExpr, procedureName).Build(ctx)
 	}
 	if err != nil {
 		return nil, err
@@ -456,7 +471,7 @@ func DoltProceduresGetDetails(ctx *sql.Context, tbl *WritableDoltTable, name str
 		return sql.StoredProcedureDetails{}, false, fmt.Errorf("could not find primary key index on system table `%s`", doltdb.ProceduresTableName)
 	}
 
-	indexLookup, err := sql.NewIndexBuilder(fragNameIndex).Equals(ctx, fragNameIndex.Expressions()[0], name).Build(ctx)
+	indexLookup, err := sql.NewMySQLIndexBuilder(fragNameIndex).Equals(ctx, fragNameIndex.Expressions()[0], name).Build(ctx)
 	if err != nil {
 		return sql.StoredProcedureDetails{}, false, err
 	}

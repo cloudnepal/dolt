@@ -24,9 +24,12 @@ import (
 	types2 "github.com/dolthub/go-mysql-server/sql/types"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 )
+
+var helpMsg = "call dolt_stats_purge() to reset statistics"
 
 func (p *Provider) Configure(ctx context.Context, ctxFactory func(ctx context.Context) (*sql.Context, error), bThreads *sql.BackgroundThreads, dbs []dsess.SqlDatabase) error {
 	p.SetStarter(NewStatsInitDatabaseHook(p, ctxFactory, bThreads))
@@ -55,7 +58,7 @@ func (p *Provider) Configure(ctx context.Context, ctxFactory func(ctx context.Co
 		thresholdf64 = threshold.(float64)
 
 		p.pro.InitDatabaseHooks = append(p.pro.InitDatabaseHooks, NewStatsInitDatabaseHook(p, ctxFactory, bThreads))
-		p.pro.DropDatabaseHooks = append(p.pro.DropDatabaseHooks, NewStatsDropDatabaseHook(p))
+		p.pro.DropDatabaseHooks = append([]sqle.DropDatabaseHook{NewStatsDropDatabaseHook(p)}, p.pro.DropDatabaseHooks...)
 	} else if _, startupStats, _ := sql.SystemVariables.GetGlobal(dsess.DoltStatsBootstrapEnabled); startupStats == int8(1) {
 		startupEnabled = true
 	}
@@ -133,22 +136,23 @@ func (p *Provider) Load(ctx *sql.Context, fs filesys.Filesys, db dsess.SqlDataba
 	// |statPath| is either file://./stat or mem://stat
 	statsDb, err := p.sf.Init(ctx, db, p.pro, fs, env.GetCurrentUserHomeDir)
 	if err != nil {
-		ctx.Warn(0, err.Error())
+		ctx.GetLogger().Errorf("initialize stats failure for %s: %s; %s\n", db.Name(), err.Error(), helpMsg)
 		return
 	}
 
 	for _, branch := range branches {
-		err = statsDb.LoadBranchStats(ctx, branch)
-		if err != nil {
+		if err = statsDb.LoadBranchStats(ctx, branch); err != nil {
 			// if branch name is invalid, continue loading rest
 			// TODO: differentiate bad branch name from other errors
-			ctx.Warn(0, err.Error())
+			ctx.GetLogger().Errorf("load stats init failure for %s: %s; %s\n", db.Name(), err.Error(), helpMsg)
+			continue
+		}
+		if err := statsDb.Flush(ctx, branch); err != nil {
+			ctx.GetLogger().Errorf("load stats flush failure for %s: %s; %s\n", db.Name(), err.Error(), helpMsg)
 			continue
 		}
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.setStatDb(strings.ToLower(db.Name()), statsDb)
 	return
 }

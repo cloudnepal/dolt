@@ -45,7 +45,8 @@ type CreateIndexReturn struct {
 func CreateIndex(
 	ctx *sql.Context,
 	table *doltdb.Table,
-	tableName, indexName string,
+	tableName string,
+	indexName string,
 	columns []string,
 	prefixLengths []uint16,
 	props schema.IndexProperties,
@@ -213,14 +214,11 @@ func BuildUniqueProllyIndex(
 	primary prolly.Map,
 	cb DupEntryCb,
 ) (durable.Index, error) {
-	empty, err := durable.NewEmptyIndex(ctx, vrw, ns, idx.Schema())
+	empty, err := durable.NewEmptyIndexFromTableSchema(ctx, vrw, ns, idx, sch)
 	if err != nil {
 		return nil, err
 	}
 	secondary := durable.ProllyMapFromIndex(empty)
-	if schema.IsKeyless(sch) {
-		secondary = prolly.ConvertToSecondaryKeylessIndex(secondary)
-	}
 
 	iter, err := primary.IterAll(ctx)
 	if err != nil {

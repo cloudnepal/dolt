@@ -54,79 +54,102 @@ const (
 
 type IgnorePatterns []IgnorePattern
 
-func GetIgnoredTablePatterns(ctx context.Context, roots Roots) (IgnorePatterns, error) {
-	var ignorePatterns []IgnorePattern
+// ConvertTupleToIgnoreBoolean is a function that converts a Tuple to a boolean for the ignore field. This is used to handle the Doltgres extended boolean type.
+var ConvertTupleToIgnoreBoolean = convertTupleToIgnoreBoolean
+
+func convertTupleToIgnoreBoolean(valueDesc val.TupleDesc, valueTuple val.Tuple) (bool, error) {
+	if !valueDesc.Equals(val.NewTupleDescriptor(val.Type{Enc: val.Int8Enc, Nullable: false})) {
+		return false, fmt.Errorf("dolt_ignore had unexpected value type, this should never happen")
+	}
+	ignore, ok := valueDesc.GetBool(0, valueTuple)
+	if !ok {
+		return false, fmt.Errorf("could not read boolean")
+	}
+	return ignore, nil
+}
+
+func GetIgnoredTablePatterns(ctx context.Context, roots Roots, schemas []string) (map[string]IgnorePatterns, error) {
+	ignorePatternsForSchemas := make(map[string]IgnorePatterns)
 	workingSet := roots.Working
-	table, found, err := workingSet.GetTable(ctx, TableName{Name: IgnoreTableName})
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		// dolt_ignore doesn't exist, so don't filter any tables.
-		return ignorePatterns, nil
-	}
-	index, err := table.GetRowData(ctx)
-	if table.Format() == types.Format_LD_1 {
-		// dolt_ignore is not supported for the legacy storage format.
-		return ignorePatterns, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	ignoreTableSchema, err := table.GetSchema(ctx)
-	if err != nil {
-		return nil, err
-	}
-	keyDesc, valueDesc := ignoreTableSchema.GetMapDescriptors()
 
-	if !keyDesc.Equals(val.NewTupleDescriptor(val.Type{Enc: val.StringEnc})) {
-		return nil, fmt.Errorf("dolt_ignore had unexpected key type, this should never happen")
-	}
-	if !valueDesc.Equals(val.NewTupleDescriptor(val.Type{Enc: val.Int8Enc, Nullable: true})) {
-		return nil, fmt.Errorf("dolt_ignore had unexpected value type, this should never happen")
-	}
+	for _, schemaName := range schemas {
+		var ignorePatterns []IgnorePattern
 
-	ignoreTableMap, err := durable.ProllyMapFromIndex(index).IterAll(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for {
-		keyTuple, valueTuple, err := ignoreTableMap.Next(ctx)
-		if err == io.EOF {
-			break
+		tname := TableName{Name: IgnoreTableName, Schema: schemaName}
+		table, found, err := workingSet.GetTable(ctx, tname)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			// dolt_ignore doesn't exist, so don't filter any tables.
+			continue
+		}
+		index, err := table.GetRowData(ctx)
+		if table.Format() == types.Format_LD_1 {
+			// dolt_ignore is not supported for the legacy storage format.
+			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-
-		pattern, ok := keyDesc.GetString(0, keyTuple)
-		if !ok {
-			return nil, fmt.Errorf("could not read pattern")
+		ignoreTableSchema, err := table.GetSchema(ctx)
+		if err != nil {
+			return nil, err
 		}
-		ignore, ok := valueDesc.GetBool(0, valueTuple)
-		ignorePatterns = append(ignorePatterns, NewIgnorePattern(pattern, ignore))
+		keyDesc, valueDesc := ignoreTableSchema.GetMapDescriptors()
+
+		if !keyDesc.Equals(val.NewTupleDescriptor(val.Type{Enc: val.StringEnc})) {
+			return nil, fmt.Errorf("dolt_ignore had unexpected key type, this should never happen")
+		}
+
+		ignoreTableMap, err := durable.ProllyMapFromIndex(index).IterAll(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for {
+			keyTuple, valueTuple, err := ignoreTableMap.Next(ctx)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			pattern, ok := keyDesc.GetString(0, keyTuple)
+			if !ok {
+				return nil, fmt.Errorf("could not read pattern")
+			}
+			ignore, err := ConvertTupleToIgnoreBoolean(valueDesc, valueTuple)
+			if err != nil {
+				return nil, err
+			}
+			ignorePatterns = append(ignorePatterns, NewIgnorePattern(pattern, ignore))
+		}
+
+		ignorePatternsForSchemas[schemaName] = ignorePatterns
 	}
-	return ignorePatterns, nil
+
+	return ignorePatternsForSchemas, nil
 }
 
 // ExcludeIgnoredTables takes a list of table names and removes any tables that should be ignored,
 // as determined by the patterns in the dolt_ignore table.
 // The ignore patterns are read from the dolt_ignore table in the working set.
 func ExcludeIgnoredTables(ctx context.Context, roots Roots, tables []TableName) ([]TableName, error) {
-	ignorePatterns, err := GetIgnoredTablePatterns(ctx, roots)
+	schemas := GetUniqueSchemaNamesFromTableNames(tables)
+	ignorePatternMap, err := GetIgnoredTablePatterns(ctx, roots, schemas)
 	if err != nil {
 		return nil, err
 	}
 	filteredTables := []TableName{}
 	for _, tbl := range tables {
+		ignorePatterns := ignorePatternMap[tbl.Schema]
 		ignored, err := ignorePatterns.IsTableNameIgnored(tbl)
 		if err != nil {
 			return nil, err
 		}
 		if conflict := AsDoltIgnoreInConflict(err); conflict != nil {
 			// no-op
-		} else if err != nil {
-			return nil, err
 		} else if ignored == DontIgnore {
 			// no-op
 		} else if ignored == Ignore {
@@ -231,10 +254,17 @@ func resolveConflictingPatterns(trueMatches, falseMatches []string, tableName Ta
 	return IgnorePatternConflict, DoltIgnoreConflictError{Table: tableName, TruePatterns: conflictingTrueMatches, FalsePatterns: conflictingFalseMatches}
 }
 
+func isDoltRebaseTable(tableName TableName) bool {
+	if strings.EqualFold(tableName.Name, RebaseTableName) {
+		return true
+	}
+	return tableName.Schema == DoltNamespace && tableName.Name == GetRebaseTableName()
+}
+
 func (ip *IgnorePatterns) IsTableNameIgnored(tableName TableName) (IgnoreResult, error) {
 	// The dolt_rebase table is automatically ignored by Dolt – it shouldn't ever
 	// be checked in to a Dolt database.
-	if strings.ToLower(tableName.Name) == strings.ToLower(RebaseTableName) {
+	if isDoltRebaseTable(tableName) {
 		return Ignore, nil
 	}
 

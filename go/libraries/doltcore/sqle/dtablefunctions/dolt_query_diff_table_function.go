@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sqle
+package dtablefunctions
 
 import (
 	"fmt"
@@ -31,6 +31,7 @@ const queryDiffDefaultRowCount = 100
 var _ sql.TableFunction = (*QueryDiffTableFunction)(nil)
 var _ sql.CatalogTableFunction = (*QueryDiffTableFunction)(nil)
 var _ sql.ExecSourceRel = (*QueryDiffTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*QueryDiffTableFunction)(nil)
 
 type QueryDiffTableFunction struct {
 	ctx      *sql.Context
@@ -102,7 +103,8 @@ func (tf *QueryDiffTableFunction) evalQuery(query sql.Expression) (sql.Schema, s
 	if !strings.HasPrefix(strings.ToLower(qStr), "select") { // TODO: allow "with?"
 		return nil, nil, fmt.Errorf("query must be a SELECT statement")
 	}
-	return tf.engine.Query(tf.ctx, qStr)
+	sch, iter, _, err := tf.engine.Query(tf.ctx, qStr)
+	return sch, iter, err
 }
 
 func (tf *QueryDiffTableFunction) evalQueries() error {
@@ -316,8 +318,8 @@ func (tf *QueryDiffTableFunction) WithChildren(node ...sql.Node) (sql.Node, erro
 	return tf, nil
 }
 
-// CheckPrivileges implements the sql.Node interface
-func (tf *QueryDiffTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (tf *QueryDiffTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
 	subject := sql.PrivilegeCheckSubject{Database: tf.database.Name()}
 	return opChecker.UserHasPrivileges(ctx, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 }

@@ -94,9 +94,9 @@ func TestRenameTable(t *testing.T) {
 
 			schemas, err := doltdb.GetAllSchemas(ctx, root)
 			require.NoError(t, err)
-			beforeSch := schemas[tt.oldName]
+			beforeSch := schemas[doltdb.TableName{Name: tt.oldName}]
 
-			updatedRoot, err := renameTable(ctx, root, tt.oldName, tt.newName)
+			updatedRoot, err := renameTable(ctx, root, doltdb.TableName{Name: tt.oldName}, doltdb.TableName{Name: tt.newName})
 			if len(tt.expectedErr) > 0 {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tt.expectedErr)
@@ -115,7 +115,7 @@ func TestRenameTable(t *testing.T) {
 
 			schemas, err = doltdb.GetAllSchemas(ctx, updatedRoot)
 			require.NoError(t, err)
-			require.Equal(t, beforeSch, schemas[tt.newName])
+			require.Equal(t, beforeSch, schemas[doltdb.TableName{Name: tt.newName}])
 		})
 	}
 }
@@ -269,7 +269,7 @@ func makePeopleTable(ctx context.Context, dEnv *env.DoltEnv) (*env.DoltEnv, erro
 	if err != nil {
 		return nil, err
 	}
-	rows, err := durable.NewEmptyIndex(ctx, root.VRW(), root.NodeStore(), sch)
+	rows, err := durable.NewEmptyPrimaryIndex(ctx, root.VRW(), root.NodeStore(), sch)
 	if err != nil {
 		return nil, err
 	}
@@ -449,12 +449,12 @@ func TestDropPks(t *testing.T) {
 			require.NoError(t, err)
 
 			for _, query := range tt.setup {
-				_, _, err := engine.Query(sqlCtx, query)
+				_, _, _, err := engine.Query(sqlCtx, query)
 				require.NoError(t, err)
 			}
 
 			drop := "alter table parent drop primary key"
-			_, iter, err := engine.Query(sqlCtx, drop)
+			_, iter, _, err := engine.Query(sqlCtx, drop)
 			require.NoError(t, err)
 
 			err = drainIter(sqlCtx, iter)
@@ -472,7 +472,7 @@ func TestDropPks(t *testing.T) {
 
 				fk, ok := foreignKeyCollection.GetByNameCaseInsensitive(childFkName)
 				assert.True(t, ok)
-				assert.Equal(t, childName, fk.TableName)
+				assert.Equal(t, childName, fk.TableName.Name)
 				if tt.fkIdxName != "" && fk.ReferencedTableIndex != "" {
 					assert.Equal(t, tt.fkIdxName, fk.ReferencedTableIndex)
 				}

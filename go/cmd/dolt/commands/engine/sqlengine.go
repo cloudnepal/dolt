@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -30,6 +29,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
 	"github.com/dolthub/go-mysql-server/sql/rowexec"
 	_ "github.com/dolthub/go-mysql-server/sql/variables"
+	"github.com/dolthub/vitess/go/vt/sqlparser"
 	"github.com/sirupsen/logrus"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
@@ -47,7 +47,6 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statspro"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/writer"
 	"github.com/dolthub/dolt/go/libraries/utils/config"
-	"github.com/dolthub/dolt/go/store/types"
 )
 
 // SqlEngine packages up the context necessary to run sql queries against dsqle.
@@ -93,15 +92,6 @@ func NewSqlEngine(
 		return nil, err
 	}
 
-	nbf := types.Format_Default
-	if len(dbs) > 0 {
-		nbf = dbs[0].DbData().Ddb.Format()
-	}
-	parallelism := runtime.GOMAXPROCS(0)
-	if types.IsFormat_DOLT(nbf) {
-		parallelism = 1
-	}
-
 	bThreads := sql.NewBackgroundThreads()
 	dbs, err = dsqle.ApplyReplicationConfig(ctx, bThreads, mrEnv, cli.CliOut, dbs...)
 	if err != nil {
@@ -121,6 +111,11 @@ func NewSqlEngine(
 	}
 
 	all := dbs[:]
+
+	// this is overwritten only for server sessions
+	for _, db := range dbs {
+		db.DbData().Ddb.SetCommitHookLogger(ctx, cli.CliOut)
+	}
 
 	clusterDB := config.ClusterController.ClusterDatabase()
 	if clusterDB != nil {
@@ -145,7 +140,7 @@ func NewSqlEngine(
 	sqlEngine := &SqlEngine{}
 
 	// Create the engine
-	engine := gms.New(analyzer.NewBuilder(pro).WithParallelism(parallelism).Build(), &gms.Config{
+	engine := gms.New(analyzer.NewBuilder(pro).Build(), &gms.Config{
 		IsReadOnly:     config.IsReadOnly,
 		IsServerLocked: config.IsServerLocked,
 	}).WithBackgroundThreads(bThreads)
@@ -210,16 +205,11 @@ func NewSqlEngine(
 		return nil, err
 	}
 
-	if dbg, ok := os.LookupEnv(dconfig.EnvSqlDebugLog); ok && strings.ToLower(dbg) == "true" {
+	if dbg, ok := os.LookupEnv(dconfig.EnvSqlDebugLog); ok && strings.EqualFold(dbg, "true") {
 		engine.Analyzer.Debug = true
-		if verbose, ok := os.LookupEnv(dconfig.EnvSqlDebugLogVerbose); ok && strings.ToLower(verbose) == "true" {
+		if verbose, ok := os.LookupEnv(dconfig.EnvSqlDebugLogVerbose); ok && strings.EqualFold(verbose, "true") {
 			engine.Analyzer.Verbose = true
 		}
-	}
-
-	// this is overwritten only for server sessions
-	for _, db := range dbs {
-		db.DbData().Ddb.SetCommitHookLogger(ctx, cli.CliOut)
 	}
 
 	err = sql.SystemVariables.SetGlobal(dsess.DoltCommitOnTransactionCommit, config.DoltTransactionCommit)
@@ -306,8 +296,12 @@ func (se *SqlEngine) NewDoltSession(_ context.Context, mysqlSess *sql.BaseSessio
 }
 
 // Query execute a SQL statement and return values for printing.
-func (se *SqlEngine) Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, error) {
+func (se *SqlEngine) Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, *sql.QueryFlags, error) {
 	return se.engine.Query(ctx, query)
+}
+
+func (se *SqlEngine) QueryWithBindings(ctx *sql.Context, query string, parsed sqlparser.Statement, bindings map[string]sqlparser.Expr, qFlags *sql.QueryFlags) (sql.Schema, sql.RowIter, *sql.QueryFlags, error) {
+	return se.engine.QueryWithBindings(ctx, query, parsed, bindings, qFlags)
 }
 
 // Analyze analyzes a node.
@@ -402,6 +396,7 @@ func configureEventScheduler(config *SqlEngineConfig, engine *gms.Engine, sessFa
 			eventSchedulerPeriod = i
 		}
 	}
+
 	return engine.InitializeEventScheduler(getCtxFunc, config.EventSchedulerStatus, eventSchedulerPeriod)
 }
 

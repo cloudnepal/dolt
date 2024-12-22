@@ -38,7 +38,7 @@ var ErrExactlyOneFromCommit = errors.New("dolt_commit_diff_* tables must be filt
 var ErrInvalidCommitDiffTableArgs = errors.New("commit_diff_<table> requires one 'to_commit' and one 'from_commit'")
 
 type CommitDiffTable struct {
-	name        string
+	tableName   doltdb.TableName
 	dbName      string
 	ddb         *doltdb.DoltDB
 	joiner      *rowconv.Joiner
@@ -57,16 +57,14 @@ var _ sql.Table = (*CommitDiffTable)(nil)
 var _ sql.IndexAddressable = (*CommitDiffTable)(nil)
 var _ sql.StatisticsTable = (*CommitDiffTable)(nil)
 
-func NewCommitDiffTable(ctx *sql.Context, dbName, tblName string, ddb *doltdb.DoltDB, wRoot, sRoot doltdb.RootValue) (sql.Table, error) {
-	diffTblName := doltdb.DoltCommitDiffTablePrefix + tblName
+func NewCommitDiffTable(ctx *sql.Context, dbName string, tblName doltdb.TableName, ddb *doltdb.DoltDB, wRoot, sRoot doltdb.RootValue) (sql.Table, error) {
+	diffTblName := doltdb.DoltCommitDiffTablePrefix + tblName.Name
 
-	// TODO: schema
-	table, _, ok, err := doltdb.GetTableInsensitive(ctx, wRoot, doltdb.TableName{Name: tblName})
+	var table *doltdb.Table
+	var err error
+	table, tblName, err = getTableInsensitiveOrError(ctx, wRoot, tblName)
 	if err != nil {
 		return nil, err
-	}
-	if !ok {
-		return nil, sql.ErrTableNotFound.New(diffTblName)
 	}
 
 	sch, err := table.GetSchema(ctx)
@@ -86,7 +84,7 @@ func NewCommitDiffTable(ctx *sql.Context, dbName, tblName string, ddb *doltdb.Do
 
 	return &CommitDiffTable{
 		dbName:       dbName,
-		name:         tblName,
+		tableName:    tblName,
 		ddb:          ddb,
 		workingRoot:  wRoot,
 		stagedRoot:   sRoot,
@@ -110,11 +108,11 @@ func (dt *CommitDiffTable) RowCount(_ *sql.Context) (uint64, bool, error) {
 }
 
 func (dt *CommitDiffTable) Name() string {
-	return doltdb.DoltCommitDiffTablePrefix + dt.name
+	return doltdb.DoltCommitDiffTablePrefix + dt.tableName.Name
 }
 
 func (dt *CommitDiffTable) String() string {
-	return doltdb.DoltCommitDiffTablePrefix + dt.name
+	return doltdb.DoltCommitDiffTablePrefix + dt.tableName.Name
 }
 
 func (dt *CommitDiffTable) Schema() sql.Schema {
@@ -128,7 +126,7 @@ func (dt *CommitDiffTable) Collation() sql.CollationID {
 
 // GetIndexes implements sql.IndexAddressable
 func (dt *CommitDiffTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
-	return []sql.Index{index.DoltToFromCommitIndex(dt.name)}, nil
+	return []sql.Index{index.DoltToFromCommitIndex(dt.tableName.Name)}, nil
 }
 
 // IndexedAccess implements sql.IndexAddressable
@@ -151,11 +149,15 @@ func (dt *CommitDiffTable) Partitions(ctx *sql.Context) (sql.PartitionIter, erro
 }
 
 func (dt *CommitDiffTable) LookupPartitions(ctx *sql.Context, i sql.IndexLookup) (sql.PartitionIter, error) {
-	if len(i.Ranges) != 1 || len(i.Ranges[0]) != 2 {
+	ranges, ok := i.Ranges.(sql.MySQLRangeCollection)
+	if !ok {
+		return nil, fmt.Errorf("commit diff table requires MySQL ranges")
+	}
+	if len(ranges) != 1 || len(ranges[0]) != 2 {
 		return nil, ErrInvalidCommitDiffTableArgs
 	}
-	to := i.Ranges[0][0]
-	from := i.Ranges[0][1]
+	to := ranges[0][0]
+	from := ranges[0][1]
 	switch to.UpperBound.(type) {
 	case sql.Above, sql.Below:
 	default:
@@ -166,16 +168,15 @@ func (dt *CommitDiffTable) LookupPartitions(ctx *sql.Context, i sql.IndexLookup)
 	default:
 		return nil, ErrInvalidCommitDiffTableArgs
 	}
-	toCommit, _, err := to.Typ.Convert(sql.GetRangeCutKey(to.UpperBound))
+	toCommit, _, err := to.Typ.Convert(sql.GetMySQLRangeCutKey(to.UpperBound))
 	if err != nil {
 		return nil, err
 	}
-	var ok bool
 	dt.toCommit, ok = toCommit.(string)
 	if !ok {
 		return nil, fmt.Errorf("to_commit must be string, found %T", toCommit)
 	}
-	fromCommit, _, err := from.Typ.Convert(sql.GetRangeCutKey(from.UpperBound))
+	fromCommit, _, err := from.Typ.Convert(sql.GetMySQLRangeCutKey(from.UpperBound))
 	if err != nil {
 		return nil, err
 	}
@@ -194,12 +195,12 @@ func (dt *CommitDiffTable) LookupPartitions(ctx *sql.Context, i sql.IndexLookup)
 		return nil, err
 	}
 
-	toTable, _, _, err := doltdb.GetTableInsensitive(ctx, toRoot, doltdb.TableName{Name: dt.name})
+	toTable, _, _, err := doltdb.GetTableInsensitive(ctx, toRoot, dt.tableName)
 	if err != nil {
 		return nil, err
 	}
 
-	fromTable, _, _, err := doltdb.GetTableInsensitive(ctx, fromRoot, doltdb.TableName{Name: dt.name})
+	fromTable, _, _, err := doltdb.GetTableInsensitive(ctx, fromRoot, dt.tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +216,7 @@ func (dt *CommitDiffTable) LookupPartitions(ctx *sql.Context, i sql.IndexLookup)
 		fromSch:  dt.targetSchema,
 	}
 
-	isDiffable, err := dp.isDiffablePartition(ctx)
+	isDiffable, _, err := dp.isDiffablePartition(ctx)
 	if err != nil {
 		return nil, err
 	}

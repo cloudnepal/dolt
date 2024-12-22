@@ -110,7 +110,7 @@ type RootValue interface {
 	// SetFeatureVersion sets the feature version and returns a new root.
 	SetFeatureVersion(v FeatureVersion) (RootValue, error)
 	// SetTableHash sets the table with the given case-sensitive name to the new hash, and returns a new root.
-	SetTableHash(ctx context.Context, tName string, h hash.Hash) (RootValue, error)
+	SetTableHash(ctx context.Context, tName TableName, h hash.Hash) (RootValue, error)
 	// TableListHash returns a unique digest of the list of table names
 	TableListHash() uint64
 	// VRW returns this root's ValueReadWriter.
@@ -328,6 +328,9 @@ func (root *rootValue) HasTable(ctx context.Context, tName TableName) (bool, err
 	return !a.IsEmpty(), nil
 }
 
+// GenerateTagsForNewColColl creates a new ColCollection for the specified |tableName|. Note that this function is only
+// intended to be used from Dolt code, and does not support qualifying a table with a schema name, so it will not work
+// correctly for Doltgres.
 func GenerateTagsForNewColColl(ctx context.Context, root RootValue, tableName string, cc *schema.ColCollection) (*schema.ColCollection, error) {
 	newColNames := make([]string, 0, cc.Size())
 	newColKinds := make([]types.NomsKind, 0, cc.Size())
@@ -337,7 +340,7 @@ func GenerateTagsForNewColColl(ctx context.Context, root RootValue, tableName st
 		return false, nil
 	})
 
-	newTags, err := GenerateTagsForNewColumns(ctx, root, tableName, newColNames, newColKinds, nil)
+	newTags, err := GenerateTagsForNewColumns(ctx, root, TableName{Name: tableName}, newColNames, newColKinds, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +358,7 @@ func GenerateTagsForNewColColl(ctx context.Context, root RootValue, tableName st
 func GenerateTagsForNewColumns(
 	ctx context.Context,
 	root RootValue,
-	tableName string,
+	tableName TableName,
 	newColNames []string,
 	newColKinds []types.NomsKind,
 	headRoot RootValue,
@@ -380,7 +383,7 @@ func GenerateTagsForNewColumns(
 		for i := range newColNames {
 			// Only re-use tags if the noms kind didn't change
 			// TODO: revisit this when new storage format is further along
-			if strings.ToLower(newColNames[i]) == strings.ToLower(col.Name) &&
+			if strings.EqualFold(newColNames[i], col.Name) &&
 				newColKinds[i] == col.TypeInfo.NomsKind() {
 				newTags[i] = &col.Tag
 				break
@@ -405,9 +408,9 @@ func GenerateTagsForNewColumns(
 			continue
 		}
 
-		outputTags[i] = schema.AutoGenerateTag(existingTags, tableName, existingColKinds, newColNames[i], newColKinds[i])
+		outputTags[i] = schema.AutoGenerateTag(existingTags, tableName.Name, existingColKinds, newColNames[i], newColKinds[i])
 		existingColKinds = append(existingColKinds, newColKinds[i])
-		existingTags.Add(outputTags[i], tableName)
+		existingTags.Add(outputTags[i], tableName.Name)
 	}
 
 	return outputTags, nil
@@ -416,13 +419,13 @@ func GenerateTagsForNewColumns(
 func GetExistingColumns(
 	ctx context.Context,
 	root, headRoot RootValue,
-	tableName string,
+	tableName TableName,
 	newColNames []string,
 	newColKinds []types.NomsKind,
 ) ([]schema.Column, error) {
 
 	var existingCols []schema.Column
-	tbl, found, err := root.GetTable(ctx, TableName{Name: tableName})
+	tbl, found, err := root.GetTable(ctx, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +440,7 @@ func GetExistingColumns(
 			return false, nil
 		})
 	} else if headRoot != nil {
-		tbl, found, err := headRoot.GetTable(ctx, TableName{Name: tableName})
+		tbl, found, err := headRoot.GetTable(ctx, tableName)
 		if err != nil {
 			return nil, err
 		}
@@ -455,11 +458,10 @@ func GetExistingColumns(
 	return existingCols, nil
 }
 
-func GetAllSchemas(ctx context.Context, root RootValue) (map[string]schema.Schema, error) {
-	m := make(map[string]schema.Schema)
+func GetAllSchemas(ctx context.Context, root RootValue) (map[TableName]schema.Schema, error) {
+	m := make(map[TableName]schema.Schema)
 	err := root.IterTables(ctx, func(name TableName, table *Table, sch schema.Schema) (stop bool, err error) {
-		// TODO: schema name
-		m[name.Name] = sch
+		m[name] = sch
 		return false, nil
 	})
 
@@ -488,7 +490,7 @@ func (root *rootValue) GetTableHash(ctx context.Context, tName TableName) (hash.
 	return tVal, !tVal.IsEmpty(), nil
 }
 
-func (root *rootValue) SetTableHash(ctx context.Context, tName string, h hash.Hash) (RootValue, error) {
+func (root *rootValue) SetTableHash(ctx context.Context, tName TableName, h hash.Hash) (RootValue, error) {
 	val, err := root.vrw.ReadValue(ctx, h)
 
 	if err != nil {
@@ -501,7 +503,7 @@ func (root *rootValue) SetTableHash(ctx context.Context, tName string, h hash.Ha
 		return nil, err
 	}
 
-	return root.putTable(ctx, TableName{Name: tName}, ref, hash.Hash{})
+	return root.putTable(ctx, tName, ref, hash.Hash{})
 }
 
 // ResolveTableName resolves a case-insensitive name to the exact name as stored in Dolt. Returns false if no matching
@@ -521,10 +523,9 @@ func (root *rootValue) ResolveTableName(ctx context.Context, tName TableName) (s
 	}
 
 	found := false
-	lwrName := strings.ToLower(tName.Name)
 	resolvedName := tName.Name
 	err = tmIterAll(ctx, tableMap, func(name string, addr hash.Hash) {
-		if found == false && lwrName == strings.ToLower(name) {
+		if found == false && strings.EqualFold(tName.Name, name) {
 			resolvedName = name
 			found = true
 		}
@@ -627,15 +628,15 @@ func (root *rootValue) getTableMap(ctx context.Context, schemaName string) (tabl
 	return root.st.GetTablesMap(ctx, root.vrw, root.ns, schemaName)
 }
 
-func TablesWithDataConflicts(ctx context.Context, root RootValue) ([]string, error) {
-	names, err := root.GetTableNames(ctx, DefaultSchemaName)
+func TablesWithDataConflicts(ctx context.Context, root RootValue) ([]TableName, error) {
+	names, err := UnionTableNames(ctx, root)
 	if err != nil {
 		return nil, err
 	}
 
-	conflicted := make([]string, 0, len(names))
+	conflicted := make([]TableName, 0, len(names))
 	for _, name := range names {
-		tbl, _, err := root.GetTable(ctx, TableName{Name: name})
+		tbl, _, err := root.GetTable(ctx, name)
 		if err != nil {
 			return nil, err
 		}
@@ -653,16 +654,15 @@ func TablesWithDataConflicts(ctx context.Context, root RootValue) ([]string, err
 }
 
 // TablesWithConstraintViolations returns all tables that have constraint violations.
-func TablesWithConstraintViolations(ctx context.Context, root RootValue) ([]string, error) {
-	// TODO: schema name
-	names, err := root.GetTableNames(ctx, DefaultSchemaName)
+func TablesWithConstraintViolations(ctx context.Context, root RootValue) ([]TableName, error) {
+	names, err := UnionTableNames(ctx, root)
 	if err != nil {
 		return nil, err
 	}
 
-	violating := make([]string, 0, len(names))
+	violating := make([]TableName, 0, len(names))
 	for _, name := range names {
-		tbl, _, err := root.GetTable(ctx, TableName{Name: name})
+		tbl, _, err := root.GetTable(ctx, name)
 		if err != nil {
 			return nil, err
 		}
@@ -771,6 +771,27 @@ func (tn TableName) String() string {
 	return tn.Schema + "." + tn.Name
 }
 
+func (tn TableName) EqualFold(o TableName) bool {
+	return strings.EqualFold(tn.Name, o.Name) && strings.EqualFold(tn.Schema, o.Schema)
+}
+
+// The ForeignKey struct used to include referenced table names as strings and
+// now includes them as TableName structs. LD_1 format repositories serialized
+// the ForeignKey struct directly to a noms struct with the string fields. So
+// we need to maintain that behavior.
+func (tn TableName) MarshalNoms(vrw types.ValueReadWriter) (val types.Value, err error) {
+	return types.String(tn.Name), nil
+}
+
+func (tn TableName) UnmarshalNoms(ctx context.Context, nbf *types.NomsBinFormat, v types.Value) error {
+	str, ok := v.(types.String)
+	if !ok {
+		return fmt.Errorf("could not unmarshal %v to doltdb.TableName; expected only a string.", v)
+	}
+	tn.Name = string(str)
+	return nil
+}
+
 // ToTableNames is a migration helper function that converts a slice of table names to a slice of TableName structs.
 func ToTableNames(names []string, schemaName string) []TableName {
 	tbls := make([]TableName, len(names))
@@ -788,6 +809,45 @@ func FlattenTableNames(names []TableName) []string {
 		tbls[i] = name.Name
 	}
 	return tbls
+}
+
+// TableNamesAsString returns a comma-separated string of the table names given
+func TableNamesAsString(names []TableName) string {
+	sb := strings.Builder{}
+	for i, name := range names {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(name.String())
+	}
+	return sb.String()
+}
+
+// UnqualifiedTableNamesAsString returns a comma-separated string of the table names given
+func UnqualifiedTableNamesAsString(names []TableName) string {
+	sb := strings.Builder{}
+	for i, name := range names {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(name.Name)
+	}
+	return sb.String()
+}
+
+// GetUniqueSchemaNamesFromTableNames returns a list of unique schema names from a list of table names
+func GetUniqueSchemaNamesFromTableNames(names []TableName) []string {
+	schemaMap := make(map[string]struct{})
+	var schemas []string
+
+	for _, t := range names {
+		if _, exists := schemaMap[t.Schema]; !exists {
+			schemaMap[t.Schema] = struct{}{}
+			schemas = append(schemas, t.Schema)
+		}
+	}
+
+	return schemas
 }
 
 // DefaultSchemaName is the name of the default schema. Tables with this schema name will be stored in the
@@ -856,6 +916,7 @@ func (root *rootValue) putTable(ctx context.Context, tName TableName, ref types.
 		// certain updates can safely reuse the previous map
 		ret.schemaHashes = root.schemaHashes
 	}
+
 	return ret, nil
 }
 
@@ -863,7 +924,7 @@ func (root *rootValue) putTable(ctx context.Context, tName TableName, ref types.
 func CreateEmptyTable(ctx context.Context, root RootValue, tName TableName, sch schema.Schema) (RootValue, error) {
 	ns := root.NodeStore()
 	vrw := root.VRW()
-	empty, err := durable.NewEmptyIndex(ctx, vrw, ns, sch)
+	empty, err := durable.NewEmptyPrimaryIndex(ctx, vrw, ns, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -1046,14 +1107,13 @@ func ValidateForeignKeysOnSchemas(ctx context.Context, root RootValue) (RootValu
 		return nil, err
 	}
 
-	// TODO: schema name
-	allTablesSlice, err := root.GetTableNames(ctx, DefaultSchemaName)
+	allTablesSlice, err := UnionTableNames(ctx, root)
 	if err != nil {
 		return nil, err
 	}
-	allTablesSet := make(map[string]schema.Schema)
+	allTablesSet := make(map[TableName]schema.Schema)
 	for _, tableName := range allTablesSlice {
-		tbl, ok, err := root.GetTable(ctx, TableName{Name: tableName})
+		tbl, ok, err := root.GetTable(ctx, tableName)
 		if err != nil {
 			return nil, err
 		}
@@ -1160,11 +1220,13 @@ func schemaNames(ctx context.Context, root RootValue) ([]string, error) {
 
 // FilterIgnoredTables takes a slice of table names and divides it into new slices based on whether the table is ignored, not ignored, or matches conflicting ignore patterns.
 func FilterIgnoredTables(ctx context.Context, tables []TableName, roots Roots) (ignoredTables IgnoredTables, err error) {
-	ignorePatterns, err := GetIgnoredTablePatterns(ctx, roots)
+	schemas := GetUniqueSchemaNamesFromTableNames(tables)
+	ignorePatternMap, err := GetIgnoredTablePatterns(ctx, roots, schemas)
 	if err != nil {
 		return ignoredTables, err
 	}
 	for _, tableName := range tables {
+		ignorePatterns := ignorePatternMap[tableName.Schema]
 		ignored, err := ignorePatterns.IsTableNameIgnored(tableName)
 		if conflict := AsDoltIgnoreInConflict(err); conflict != nil {
 			ignoredTables.Conflicts = append(ignoredTables.Conflicts, *conflict)
@@ -1270,15 +1332,15 @@ func (root *rootValue) DebugString(ctx context.Context, transitive bool) string 
 }
 
 // MapTableHashes returns a map of each table name and hash.
-func MapTableHashes(ctx context.Context, root RootValue) (map[string]hash.Hash, error) {
-	// TODO: schema name
-	names, err := root.GetTableNames(ctx, DefaultSchemaName)
+func MapTableHashes(ctx context.Context, root RootValue) (map[TableName]hash.Hash, error) {
+	names, err := UnionTableNames(ctx, root)
 	if err != nil {
 		return nil, err
 	}
-	nameToHash := make(map[string]hash.Hash)
+
+	nameToHash := make(map[TableName]hash.Hash)
 	for _, name := range names {
-		h, ok, err := root.GetTableHash(ctx, TableName{Name: name})
+		h, ok, err := root.GetTableHash(ctx, name)
 		if err != nil {
 			return nil, err
 		} else if !ok {

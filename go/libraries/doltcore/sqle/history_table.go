@@ -497,8 +497,7 @@ func (ht *HistoryTable) newRowItrForTableAtCommit(ctx *sql.Context, table *DoltT
 		return nil, err
 	}
 
-	// TODO: schema
-	_, _, ok, err := doltdb.GetTableInsensitive(ctx, root, doltdb.TableName{Name: table.Name()})
+	_, ok, err := root.GetTable(ctx, table.TableName())
 	if err != nil {
 		return nil, err
 	}
@@ -521,10 +520,6 @@ func (ht *HistoryTable) newRowItrForTableAtCommit(ctx *sql.Context, table *DoltT
 		for _, idx := range indexes {
 			if idx.ID() == lookup.Index.ID() {
 				histTable = lockedTable.IndexedAccess(lookup)
-				if err != nil {
-					return nil, err
-				}
-
 				if histTable != nil {
 					newLookup := sql.IndexLookup{Index: idx, Ranges: lookup.Ranges}
 					partIter, err = histTable.(sql.IndexedTable).LookupPartitions(ctx, newLookup)

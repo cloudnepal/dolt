@@ -24,6 +24,7 @@ import (
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
 	"github.com/dolthub/dolt/go/libraries/doltcore/cherry_pick"
+	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 )
 
 var ErrEmptyCherryPick = errors.New("cannot cherry-pick empty string")
@@ -57,7 +58,7 @@ func doltCherryPick(ctx *sql.Context, args ...string) (sql.RowIter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return rowToIter(newCommitHash, dataConflicts, schemaConflicts, constraintViolations), nil
+	return rowToIter(newCommitHash, int64(dataConflicts), int64(schemaConflicts), int64(constraintViolations)), nil
 }
 
 // doDoltCherryPick attempts to perform a cherry-pick merge based on the arguments specified in |args| and returns
@@ -95,7 +96,14 @@ func doDoltCherryPick(ctx *sql.Context, args []string) (string, int, int, int, e
 		return "", 0, 0, 0, ErrEmptyCherryPick
 	}
 
-	commit, mergeResult, err := cherry_pick.CherryPick(ctx, cherryStr, cherry_pick.CherryPickOptions{})
+	cherryPickOptions := cherry_pick.NewCherryPickOptions()
+
+	// If --allow-empty is specified, then empty commits are allowed to be cherry-picked
+	if apr.Contains(cli.AllowEmptyFlag) {
+		cherryPickOptions.EmptyCommitHandling = doltdb.KeepEmptyCommit
+	}
+
+	commit, mergeResult, err := cherry_pick.CherryPick(ctx, cherryStr, cherryPickOptions)
 	if err != nil {
 		return "", 0, 0, 0, err
 	}

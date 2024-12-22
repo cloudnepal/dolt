@@ -18,11 +18,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/dolthub/go-mysql-server/sql"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
@@ -49,12 +51,14 @@ type updateOrdinal struct {
 
 func NewProvider(pro *sqle.DoltDatabaseProvider, sf StatsFactory) *Provider {
 	return &Provider{
-		pro:       pro,
-		sf:        sf,
-		mu:        &sync.Mutex{},
-		statDbs:   make(map[string]Database),
-		cancelers: make(map[string]context.CancelFunc),
-		status:    make(map[string]string),
+		pro:                 pro,
+		sf:                  sf,
+		mu:                  &sync.Mutex{},
+		statDbs:             make(map[string]Database),
+		autoCtxCancelers:    make(map[string]context.CancelFunc),
+		analyzeCtxCancelers: make(map[string]context.CancelFunc),
+		status:              make(map[string]string),
+		lockedTables:        make(map[string]bool),
 	}
 }
 
@@ -62,13 +66,15 @@ func NewProvider(pro *sqle.DoltDatabaseProvider, sf StatsFactory) *Provider {
 // Each database has its own statistics table that all tables/indexes in a db
 // share.
 type Provider struct {
-	mu        *sync.Mutex
-	pro       *sqle.DoltDatabaseProvider
-	sf        StatsFactory
-	statDbs   map[string]Database
-	cancelers map[string]context.CancelFunc
-	starter   sqle.InitDatabaseHook
-	status    map[string]string
+	mu                  *sync.Mutex
+	pro                 *sqle.DoltDatabaseProvider
+	sf                  StatsFactory
+	statDbs             map[string]Database
+	autoCtxCancelers    map[string]context.CancelFunc
+	analyzeCtxCancelers map[string]context.CancelFunc
+	starter             sqle.InitDatabaseHook
+	status              map[string]string
+	lockedTables        map[string]bool
 }
 
 // each database has one statistics table that is a collection of the
@@ -92,10 +98,37 @@ func newDbStats(dbName string) *dbToStats {
 
 var _ sql.StatsProvider = (*Provider)(nil)
 
-func (p *Provider) StartRefreshThread(ctx *sql.Context, pro dsess.DoltDatabaseProvider, name string, env *env.DoltEnv, db dsess.SqlDatabase) error {
-	err := p.starter(ctx, pro.(*sqle.DoltDatabaseProvider), name, env, db)
+func (p *Provider) Close() error {
+	var lastErr error
+	for _, db := range p.statDbs {
+		if err := db.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+func (p *Provider) TryLockForUpdate(branch, db, table string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	lockId := fmt.Sprintf("%s.%s.%s", branch, db, table)
+	if ok := p.lockedTables[lockId]; ok {
+		return false
+	}
+	p.lockedTables[lockId] = true
+	return true
+}
+
+func (p *Provider) UnlockTable(branch, db, table string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	lockId := fmt.Sprintf("%s.%s.%s", branch, db, table)
+	p.lockedTables[lockId] = false
+	return
+}
+
+func (p *Provider) StartRefreshThread(ctx *sql.Context, pro dsess.DoltDatabaseProvider, name string, env *env.DoltEnv, db dsess.SqlDatabase) error {
+	err := p.starter(ctx, pro.(*sqle.DoltDatabaseProvider), name, env, db)
 
 	if err != nil {
 		p.UpdateStatus(name, fmt.Sprintf("error restarting thread %s: %s", name, err.Error()))
@@ -111,11 +144,12 @@ func (p *Provider) SetStarter(hook sqle.InitDatabaseHook) {
 
 func (p *Provider) CancelRefreshThread(dbName string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if cancel, ok := p.cancelers[dbName]; ok {
+	if cancel, ok := p.autoCtxCancelers[dbName]; ok {
 		cancel()
-		p.UpdateStatus(dbName, fmt.Sprintf("cancelled thread: %s", dbName))
 	}
+	p.mu.Unlock()
+	p.UpdateStatus(dbName, fmt.Sprintf("cancelled thread: %s", dbName))
+
 }
 
 func (p *Provider) ThreadStatus(dbName string) string {
@@ -135,14 +169,15 @@ func (p *Provider) GetTableStats(ctx *sql.Context, db string, table sql.Table) (
 		return nil, nil
 	}
 
-	// TODO: schema name
-	return p.GetTableDoltStats(ctx, branch, db, table.Name())
+	var schemaName string
+	if schTab, ok := table.(sql.DatabaseSchemaTable); ok {
+		schemaName = strings.ToLower(schTab.DatabaseSchema().SchemaName())
+	}
+
+	return p.GetTableDoltStats(ctx, branch, db, schemaName, table.Name())
 }
 
-func (p *Provider) GetTableDoltStats(ctx *sql.Context, branch, db, table string) ([]sql.Statistic, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+func (p *Provider) GetTableDoltStats(ctx *sql.Context, branch, db, schema, table string) ([]sql.Statistic, error) {
 	statDb, ok := p.getStatDb(db)
 	if !ok || statDb == nil {
 		return nil, nil
@@ -159,7 +194,7 @@ func (p *Provider) GetTableDoltStats(ctx *sql.Context, branch, db, table string)
 
 	var ret []sql.Statistic
 	for _, qual := range statDb.ListStatQuals(branch) {
-		if strings.EqualFold(db, qual.Database) && strings.EqualFold(table, qual.Tab) {
+		if strings.EqualFold(db, qual.Database) && strings.EqualFold(schema, qual.Sch) && strings.EqualFold(table, qual.Tab) {
 			stat, _ := statDb.GetStat(branch, qual)
 			ret = append(ret, stat)
 		}
@@ -169,18 +204,25 @@ func (p *Provider) GetTableDoltStats(ctx *sql.Context, branch, db, table string)
 }
 
 func (p *Provider) setStatDb(name string, db Database) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.statDbs[name] = db
 }
 
 func (p *Provider) getStatDb(name string) (Database, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	statDb, ok := p.statDbs[strings.ToLower(name)]
 	return statDb, ok
 }
 
-func (p *Provider) SetStats(ctx *sql.Context, s sql.Statistic) error {
+func (p *Provider) deleteStatDb(name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	delete(p.statDbs, strings.ToLower(name))
+}
 
+func (p *Provider) SetStats(ctx *sql.Context, s sql.Statistic) error {
 	statDb, ok := p.getStatDb(s.Qualifier().Db())
 	if !ok {
 		return nil
@@ -218,9 +260,6 @@ func (p *Provider) getQualStats(ctx *sql.Context, qual sql.StatQualifier) (*Dolt
 }
 
 func (p *Provider) GetStats(ctx *sql.Context, qual sql.StatQualifier, _ []string) (sql.Statistic, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	stat, ok := p.getQualStats(ctx, qual)
 	if !ok {
 		return nil, false
@@ -228,35 +267,38 @@ func (p *Provider) GetStats(ctx *sql.Context, qual sql.StatQualifier, _ []string
 	return stat, true
 }
 
-func (p *Provider) DropDbStats(ctx *sql.Context, db string, flush bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+func (p *Provider) DropBranchDbStats(ctx *sql.Context, branch, db string, flush bool) error {
 	statDb, ok := p.getStatDb(db)
 	if !ok {
 		return nil
 	}
 
-	dSess := dsess.DSessFromSess(ctx.Session)
-	branch, err := dSess.GetBranch()
-	if err != nil {
-		return err
-	}
-
-	// remove provider access
-	if err := statDb.DeleteBranchStats(ctx, branch, flush); err != nil {
-		return nil
-	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	p.status[db] = "dropped"
+
+	return statDb.DeleteBranchStats(ctx, branch, flush)
+}
+
+func (p *Provider) DropDbStats(ctx *sql.Context, db string, flush bool) error {
+	statDb, ok := p.getStatDb(db)
+	if !ok {
+		return nil
+	}
+	for _, branch := range statDb.Branches() {
+		// remove provider access
+		p.DropBranchDbStats(ctx, branch, db, flush)
+	}
+
+	if flush {
+		p.deleteStatDb(db)
+	}
 
 	return nil
 }
 
 func (p *Provider) DropStats(ctx *sql.Context, qual sql.StatQualifier, _ []string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	statDb, ok := p.getStatDb(qual.Db())
 	if !ok {
 		return nil
@@ -269,7 +311,7 @@ func (p *Provider) DropStats(ctx *sql.Context, qual sql.StatQualifier, _ []strin
 	}
 
 	if _, ok := statDb.GetStat(branch, qual); ok {
-		statDb.DeleteStats(branch, qual)
+		statDb.DeleteStats(ctx, branch, qual)
 		p.UpdateStatus(qual.Db(), fmt.Sprintf("dropped statisic: %s", qual.String()))
 	}
 
@@ -277,13 +319,13 @@ func (p *Provider) DropStats(ctx *sql.Context, qual sql.StatQualifier, _ []strin
 }
 
 func (p *Provider) UpdateStatus(db string, msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.status[db] = msg
 }
 
 func (p *Provider) RowCount(ctx *sql.Context, db string, table sql.Table) (uint64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	statDb, ok := p.getStatDb(db)
 	if !ok {
 		return 0, sql.ErrDatabaseNotFound.New(db)
@@ -295,8 +337,12 @@ func (p *Provider) RowCount(ctx *sql.Context, db string, table sql.Table) (uint6
 		return 0, err
 	}
 
-	// TODO: schema name
-	priStats, ok := statDb.GetStat(branch, sql.NewStatQualifier(db, table.Name(), "primary"))
+	var schemaName string
+	if schTab, ok := table.(sql.DatabaseSchemaTable); ok {
+		schemaName = strings.ToLower(schTab.DatabaseSchema().SchemaName())
+	}
+
+	priStats, ok := statDb.GetStat(branch, sql.NewStatQualifier(db, schemaName, table.Name(), "primary"))
 	if !ok {
 		return 0, nil
 	}
@@ -305,9 +351,6 @@ func (p *Provider) RowCount(ctx *sql.Context, db string, table sql.Table) (uint6
 }
 
 func (p *Provider) DataLength(ctx *sql.Context, db string, table sql.Table) (uint64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	statDb, ok := p.getStatDb(db)
 	if !ok {
 		return 0, sql.ErrDatabaseNotFound.New(db)
@@ -319,11 +362,165 @@ func (p *Provider) DataLength(ctx *sql.Context, db string, table sql.Table) (uin
 		return 0, err
 	}
 
-	// TODO: schema name
-	priStats, ok := statDb.GetStat(branch, sql.NewStatQualifier(db, table.Name(), "primary"))
+	var schemaName string
+	if schTab, ok := table.(sql.DatabaseSchemaTable); ok {
+		schemaName = strings.ToLower(schTab.DatabaseSchema().SchemaName())
+	}
+
+	priStats, ok := statDb.GetStat(branch, sql.NewStatQualifier(db, schemaName, table.Name(), "primary"))
 	if !ok {
 		return 0, nil
 	}
 
 	return priStats.AvgSize(), nil
+}
+
+func (p *Provider) Prune(ctx *sql.Context) error {
+	dSess := dsess.DSessFromSess(ctx.Session)
+
+	for _, sqlDb := range p.pro.DoltDatabases() {
+		dbName := strings.ToLower(sqlDb.Name())
+		sqlDb, ok, err := dSess.Provider().SessionDatabase(ctx, dbName)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		statDb, ok := p.getStatDb(dbName)
+		if !ok {
+			continue
+		}
+
+		// Canceling refresh thread prevents background thread from
+		// making progress. Prune should succeed.
+		p.CancelRefreshThread(dbName)
+
+		tables, err := sqlDb.GetTableNames(ctx)
+		if err != nil {
+			return err
+		}
+
+		for _, branch := range statDb.Branches() {
+			err := func() error {
+				// function closure ensures safe defers
+				var stats []sql.Statistic
+				for _, t := range tables {
+					// XXX: avoid races with ANALYZE with the table locks.
+					// Either concurrent purge or analyze (or both) will fail.
+					if !p.TryLockForUpdate(branch, dbName, t) {
+						p.mu.Lock()
+						fmt.Println(p.lockedTables)
+						p.mu.Unlock()
+						return fmt.Errorf("concurrent statistics update and prune; retry prune when update is finished")
+					}
+					defer p.UnlockTable(branch, dbName, t)
+
+					tableStats, err := p.GetTableDoltStats(ctx, branch, dbName, sqlDb.SchemaName(), t)
+					if err != nil {
+						return err
+					}
+					stats = append(stats, tableStats...)
+				}
+
+				if err := p.DropBranchDbStats(ctx, branch, dbName, true); err != nil {
+					return err
+				}
+
+				for _, s := range stats {
+					ds, ok := s.(*DoltStats)
+					if !ok {
+						return fmt.Errorf("unexpected statistics type found: %T", s)
+					}
+					if err := statDb.SetStat(ctx, branch, ds.Qualifier(), ds); err != nil {
+						return err
+					}
+				}
+				if err := statDb.Flush(ctx, branch); err != nil {
+					return err
+				}
+				return nil
+			}()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Provider) Purge(ctx *sql.Context) error {
+	for _, sqlDb := range p.pro.DoltDatabases() {
+		dbName := strings.ToLower(sqlDb.Name())
+
+		tables, err := sqlDb.GetTableNames(ctx)
+		if err != nil {
+			return err
+		}
+
+		var branches []string
+		db, ok := p.getStatDb(dbName)
+		if ok {
+			// Canceling refresh thread prevents background thread from
+			// making progress. Purge should succeed.
+			p.CancelRefreshThread(dbName)
+
+			branches = db.Branches()
+			for _, branch := range branches {
+				err := func() error {
+					for _, t := range tables {
+						// XXX: avoid races with ANALYZE with the table locks.
+						// Either concurrent purge or analyze (or both) will fail.
+						if !p.TryLockForUpdate(branch, dbName, t) {
+							return fmt.Errorf("concurrent statistics update and prune; retry purge when update is finished")
+						}
+						defer p.UnlockTable(branch, dbName, t)
+					}
+
+					err := p.DropBranchDbStats(ctx, branch, dbName, true)
+					if err != nil {
+						return fmt.Errorf("failed to drop stats: %w", err)
+					}
+					return nil
+				}()
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		// if the database's failed to load, we still want to delete the folder
+
+		fs, err := p.pro.FileSystemForDatabase(dbName)
+		if err != nil {
+			return err
+		}
+
+		//remove from filesystem
+		statsFs, err := fs.WithWorkingDir(dbfactory.DoltStatsDir)
+		if err != nil {
+			return err
+		}
+
+		if ok, _ := statsFs.Exists(""); ok {
+			if err := statsFs.Delete("", true); err != nil {
+				return err
+			}
+		}
+
+		dropDbLoc, err := statsFs.Abs("")
+		if err != nil {
+			return err
+		}
+
+		if err = dbfactory.DeleteFromSingletonCache(filepath.ToSlash(dropDbLoc + "/.dolt/noms")); err != nil {
+			return err
+		}
+		if len(branches) == 0 {
+			// if stats db was invalid on startup, recreate from baseline
+			branches = p.getStatsBranches(ctx)
+		}
+		p.Load(ctx, fs, sqlDb, branches)
+	}
+	return nil
 }

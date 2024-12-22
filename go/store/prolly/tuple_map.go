@@ -213,6 +213,11 @@ func (m Map) Mutate() *MutableMap {
 	return newMutableMap(m)
 }
 
+// MutateInterface makes a MutableMap from a Map.
+func (m Map) MutateInterface() MutableMapInterface {
+	return newMutableMap(m)
+}
+
 // Rewriter returns a mutator that intends to rewrite this map with the key and value descriptors provided.
 func (m Map) Rewriter(kd, vd val.TupleDesc) *MutableMap {
 	return newMutableMapWithDescriptors(m, kd, vd)
@@ -314,7 +319,15 @@ func (m Map) IterRange(ctx context.Context, rng Range) (iter MapIter, err error)
 	} else {
 		iter, err = treeIterFromRange(ctx, m.tuples.Root, m.tuples.NodeStore, rng)
 	}
-	return filteredIter{iter: iter, rng: rng}, nil
+	if err != nil {
+		return nil, err
+	}
+	if !rng.SkipRangeMatchCallback || !rng.IsContiguous {
+		// range.Matches check is required if a type is imprecise
+		// or a key range is non-contiguous on disk
+		iter = filteredIter{iter: iter, rng: rng}
+	}
+	return iter, nil
 }
 
 // IterRangeReverse returns a mutableMapIter that iterates over a Range backwards.
@@ -433,24 +446,15 @@ func DebugFormat(ctx context.Context, m Map) (string, error) {
 	return sb.String(), nil
 }
 
-// ConvertToSecondaryKeylessIndex converts the given map to a keyless index map.
-func ConvertToSecondaryKeylessIndex(m Map) Map {
-	keyDesc, valDesc := m.Descriptors()
+func AddHashToSchema(keyDesc val.TupleDesc) val.TupleDesc {
 	newTypes := make([]val.Type, len(keyDesc.Types)+1)
 	handlers := make([]val.TupleTypeHandler, len(keyDesc.Types)+1)
 	copy(newTypes, keyDesc.Types)
 	copy(handlers, keyDesc.Handlers)
 	newTypes[len(newTypes)-1] = val.Type{Enc: val.Hash128Enc}
 	handlers[len(handlers)-1] = nil
-	newKeyDesc := val.NewTupleDescriptorWithArgs(val.TupleDescriptorArgs{
+	return val.NewTupleDescriptorWithArgs(val.TupleDescriptorArgs{
 		Comparator: keyDesc.Comparator(),
 		Handlers:   handlers,
 	}, newTypes...)
-	newTuples := m.tuples
-	newTuples.Order = newKeyDesc
-	return Map{
-		tuples:  newTuples,
-		keyDesc: newKeyDesc,
-		valDesc: valDesc,
-	}
 }

@@ -648,7 +648,7 @@ func (tx *DoltTransaction) validateWorkingSetForCommit(ctx *sql.Context, working
 
 			violations := make([]string, len(badTbls))
 			for i, name := range badTbls {
-				tbl, _, err := workingRoot.GetTable(ctx, doltdb.TableName{Name: name})
+				tbl, _, err := workingRoot.GetTable(ctx, name)
 				if err != nil {
 					return err
 				}
@@ -755,7 +755,7 @@ func (tx *DoltTransaction) CreateSavepoint(name string, roots map[string]doltdb.
 // findSavepoint returns the index of the savepoint with the name given, or -1 if it doesn't exist
 func (tx *DoltTransaction) findSavepoint(name string) int {
 	for i, s := range tx.savepoints {
-		if strings.ToLower(s.name) == strings.ToLower(name) {
+		if strings.EqualFold(s.name, name) {
 			return i
 		}
 	}

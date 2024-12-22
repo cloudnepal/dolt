@@ -26,7 +26,6 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/transform"
 	"github.com/dolthub/go-mysql-server/sql/types"
-	"golang.org/x/exp/maps"
 	errorkinds "gopkg.in/src-d/go-errors.v1"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
@@ -53,7 +52,13 @@ var ErrUnableToMergeColumnDefaultValue = errorkinds.NewKind("unable to automatic
 // table's primary index will also be rewritten. This function merges the table's artifacts (e.g. recorded
 // conflicts), migrates any existing table data to the specified |mergedSch|, and merges table data from both
 // sides of the merge together.
-func mergeProllyTable(ctx context.Context, tm *TableMerger, mergedSch schema.Schema, mergeInfo MergeInfo, diffInfo tree.ThreeWayDiffInfo) (*doltdb.Table, *MergeStats, error) {
+func mergeProllyTable(
+	ctx context.Context,
+	tm *TableMerger,
+	mergedSch schema.Schema,
+	mergeInfo MergeInfo,
+	diffInfo tree.ThreeWayDiffInfo,
+) (*doltdb.Table, *MergeStats, error) {
 	mergeTbl, err := mergeTableArtifacts(ctx, tm, tm.leftTbl)
 	if err != nil {
 		return nil, nil, err
@@ -133,7 +138,7 @@ func mergeProllyTableData(ctx *sql.Context, tm *TableMerger, finalSch schema.Sch
 
 	keyless := schema.IsKeyless(tm.leftSch)
 
-	defaults, err := resolveDefaults(ctx, tm.name, finalSch, tm.leftSch)
+	defaults, err := resolveDefaults(ctx, tm.name.Name, finalSch, tm.leftSch)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -375,7 +380,7 @@ func newCheckValidator(ctx *sql.Context, tm *TableMerger, vm *valueMerger, sch s
 			continue
 		}
 
-		expr, err := expranalysis.ResolveCheckExpression(ctx, tm.name, sch, check.Expression())
+		expr, err := expranalysis.ResolveCheckExpression(ctx, tm.name.Name, sch, check.Expression())
 		if err != nil {
 			return checkValidator{}, err
 		}
@@ -547,7 +552,7 @@ func newUniqValidator(ctx *sql.Context, sch schema.Schema, tm *TableMerger, vm *
 		}
 		secondary := durable.ProllyMapFromIndex(idx)
 
-		u, err := newUniqIndex(ctx, sch, tm.name, def, clustered, secondary)
+		u, err := newUniqIndex(ctx, sch, tm.name.Name, def, clustered, secondary)
 		if err != nil {
 			return uniqValidator{}, err
 		}
@@ -710,9 +715,6 @@ func newUniqIndex(ctx *sql.Context, sch schema.Schema, tableName string, def sch
 		return uniqIndex{}, err
 	}
 
-	if schema.IsKeyless(sch) { // todo(andy): sad panda
-		secondary = prolly.ConvertToSecondaryKeylessIndex(secondary)
-	}
 	p := clustered.Pool()
 
 	prefixDesc := secondary.KeyDesc().PrefixDesc(def.Count())
@@ -854,7 +856,7 @@ func newNullValidator(
 		return nullValidator{}, err
 	}
 	return nullValidator{
-		table:        tm.name,
+		table:        tm.name.Name,
 		final:        final,
 		leftMap:      vm.leftMapping,
 		rightMap:     vm.rightMapping,
@@ -1090,7 +1092,7 @@ func (m *primaryMerger) merge(ctx *sql.Context, diff tree.ThreeWayDiff, sourceSc
 		} else {
 			// Remapping when there's no schema change is harmless, but slow.
 			if m.mergeInfo.RightNeedsRewrite {
-				defaults, err := resolveDefaults(ctx, m.tableMerger.name, m.finalSch, m.tableMerger.rightSch)
+				defaults, err := resolveDefaults(ctx, m.tableMerger.name.Name, m.finalSch, m.tableMerger.rightSch)
 				if err != nil {
 					return err
 				}
@@ -1128,7 +1130,7 @@ func (m *primaryMerger) merge(ctx *sql.Context, diff tree.ThreeWayDiff, sourceSc
 		// the merge
 		merged := diff.Merged
 		if hasStoredGeneratedColumns(m.finalSch) {
-			defaults, err := resolveDefaults(ctx, m.tableMerger.name, m.finalSch, m.tableMerger.rightSch)
+			defaults, err := resolveDefaults(ctx, m.tableMerger.name.Name, m.finalSch, m.tableMerger.rightSch)
 			if err != nil {
 				return err
 			}
@@ -1210,7 +1212,7 @@ func resolveDefaults(ctx *sql.Context, tableName string, mergedSchema schema.Sch
 		return nil, err
 	}
 
-	// The default expresions always come in the order of the merged schema, but the fields we need to apply them to
+	// The default expressions always come in the order of the merged schema, but the fields we need to apply them to
 	// might have different column indexes in the case of a schema change
 	if len(exprs) > 0 {
 		for i := range exprs {
@@ -1282,7 +1284,7 @@ func newSecondaryMerger(ctx *sql.Context, tm *TableMerger, valueMerger *valueMer
 	}
 	// Use the mergedSchema to work with the secondary indexes, to pull out row data using the right
 	// pri_index -> sec_index mapping.
-	lm, err := GetMutableSecondaryIdxsWithPending(ctx, leftSchema, mergedSchema, tm.name, ls, secondaryMergerPendingSize)
+	lm, err := GetMutableSecondaryIdxsWithPending(ctx, leftSchema, mergedSchema, tm.name.Name, ls, secondaryMergerPendingSize)
 	if err != nil {
 		return nil, err
 	}
@@ -1327,7 +1329,7 @@ func (m *secondaryMerger) merge(ctx *sql.Context, diff tree.ThreeWayDiff, leftSc
 						return fmt.Errorf("cannot merge keyless tables with reordered columns")
 					}
 				} else {
-					defaults, err := resolveDefaults(ctx, m.tableMerger.name, m.mergedSchema, m.tableMerger.rightSch)
+					defaults, err := resolveDefaults(ctx, m.tableMerger.name.Name, m.mergedSchema, m.tableMerger.rightSch)
 					if err != nil {
 						return err
 					}
@@ -1351,7 +1353,7 @@ func (m *secondaryMerger) merge(ctx *sql.Context, diff tree.ThreeWayDiff, leftSc
 					}
 					newTupleValue = tempTupleValue
 					if diff.Base != nil {
-						defaults, err := resolveDefaults(ctx, m.tableMerger.name, m.mergedSchema, m.tableMerger.ancSch)
+						defaults, err := resolveDefaults(ctx, m.tableMerger.name.Name, m.mergedSchema, m.tableMerger.ancSch)
 						if err != nil {
 							return err
 						}
@@ -1761,7 +1763,7 @@ func (m *valueMerger) processBaseColumn(ctx context.Context, i int, left, right,
 		if err != nil {
 			return false, err
 		}
-		if isEqual(i, baseCol, rightCol, m.rightVD.Types[rightColIdx]) {
+		if isEqual(m.baseVD.Comparator(), i, baseCol, rightCol, m.rightVD.Types[rightColIdx]) {
 			// right column did not change, so there is no conflict.
 			return false, nil
 		}
@@ -1784,7 +1786,7 @@ func (m *valueMerger) processBaseColumn(ctx context.Context, i int, left, right,
 		if err != nil {
 			return false, err
 		}
-		if isEqual(i, baseCol, leftCol, m.leftVD.Types[leftColIdx]) {
+		if isEqual(m.baseVD.Comparator(), i, baseCol, leftCol, m.leftVD.Types[leftColIdx]) {
 			// left column did not change, so there is no conflict.
 			return false, nil
 		}
@@ -1875,7 +1877,7 @@ func (m *valueMerger) processColumn(ctx *sql.Context, i int, left, right, base v
 			return nil, false, err
 		}
 
-		if isEqual(i, leftCol, rightCol, resultType) {
+		if isEqual(m.leftVD.Comparator(), i, leftCol, rightCol, resultType) {
 			// Columns are equal, returning either would be correct.
 			// However, for certain types the two columns may have different bytes.
 			// We need to ensure that merges are deterministic regardless of the merge direction.
@@ -1895,7 +1897,7 @@ func (m *valueMerger) processColumn(ctx *sql.Context, i int, left, right, base v
 		return nil, true, nil
 	}
 
-	// We can now assume that both left are right contain byte-level changes to an existing column.
+	// We can now assume that both left and right contain byte-level changes to an existing column.
 	// But we need to know if those byte-level changes represent a modification to the underlying value,
 	// and whether those changes represent the *same* modification, otherwise there's a conflict.
 
@@ -1929,14 +1931,14 @@ func (m *valueMerger) processColumn(ctx *sql.Context, i int, left, right, base v
 		if err != nil {
 			return nil, true, nil
 		}
-		rightModified = !isEqual(i, rightCol, baseCol, resultType)
+		rightModified = !isEqual(m.resultVD.Comparator(), i, rightCol, baseCol, resultType)
 	}
 
 	leftCol, err = convert(ctx, m.leftVD, m.resultVD, m.resultSchema, leftColIdx, i, left, leftCol, m.ns)
 	if err != nil {
 		return nil, true, nil
 	}
-	if isEqual(i, leftCol, rightCol, resultType) {
+	if isEqual(m.resultVD.Comparator(), i, leftCol, rightCol, resultType) {
 		// Columns are equal, returning either would be correct.
 		// However, for certain types the two columns may have different bytes.
 		// We need to ensure that merges are deterministic regardless of the merge direction.
@@ -1947,7 +1949,7 @@ func (m *valueMerger) processColumn(ctx *sql.Context, i int, left, right, base v
 		return rightCol, false, nil
 	}
 
-	leftModified = !isEqual(i, leftCol, baseCol, resultType)
+	leftModified = !isEqual(m.resultVD.Comparator(), i, leftCol, baseCol, resultType)
 
 	switch {
 	case leftModified && rightModified:
@@ -1978,20 +1980,20 @@ func (m *valueMerger) processColumn(ctx *sql.Context, i int, left, right, base v
 }
 
 func (m *valueMerger) mergeJSONAddr(ctx context.Context, baseAddr []byte, leftAddr []byte, rightAddr []byte) (resultAddr []byte, conflict bool, err error) {
-	baseDoc, err := tree.NewJSONDoc(hash.New(baseAddr), m.ns).ToJSONDocument(ctx)
+	baseDoc, err := tree.NewJSONDoc(hash.New(baseAddr), m.ns).ToIndexedJSONDocument(ctx)
 	if err != nil {
 		return nil, true, err
 	}
-	leftDoc, err := tree.NewJSONDoc(hash.New(leftAddr), m.ns).ToJSONDocument(ctx)
+	leftDoc, err := tree.NewJSONDoc(hash.New(leftAddr), m.ns).ToIndexedJSONDocument(ctx)
 	if err != nil {
 		return nil, true, err
 	}
-	rightDoc, err := tree.NewJSONDoc(hash.New(rightAddr), m.ns).ToJSONDocument(ctx)
+	rightDoc, err := tree.NewJSONDoc(hash.New(rightAddr), m.ns).ToIndexedJSONDocument(ctx)
 	if err != nil {
 		return nil, true, err
 	}
 
-	mergedDoc, conflict, err := mergeJSON(ctx, baseDoc, leftDoc, rightDoc)
+	mergedDoc, conflict, err := mergeJSON(ctx, m.ns, baseDoc, leftDoc, rightDoc)
 	if err != nil {
 		return nil, true, err
 	}
@@ -1999,66 +2001,124 @@ func (m *valueMerger) mergeJSONAddr(ctx context.Context, baseAddr []byte, leftAd
 		return nil, true, nil
 	}
 
-	mergedVal, err := mergedDoc.ToInterface()
+	root, err := tree.SerializeJsonToAddr(ctx, m.ns, mergedDoc)
 	if err != nil {
 		return nil, true, err
 	}
-	mergedBytes, err := json.Marshal(mergedVal)
-	if err != nil {
-		return nil, true, err
-	}
-	mergedAddr, err := tree.SerializeBytesToAddr(ctx, m.ns, bytes.NewReader(mergedBytes), len(mergedBytes))
-	if err != nil {
-		return nil, true, err
-	}
+	mergedAddr := root.HashOf()
 	return mergedAddr[:], false, nil
-
 }
 
-func mergeJSON(ctx context.Context, base types.JSONDocument, left types.JSONDocument, right types.JSONDocument) (resultDoc types.JSONDocument, conflict bool, err error) {
+func mergeJSON(ctx context.Context, ns tree.NodeStore, base, left, right sql.JSONWrapper) (resultDoc sql.JSONWrapper, conflict bool, err error) {
 	// First, deserialize each value into JSON.
 	// We can only merge if the value at all three commits is a JSON object.
 
-	baseObject, baseIsObject := base.Val.(types.JsonObject)
-	leftObject, leftIsObject := left.Val.(types.JsonObject)
-	rightObject, rightIsObject := right.Val.(types.JsonObject)
+	baseIsObject, err := tree.IsJsonObject(base)
+	if err != nil {
+		return nil, true, err
+	}
+	leftIsObject, err := tree.IsJsonObject(left)
+	if err != nil {
+		return nil, true, err
+	}
+	rightIsObject, err := tree.IsJsonObject(right)
+	if err != nil {
+		return nil, true, err
+	}
 
 	if !baseIsObject || !leftIsObject || !rightIsObject {
 		// At least one of the commits does not have a JSON object.
 		// If both left and right have the same value, use that value.
 		// But if they differ, this is an unresolvable merge conflict.
-		cmp, err := left.Compare(right)
+		cmp, err := types.CompareJSON(left, right)
 		if err != nil {
 			return types.JSONDocument{}, true, err
 		}
 		if cmp == 0 {
-			//convergent operation.
+			// convergent operation.
 			return left, false, nil
 		} else {
 			return types.JSONDocument{}, true, nil
 		}
 	}
 
-	mergedObject := maps.Clone(leftObject)
-	merged := types.JSONDocument{Val: mergedObject}
+	indexedBase, isBaseIndexed := base.(tree.IndexedJsonDocument)
+	indexedLeft, isLeftIndexed := left.(tree.IndexedJsonDocument)
+	indexedRight, isRightIndexed := right.(tree.IndexedJsonDocument)
 
-	threeWayDiffer := NewThreeWayJsonDiffer(baseObject, leftObject, rightObject)
+	// We only do three way merges on values read from tables right now, which are read in as tree.IndexedJsonDocument.
+
+	var leftDiffer tree.IJsonDiffer
+	if isBaseIndexed && isLeftIndexed {
+		leftDiffer, err = tree.NewIndexedJsonDiffer(ctx, indexedBase, indexedLeft)
+		if err != nil {
+			return nil, true, err
+		}
+	} else {
+		baseObject, err := base.ToInterface()
+		if err != nil {
+			return nil, true, err
+		}
+		leftObject, err := left.ToInterface()
+		if err != nil {
+			return nil, true, err
+		}
+		leftDiffer = tree.NewJsonDiffer(baseObject.(types.JsonObject), leftObject.(types.JsonObject))
+	}
+
+	var rightDiffer tree.IJsonDiffer
+	if isBaseIndexed && isRightIndexed {
+		rightDiffer, err = tree.NewIndexedJsonDiffer(ctx, indexedBase, indexedRight)
+		if err != nil {
+			return nil, true, err
+		}
+	} else {
+		baseObject, err := base.ToInterface()
+		if err != nil {
+			return nil, true, err
+		}
+		rightObject, err := right.ToInterface()
+		if err != nil {
+			return nil, true, err
+		}
+		rightDiffer = tree.NewJsonDiffer(baseObject.(types.JsonObject), rightObject.(types.JsonObject))
+	}
+
+	threeWayDiffer := ThreeWayJsonDiffer{
+		leftDiffer:  leftDiffer,
+		rightDiffer: rightDiffer,
+		ns:          ns,
+	}
 
 	// Compute the merged object by applying diffs to the left object as needed.
+	// If the left object isn't an IndexedJsonDocument, we make one.
+	var ok bool
+	var merged tree.IndexedJsonDocument
+	if merged, ok = left.(tree.IndexedJsonDocument); !ok {
+		root, err := tree.SerializeJsonToAddr(ctx, ns, left)
+		if err != nil {
+			return types.JSONDocument{}, true, err
+		}
+		merged = tree.NewIndexedJsonDocument(ctx, root, ns)
+	}
+
 	for {
 		threeWayDiff, err := threeWayDiffer.Next(ctx)
 		if err == io.EOF {
 			return merged, false, nil
 		}
+		if err != nil {
+			return types.JSONDocument{}, true, err
+		}
 
 		switch threeWayDiff.Op {
-		case tree.DiffOpRightAdd, tree.DiffOpConvergentAdd, tree.DiffOpRightModify, tree.DiffOpConvergentModify:
-			_, _, err := merged.Set(ctx, threeWayDiff.Key, threeWayDiff.Right)
+		case tree.DiffOpRightAdd, tree.DiffOpConvergentAdd, tree.DiffOpRightModify, tree.DiffOpConvergentModify, tree.DiffOpDivergentModifyResolved:
+			merged, _, err = merged.SetWithKey(ctx, threeWayDiff.Key, threeWayDiff.Right)
 			if err != nil {
 				return types.JSONDocument{}, true, err
 			}
 		case tree.DiffOpRightDelete, tree.DiffOpConvergentDelete:
-			_, _, err := merged.Remove(ctx, threeWayDiff.Key)
+			merged, _, err = merged.RemoveWithKey(ctx, threeWayDiff.Key)
 			if err != nil {
 				return types.JSONDocument{}, true, err
 			}
@@ -2072,10 +2132,8 @@ func mergeJSON(ctx context.Context, base types.JSONDocument, left types.JSONDocu
 	}
 }
 
-func isEqual(i int, left []byte, right []byte, resultType val.Type) bool {
-	// We use a default comparator instead of the comparator in the schema.
-	// This is necessary to force a binary collation for string comparisons.
-	return val.DefaultTupleComparator{}.CompareValues(i, left, right, resultType) == 0
+func isEqual(cmp val.TupleComparator, i int, left []byte, right []byte, resultType val.Type) bool {
+	return cmp.CompareValues(i, left, right, resultType) == 0
 }
 
 func getColumn(tuple *val.Tuple, mapping *val.OrdinalMapping, idx int) (col []byte, colIndex int, exists bool) {

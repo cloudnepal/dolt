@@ -41,7 +41,7 @@ type IndexCollection interface {
 	Equals(other IndexCollection) bool
 	// GetByName returns the index with the given name, or nil if it does not exist.
 	GetByName(indexName string) Index
-	// GetByName returns the index with a matching case-insensitive name, the bool return value indicates if a match was found.
+	// GetByNameCaseInsensitive returns the index with a matching case-insensitive name, the bool return value indicates if a match was found.
 	GetByNameCaseInsensitive(indexName string) (Index, bool)
 	// GetIndexByColumnNames returns whether the collection contains an index that has this exact collection and ordering of columns.
 	GetIndexByColumnNames(cols ...string) (Index, bool)
@@ -173,10 +173,6 @@ func (ixc *indexCollectionImpl) AddIndex(indexes ...Index) {
 		if ok {
 			ixc.removeIndex(oldNamedIndex)
 		}
-		oldTaggedIndex := ixc.containsColumnTagCollection(index.tags...)
-		if oldTaggedIndex != nil {
-			ixc.removeIndex(oldTaggedIndex)
-		}
 		ixc.indexes[lowerName] = index
 		for _, tag := range index.tags {
 			ixc.colTagToIndex[tag] = append(ixc.colTagToIndex[tag], index)
@@ -194,7 +190,7 @@ func (ixc *indexCollectionImpl) AddIndexByColNames(indexName string, cols []stri
 
 func (ixc *indexCollectionImpl) AddIndexByColTags(indexName string, tags []uint64, prefixLengths []uint16, props IndexProperties) (Index, error) {
 	lowerName := strings.ToLower(indexName)
-	if strings.HasPrefix(lowerName, "dolt_") {
+	if strings.HasPrefix(lowerName, "dolt_") && !strings.HasPrefix(lowerName, "dolt_ci_") {
 		return nil, fmt.Errorf("indexes cannot be prefixed with `dolt_`")
 	}
 	if ixc.Contains(lowerName) {
@@ -306,7 +302,7 @@ func (ixc *indexCollectionImpl) GetByName(indexName string) Index {
 
 func (ixc *indexCollectionImpl) GetByNameCaseInsensitive(indexName string) (Index, bool) {
 	for name, ix := range ixc.indexes {
-		if strings.ToLower(name) == strings.ToLower(indexName) {
+		if strings.EqualFold(name, indexName) {
 			return ix, true
 		}
 	}

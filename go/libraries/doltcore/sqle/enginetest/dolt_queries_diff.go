@@ -19,7 +19,7 @@ import (
 	"github.com/dolthub/go-mysql-server/sql"
 	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
 
-	"github.com/dolthub/dolt/go/libraries/doltcore/sqle"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtablefunctions"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
 )
 
@@ -36,6 +36,11 @@ var DiffSystemTableScriptTests = []queries.ScriptTest{
 		Assertions: []queries.ScriptTestAssertion{
 			{
 				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_t;",
+				Expected: []sql.Row{{2}},
+			},
+			{
+				// Test case-insensitive table name
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_T;",
 				Expected: []sql.Row{{2}},
 			},
 			{
@@ -523,11 +528,41 @@ var DiffSystemTableScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_t;",
-				Expected: []sql.Row{{1}},
+				Expected: []sql.Row{{7}},
 			},
 			{
 				Query:    "SELECT to_pk, to_c1, from_pk, from_c1, diff_type FROM DOLT_DIFF_t where to_commit=@Commit4;",
 				Expected: []sql.Row{{7, 8, nil, nil, "added"}},
+			},
+		},
+	},
+	{
+		// Similar to previous test, but with one row to avoid ordering issues.
+		Name: "altered keyless table add pk", // https://github.com/dolthub/dolt/issues/8625
+		SetUpScript: []string{
+			"create table tbl (i int, j int);",
+			"insert into tbl values (42, 23);",
+			"call dolt_commit('-Am', 'commit1');",
+			"alter table tbl add primary key(i);",
+			"call dolt_commit('-am', 'commit2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT to_i,to_j,from_i,from_j,diff_type  FROM dolt_diff_tbl;",
+				// Output in the situation is admittedly wonky. Updating the PK leaves in a place where we can't really render
+				// the diff, but we want to show something. In this case, the 'pk' column tag changes, so in the last two rows
+				// of the output you see we add "nil,23" and remove "nil,23" when in fact those columns were "42" with a different
+				// tag.
+				//
+				// In the past we just returned an empty set in this case. The
+				// warning is kind of essential to understand what is happening.
+				Expected: []sql.Row{
+					{42, 23, nil, nil, "added"},
+					{nil, nil, nil, 23, "removed"},
+				},
+				ExpectedWarningsCount:           1,
+				ExpectedWarning:                 1105,
+				ExpectedWarningMessageSubstring: "due to primary key set change",
 			},
 		},
 	},
@@ -671,6 +706,24 @@ var DiffSystemTableScriptTests = []queries.ScriptTest{
 			},
 		},
 	},
+	{
+		Name: "duplicate commit_hash",
+		SetUpScript: []string{
+			"create table t1 (x int primary key)",
+			"create table t2 (x int primary key)",
+			"call dolt_add('.');",
+			"call dolt_commit_hash_out(@commit1, '-Am', 'commit1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select table_name from dolt_diff where commit_hash = @commit1",
+				Expected: []sql.Row{
+					{"t1"},
+					{"t2"},
+				},
+			},
+		},
+	},
 }
 
 var Dolt1DiffSystemTableScripts = []queries.ScriptTest{
@@ -690,8 +743,10 @@ var Dolt1DiffSystemTableScripts = []queries.ScriptTest{
 		},
 		Assertions: []queries.ScriptTestAssertion{
 			{
-				Query:    "SELECT to_pk1, to_pk2, from_pk1, from_pk2, diff_type from dolt_diff_t;",
-				Expected: []sql.Row{{"2", "2", nil, nil, "added"}},
+				Query: "SELECT to_pk1, to_pk2, from_pk1, from_pk2, diff_type from dolt_diff_t;",
+				Expected: []sql.Row{
+					{"2", "2", nil, nil, "added"},
+				},
 			},
 		},
 	},
@@ -757,15 +812,15 @@ var DiffTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:       "SELECT * from dolt_diff(@Commit1, concat('fake', '-', 'branch'), 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_diff(hashof('main'), @Commit2, 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_diff(hashof('main'), @Commit2, LOWER('T'));",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 
 			{
@@ -802,7 +857,7 @@ var DiffTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:       "SELECT * from dolt_diff('main..main~', LOWER('T'));",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 		},
 	},
@@ -1435,6 +1490,100 @@ on a.to_pk = b.to_pk;`,
 			},
 		},
 	},
+	{
+		Name: "diff table function works with views",
+		SetUpScript: []string{
+			"create table t (i int primary key);",
+			"call dolt_commit('-Am', 'created table')",
+			"insert into t values (1), (2), (3);",
+			"call dolt_commit('-Am', 'inserted into table')",
+			"create view v as select to_i, to_commit, from_i, from_commit, diff_type from dolt_diff('HEAD', 'HEAD~1', 't');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select * from v;",
+				Expected: []sql.Row{
+					{nil, "HEAD~1", 1, "HEAD", "removed"},
+					{nil, "HEAD~1", 2, "HEAD", "removed"},
+					{nil, "HEAD~1", 3, "HEAD", "removed"},
+				},
+			},
+			{
+				Query: "insert into t values (4), (5), (6);",
+				Expected: []sql.Row{
+					{gmstypes.NewOkResult(3)},
+				},
+			},
+			{
+				Query:            "call dolt_commit('-Am', 'inserted into table again');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "select * from v;",
+				Expected: []sql.Row{
+					{nil, "HEAD~1", 4, "HEAD", "removed"},
+					{nil, "HEAD~1", 5, "HEAD", "removed"},
+					{nil, "HEAD~1", 6, "HEAD", "removed"},
+				},
+			},
+		},
+	},
+	{
+		Name: "diff table function works with virtual generated columns",
+		SetUpScript: []string{
+			"create table t (i int primary key, j int, k int, jk int generated always as (10 * j + k), l int);",
+			"call dolt_commit('-Am', 'created table')",
+			"insert into t(i, j, k, l) values (1, 2, 3, 4);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select * from t;",
+				Expected: []sql.Row{
+					{1, 2, 3, 23, 4},
+				},
+			},
+			{
+				Query: "select to_i, to_jk, from_i, from_jk from dolt_diff_t;",
+				Expected: []sql.Row{
+					{1, nil, nil, nil},
+				},
+			},
+			{
+				Query: "select to_i, to_jk, from_i, from_jk from dolt_diff('HEAD', 'WORKING', 't');",
+				Expected: []sql.Row{
+					{1, nil, nil, nil},
+				},
+			},
+		},
+	},
+	{
+		Name: "diff table function works with stored generated columns",
+		SetUpScript: []string{
+			"create table t (i int primary key, j int, k int, jk int generated always as (10 * j + k) stored, l int);",
+			"call dolt_commit('-Am', 'created table')",
+			"insert into t(i, j, k, l) values (1, 2, 3, 4);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select * from t;",
+				Expected: []sql.Row{
+					{1, 2, 3, 23, 4},
+				},
+			},
+			{
+				Query: "select to_i, to_jk, from_i, from_jk from dolt_diff_t;",
+				Expected: []sql.Row{
+					{1, 23, nil, nil},
+				},
+			},
+			{
+				Query: "select to_i, to_jk, from_i, from_jk from dolt_diff('HEAD', 'WORKING', 't');",
+				Expected: []sql.Row{
+					{1, 23, nil, nil},
+				},
+			},
+		},
+	},
 }
 
 var DiffStatTableFunctionScriptTests = []queries.ScriptTest{
@@ -1505,19 +1654,19 @@ var DiffStatTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:       "SELECT * from dolt_diff_stat(@Commit1, concat('fake', '-', 'branch'), 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_diff_stat(hashof('main'), @Commit2, 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_diff_stat(@Commit1, @Commit2, LOWER('T'));",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_diff_stat('main..main~', LOWER('T'));",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 		},
 	},
@@ -2199,15 +2348,15 @@ var DiffSummaryTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:       "SELECT * from dolt_diff_summary(@Commit1, concat('fake', '-', 'branch'), 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_diff_summary(hashof('main'), @Commit2, 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_diff_summary(@Commit1, @Commit2, LOWER('T'));",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 		},
 	},
@@ -2963,19 +3112,19 @@ var PatchTableFunctionScriptTests = []queries.ScriptTest{
 			},
 			{
 				Query:       "SELECT * from dolt_patch(@Commit1, concat('fake', '-', 'branch'), 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_patch(hashof('main'), @Commit2, 't');",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_patch(@Commit1, @Commit2, LOWER('T'));",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 			{
 				Query:       "SELECT * from dolt_patch('main..main~', LOWER('T'));",
-				ExpectedErr: sqle.ErrInvalidNonLiteralArgument,
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
 			},
 		},
 	},
@@ -3574,6 +3723,105 @@ var PatchTableFunctionScriptTests = []queries.ScriptTest{
 					{"UPDATE `t` SET `z`=2 WHERE `pk`=2;"},
 					{"DELETE FROM `t` WHERE `pk`=3;"},
 					{"INSERT INTO `t` (`pk`,`a`,`z`,`d`) VALUES (7,'7',7,7);"},
+				},
+			},
+		},
+	},
+	{
+		Name: "tag collision",
+		SetUpScript: []string{
+			"CALL dolt_checkout('-b', 'other')",
+			"CREATE TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_144_075_01` (\n" +
+				"  `ID` varchar(8) NOT NULL,\n" +
+				"  `PRODUCTO` varchar(255),\n" +
+				"  `TARIFA` int,\n" +
+				"  `VERSION_INICIO` int,\n" +
+				"  `VERSION_FIN` int,\n" +
+				"  `COBERTURA` varchar(255),\n" +
+				"  `INDICADOR_NM` varchar(255),\n" +
+				"  `ANOS_COMPANIA_PROCEDENCIA_MIN` int,\n" +
+				"  `ANOS_COMPANIA_PROCEDENCIA_MAX` int,\n" +
+				"  `COEFICIENTE` double,\n" +
+				"  `DWB_IDENTITY` varchar(64),\n" +
+				"  PRIMARY KEY (`ID`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+			"CREATE TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_144_075` (\n" +
+				"  `ID` varchar(8) NOT NULL,\n" +
+				"  `PRODUCTO` varchar(255),\n" +
+				"  `TARIFA` int,\n" +
+				"  `VERSION_INICIO` int,\n" +
+				"  `VERSION_FIN` int,\n" +
+				"  `COBERTURA` varchar(255),\n" +
+				"  `INDICADOR_NM` varchar(255),\n" +
+				"  `ANOS_COMPANIA_PROCEDENCIA_MIN` int,\n" +
+				"  `ANOS_COMPANIA_PROCEDENCIA_MAX` int,\n" +
+				"  `COEFICIENTE` double,\n" +
+				"  `DWB_IDENTITY` varchar(64),\n" +
+				"  PRIMARY KEY (`ID`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+			"CALL dolt_commit('-A', '-m', 'create tables on other');",
+
+			"CALL dolt_checkout('main')",
+			"CREATE TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_060` (\n" +
+				"  `ID` varchar(8) NOT NULL,\n" +
+				"  `PRODUCTO` varchar(255),\n" +
+				"  `TARIFA` int,\n" +
+				"  `VERSION_INICIO` int,\n" +
+				"  `VERSION_FIN` int,\n" +
+				"  `COBERTURA` varchar(255),\n" +
+				"  `FRECUENCIA_PAGO` varchar(255),\n" +
+				"  `COEFICIENTE` double,\n" +
+				"  `DWB_IDENTITY` varchar(64),\n" +
+				"  PRIMARY KEY (`ID`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+			"CREATE TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_060_01` (\n" +
+				"  `ID` varchar(8) NOT NULL,\n" +
+				"  `PRODUCTO` varchar(255),\n" +
+				"  `TARIFA` int,\n" +
+				"  `VERSION_INICIO` int,\n" +
+				"  `VERSION_FIN` int,\n" +
+				"  `COBERTURA` varchar(255),\n" +
+				"  `FRECUENCIA_PAGO` varchar(255),\n" +
+				"  `COEFICIENTE` double,\n" +
+				"  `DWB_IDENTITY` varchar(64),\n" +
+				"  PRIMARY KEY (`ID`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;",
+			"call dolt_commit('-A', '-m', 'create tables on main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT statement FROM dolt_patch('main', 'other') ORDER BY statement_order",
+				Expected: []sql.Row{
+					{"DROP TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_060`;"},
+					{"DROP TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_060_01`;"},
+					{"CREATE TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_144_075` (\n" +
+						"  `ID` varchar(8) NOT NULL,\n" +
+						"  `PRODUCTO` varchar(255),\n" +
+						"  `TARIFA` int,\n" +
+						"  `VERSION_INICIO` int,\n" +
+						"  `VERSION_FIN` int,\n" +
+						"  `COBERTURA` varchar(255),\n" +
+						"  `INDICADOR_NM` varchar(255),\n" +
+						"  `ANOS_COMPANIA_PROCEDENCIA_MIN` int,\n" +
+						"  `ANOS_COMPANIA_PROCEDENCIA_MAX` int,\n" +
+						"  `COEFICIENTE` double,\n" +
+						"  `DWB_IDENTITY` varchar(64),\n" +
+						"  PRIMARY KEY (`ID`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;"},
+					{"CREATE TABLE `MOTOR_TARIFA_COEFICIENTE_RIESGO_144_075_01` (\n" +
+						"  `ID` varchar(8) NOT NULL,\n" +
+						"  `PRODUCTO` varchar(255),\n" +
+						"  `TARIFA` int,\n" +
+						"  `VERSION_INICIO` int,\n" +
+						"  `VERSION_FIN` int,\n" +
+						"  `COBERTURA` varchar(255),\n" +
+						"  `INDICADOR_NM` varchar(255),\n" +
+						"  `ANOS_COMPANIA_PROCEDENCIA_MIN` int,\n" +
+						"  `ANOS_COMPANIA_PROCEDENCIA_MAX` int,\n" +
+						"  `COEFICIENTE` double,\n" +
+						"  `DWB_IDENTITY` varchar(64),\n" +
+						"  PRIMARY KEY (`ID`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;"},
 				},
 			},
 		},
@@ -4733,6 +4981,14 @@ var CommitDiffSystemTableScriptTests = []queries.ScriptTest{
 				},
 			},
 			{
+				// Test case-insensitive table name
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_T WHERE TO_COMMIT=@Commit1 and FROM_COMMIT=@Commit0;",
+				Expected: []sql.Row{
+					{1, 2, 3, nil, nil, nil, "added"},
+					{4, 5, 6, nil, nil, nil, "added"},
+				},
+			},
+			{
 				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit2 and FROM_COMMIT=@Commit1 ORDER BY to_pk;",
 				Expected: []sql.Row{
 					{1, 2, 0, 1, 2, 3, "modified"},
@@ -4915,6 +5171,35 @@ var CommitDiffSystemTableScriptTests = []queries.ScriptTest{
 			},
 		},
 	},
+	{
+		// When in a detached head mode, dolt_commit_diff should still work, even though it doesn't have a staged root
+		Name: "detached head",
+		SetUpScript: []string{
+			"CREATE TABLE t (pk int primary key, c1 varchar(100));",
+			"CALL dolt_commit('-Am', 'create table t');",
+			"SET @commit1 = hashof('HEAD');",
+			"INSERT INTO t VALUES (1, 'one');",
+			"CALL dolt_commit('-Am', 'insert 1');",
+			"SET @commit2 = hashof('HEAD');",
+			"CALL dolt_tag('v1', @commit2);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "use mydb/v1;",
+				Expected: []sql.Row{},
+			},
+			{
+				// With no working set, this query should still compute the diff between two commits
+				Query:    "SELECT COUNT(*) AS table_diff_num FROM dolt_commit_diff_t WHERE from_commit=@commit1 AND to_commit=@commit2;",
+				Expected: []sql.Row{{1}},
+			},
+			{
+				// With no working set, STAGED should reference the current root of the checked out tag
+				Query:    "SELECT COUNT(*) AS table_diff_num FROM dolt_commit_diff_t WHERE from_commit=@commit1 AND to_commit='STAGED';",
+				Expected: []sql.Row{{1}},
+			},
+		},
+	},
 
 	{
 		// When a column is dropped and recreated with a different type, we expect only the new column
@@ -5045,6 +5330,7 @@ var CommitDiffSystemTableScriptTests = []queries.ScriptTest{
 			},
 		},
 	},
+
 	{
 		Name: "added and dropped table",
 		SetUpScript: []string{

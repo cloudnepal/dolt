@@ -52,7 +52,7 @@ func ResolveDefaultExpression(ctx *sql.Context, tableName string, sch schema.Sch
 		return nil, fmt.Errorf("unable to find default or generated expression")
 	}
 
-	return expr.Expr, nil
+	return expr, nil
 }
 
 // ResolveCheckExpression returns a sql.Expression for the check provided
@@ -95,8 +95,8 @@ func parseCreateTable(_ *sql.Context, tableName string, sch schema.Schema) (*pla
 	parseCtx := sql.NewEmptyContext()
 	parseCtx.SetCurrentDatabase("mydb")
 
-	b := planbuilder.New(parseCtx, catalog, sql.NewMysqlParser())
-	pseudoAnalyzedQuery, _, _, _, err := b.Parse(query, false)
+	b := planbuilder.New(parseCtx, catalog, nil, nil)
+	pseudoAnalyzedQuery, _, _, _, err := b.Parse(query, nil, false)
 	if err != nil {
 		return nil, err
 	}

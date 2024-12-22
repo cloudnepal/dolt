@@ -30,7 +30,6 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/merge"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
-	"github.com/dolthub/dolt/go/libraries/utils/set"
 	"github.com/dolthub/dolt/go/store/types"
 )
 
@@ -85,7 +84,12 @@ func (cmd VerifyConstraintsCmd) Exec(ctx context.Context, commandStr string, arg
 			return commands.HandleVErrAndExitCode(errhand.BuildDError("Unable to read table names.").AddCause(err).Build(), nil)
 		}
 	}
-	tableSet := set.NewStrSet(tableNames)
+	tableSet := doltdb.NewTableNameSet(nil)
+
+	// TODO: schema names
+	for _, tableName := range tableNames {
+		tableSet.Add(doltdb.TableName{Name: tableName})
+	}
 
 	comparingRoot, err := dEnv.HeadRoot(ctx)
 	if err != nil {
@@ -125,7 +129,7 @@ func (cmd VerifyConstraintsCmd) Exec(ctx context.Context, commandStr string, arg
 		}
 
 		for _, tableName := range tablesWithViolations.AsSortedSlice() {
-			tbl, ok, err := endRoot.GetTable(ctx, doltdb.TableName{Name: tableName})
+			tbl, ok, err := endRoot.GetTable(ctx, tableName)
 			if err != nil {
 				return commands.HandleVErrAndExitCode(errhand.BuildDError("Error loading table.").AddCause(err).Build(), nil)
 			}
@@ -133,8 +137,8 @@ func (cmd VerifyConstraintsCmd) Exec(ctx context.Context, commandStr string, arg
 				return commands.HandleVErrAndExitCode(errhand.BuildDError("Unable to load table '%s'.", tableName).Build(), nil)
 			}
 			cli.Println("")
-			cli.Println(doltdb.DoltConstViolTablePrefix + tableName)
-			dErr := printViolationsForTable(ctx, dbName, tableName, tbl, eng)
+			cli.Println(doltdb.DoltConstViolTablePrefix + tableName.Name)
+			dErr := printViolationsForTable(ctx, dbName, tableName.Name, tbl, eng)
 			if dErr != nil {
 				return commands.HandleVErrAndExitCode(dErr, nil)
 			}
@@ -168,7 +172,7 @@ func printViolationsForTable(ctx context.Context, dbName, tblName string, tbl *d
 	}
 	sCtx.SetCurrentDatabase(dbName)
 
-	sqlSch, sqlItr, err := eng.Query(sCtx, query)
+	sqlSch, sqlItr, _, err := eng.Query(sCtx, query)
 	if err != nil {
 		return errhand.BuildDError("Error querying constraint violations").AddCause(err).Build()
 	}

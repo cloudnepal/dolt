@@ -192,6 +192,10 @@ func workingset_flatbuffer(working hash.Hash, staged *hash.Hash, mergeState *Mer
 		serial.RebaseStateAddPreWorkingRootAddr(builder, preRebaseRootAddrOffset)
 		serial.RebaseStateAddBranch(builder, branchOffset)
 		serial.RebaseStateAddOntoCommitAddr(builder, ontoAddrOffset)
+		serial.RebaseStateAddCommitBecomesEmptyHandling(builder, rebaseState.commitBecomesEmptyHandling)
+		serial.RebaseStateAddEmptyCommitHandling(builder, rebaseState.emptyCommitHandling)
+		serial.RebaseStateAddLastAttemptedStep(builder, rebaseState.lastAttemptedStep)
+		serial.RebaseStateAddRebasingStarted(builder, rebaseState.rebasingStarted)
 		rebaseStateOffset = serial.RebaseStateEnd(builder)
 	}
 
@@ -260,11 +264,15 @@ func NewMergeState(
 	}
 }
 
-func NewRebaseState(preRebaseWorkingRoot hash.Hash, commitAddr hash.Hash, branch string) *RebaseState {
+func NewRebaseState(preRebaseWorkingRoot hash.Hash, commitAddr hash.Hash, branch string, commitBecomesEmptyHandling uint8, emptyCommitHandling uint8, lastAttemptedStep float32, rebasingStarted bool) *RebaseState {
 	return &RebaseState{
-		preRebaseWorkingAddr: &preRebaseWorkingRoot,
-		ontoCommitAddr:       &commitAddr,
-		branch:               branch,
+		preRebaseWorkingAddr:       &preRebaseWorkingRoot,
+		ontoCommitAddr:             &commitAddr,
+		branch:                     branch,
+		commitBecomesEmptyHandling: commitBecomesEmptyHandling,
+		emptyCommitHandling:        emptyCommitHandling,
+		lastAttemptedStep:          lastAttemptedStep,
+		rebasingStarted:            rebasingStarted,
 	}
 }
 

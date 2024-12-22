@@ -47,6 +47,7 @@ var filterColumnNameSet = set.NewStrSet([]string{commitHashCol})
 // changed in each commit, across all branches.
 type UnscopedDiffTable struct {
 	dbName           string
+	tableName        string
 	ddb              *doltdb.DoltDB
 	head             *doltdb.Commit
 	partitionFilters []sql.Expression
@@ -58,8 +59,8 @@ var _ sql.StatisticsTable = (*UnscopedDiffTable)(nil)
 var _ sql.IndexAddressable = (*UnscopedDiffTable)(nil)
 
 // NewUnscopedDiffTable creates an UnscopedDiffTable
-func NewUnscopedDiffTable(_ *sql.Context, dbName string, ddb *doltdb.DoltDB, head *doltdb.Commit) sql.Table {
-	return &UnscopedDiffTable{dbName: dbName, ddb: ddb, head: head}
+func NewUnscopedDiffTable(_ *sql.Context, dbName, tableName string, ddb *doltdb.DoltDB, head *doltdb.Commit) sql.Table {
+	return &UnscopedDiffTable{dbName: dbName, tableName: tableName, ddb: ddb, head: head}
 }
 
 func (dt *UnscopedDiffTable) DataLength(ctx *sql.Context) (uint64, error) {
@@ -75,30 +76,36 @@ func (dt *UnscopedDiffTable) RowCount(_ *sql.Context) (uint64, bool, error) {
 	return unscopedDiffDefaultRowCount, false, nil
 }
 
-// Name is a sql.Table interface function which returns the name of the table which is defined by the constant
-// DiffTableName
+// Name is a sql.Table interface function which returns the name of the table
 func (dt *UnscopedDiffTable) Name() string {
-	return doltdb.DiffTableName
+	return dt.tableName
 }
 
-// String is a sql.Table interface function which returns the name of the table which is defined by the constant
-// DiffTableName
+// String is a sql.Table interface function which returns the name of the table
 func (dt *UnscopedDiffTable) String() string {
-	return doltdb.DiffTableName
+	return dt.tableName
 }
+
+func getUnscopedDoltDiffSchema(dbName, tableName string) sql.Schema {
+	return []*sql.Column{
+		{Name: "commit_hash", Type: types.Text, Source: tableName, PrimaryKey: true, DatabaseSource: dbName},
+		{Name: "table_name", Type: types.Text, Source: tableName, PrimaryKey: true, DatabaseSource: dbName},
+		{Name: "committer", Type: types.Text, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "email", Type: types.Text, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "date", Type: types.Datetime, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "message", Type: types.Text, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "data_change", Type: types.Boolean, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "schema_change", Type: types.Boolean, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+	}
+}
+
+// GetUnscopedDoltDiffSchema returns the schema of the dolt_diff system table. This is used
+// by Doltgres to update the dolt_diff schema using Doltgres types.
+var GetUnscopedDoltDiffSchema = getUnscopedDoltDiffSchema
 
 // Schema is a sql.Table interface function that returns the sql.Schema for this system table.
 func (dt *UnscopedDiffTable) Schema() sql.Schema {
-	return []*sql.Column{
-		{Name: "commit_hash", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: true, DatabaseSource: dt.dbName},
-		{Name: "table_name", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: true, DatabaseSource: dt.dbName},
-		{Name: "committer", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
-		{Name: "email", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
-		{Name: "date", Type: types.Datetime, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
-		{Name: "message", Type: types.Text, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
-		{Name: "data_change", Type: types.Boolean, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
-		{Name: "schema_change", Type: types.Boolean, Source: doltdb.DiffTableName, PrimaryKey: false, DatabaseSource: dt.dbName},
-	}
+	return GetUnscopedDoltDiffSchema(dt.dbName, dt.tableName)
 }
 
 // Collation implements the sql.Table interface.
@@ -141,7 +148,7 @@ func (dt *UnscopedDiffTable) PartitionRows(ctx *sql.Context, partition sql.Parti
 
 // GetIndexes implements sql.IndexAddressable
 func (dt *UnscopedDiffTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
-	return index.DoltCommitIndexes(dt.dbName, dt.Name(), dt.ddb, true)
+	return index.DoltCommitIndexes(dt.dbName, dt.Name(), dt.ddb, false)
 }
 
 // IndexedAccess implements sql.IndexAddressable
@@ -152,7 +159,7 @@ func (dt *UnscopedDiffTable) IndexedAccess(lookup sql.IndexLookup) sql.IndexedTa
 
 // PreciseMatch implements sql.IndexAddressable
 func (dt *UnscopedDiffTable) PreciseMatch() bool {
-	return true
+	return false
 }
 
 func (dt *UnscopedDiffTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLookup) (sql.PartitionIter, error) {
@@ -240,7 +247,7 @@ func (d *doltDiffWorkingSetRowItr) Next(ctx *sql.Context) (sql.Row, error) {
 
 	sqlRow := sql.NewRow(
 		changeSet,
-		change.TableName.Name,
+		change.TableName.String(),
 		nil, // committer
 		nil, // email
 		nil, // date
@@ -361,7 +368,7 @@ func (itr *doltDiffCommitHistoryRowItr) Next(ctx *sql.Context) (sql.Row, error) 
 
 	return sql.NewRow(
 		h.String(),
-		tableChange.TableName.Name,
+		tableChange.TableName.String(),
 		meta.Name,
 		meta.Email,
 		meta.Time(),

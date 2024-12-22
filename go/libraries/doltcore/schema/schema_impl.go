@@ -524,9 +524,10 @@ func (si *schemaImpl) getKeyColumnsDescriptor(convertAddressColumns bool) val.Tu
 			}
 		}
 		tt = append(tt, t)
-		if queryType == query.Type_CHAR || queryType == query.Type_VARCHAR || queryType == query.Type_TEXT {
+		stringType, isStringType := sqlType.(sql.StringType)
+		if isStringType && (queryType == query.Type_CHAR || queryType == query.Type_VARCHAR || queryType == query.Type_TEXT) {
 			useCollations = true
-			collations = append(collations, sqlType.(sql.StringType).Collation())
+			collations = append(collations, stringType.Collation())
 		} else {
 			collations = append(collations, sql.Collation_Unspecified)
 		}
@@ -623,7 +624,7 @@ func (si *schemaImpl) SetCollation(collation Collation) {
 func (si *schemaImpl) indexOf(colName string) int {
 	i, idx := 0, -1
 	si.allCols.Iter(func(tag uint64, col Column) (stop bool, err error) {
-		if strings.ToLower(col.Name) == strings.ToLower(colName) {
+		if strings.EqualFold(col.Name, colName) {
 			idx = i
 			return true, nil
 		}

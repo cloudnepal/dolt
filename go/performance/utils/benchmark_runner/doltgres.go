@@ -65,7 +65,7 @@ func (b *doltgresBenchmarkerImpl) cleanupServerDir(dir string) error {
 }
 
 func (b *doltgresBenchmarkerImpl) createTestingDb(ctx context.Context) error {
-	psqlconn := fmt.Sprintf(psqlDsnTemplate, b.serverConfig.GetHost(), b.serverConfig.GetPort(), doltgresUser, "", dbName)
+	psqlconn := fmt.Sprintf(doltgresDsnTemplate, b.serverConfig.GetHost(), b.serverConfig.GetPort(), doltgresUser, doltgresPassword)
 
 	// open database
 	db, err := sql.Open(postgresDriver, psqlconn)
@@ -76,11 +76,13 @@ func (b *doltgresBenchmarkerImpl) createTestingDb(ctx context.Context) error {
 	// close database
 	defer db.Close()
 
+	// todo: currently db.Ping is busted in doltgres,
+	// results in error
 	// check db
-	err = db.PingContext(ctx)
-	if err != nil {
-		return err
-	}
+	//err = db.PingContext(ctx)
+	//if err != nil {
+	//	return err
+	//}
 
 	_, err = db.ExecContext(ctx, fmt.Sprintf(createDatabaseTemplate, dbName))
 	return err
@@ -117,6 +119,12 @@ func (b *doltgresBenchmarkerImpl) Benchmark(ctx context.Context) (results Result
 	if err != nil {
 		return
 	}
+	defer func() {
+		rerr := server.Stop()
+		if err == nil {
+			err = rerr
+		}
+	}()
 
 	err = b.createTestingDb(ctx)
 	if err != nil {
@@ -154,11 +162,6 @@ func (b *doltgresBenchmarkerImpl) Benchmark(ctx context.Context) (results Result
 			}
 			results = append(results, r)
 		}
-	}
-
-	err = server.Stop()
-	if err != nil {
-		return
 	}
 
 	if len(testsFailed) > 0 {

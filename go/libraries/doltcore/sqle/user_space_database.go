@@ -15,6 +15,8 @@
 package sqle
 
 import (
+	"fmt"
+
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
@@ -38,7 +40,7 @@ func NewUserSpaceDatabase(root doltdb.RootValue, editOpts editor.Options) *UserS
 }
 
 func (db *UserSpaceDatabase) Name() string {
-	return "dolt"
+	return doltdb.DoltNamespace
 }
 
 func (db *UserSpaceDatabase) Schema() string {
@@ -46,10 +48,11 @@ func (db *UserSpaceDatabase) Schema() string {
 }
 
 func (db *UserSpaceDatabase) GetTableInsensitive(ctx *sql.Context, tableName string) (sql.Table, bool, error) {
-	if doltdb.IsReadOnlySystemTable(tableName) {
+	tname := doltdb.TableName{Name: tableName}
+	if doltdb.IsReadOnlySystemTable(tname) {
 		return nil, false, nil
 	}
-	table, tableName, ok, err := doltdb.GetTableInsensitive(ctx, db.RootValue, doltdb.TableName{Name: tableName})
+	table, tableName, ok, err := doltdb.GetTableInsensitive(ctx, db.RootValue, tname)
 	if err != nil {
 		return nil, false, err
 	}
@@ -74,7 +77,7 @@ func (db *UserSpaceDatabase) GetTableNames(ctx *sql.Context) ([]string, error) {
 	}
 	resultingTblNames := []string{}
 	for _, tbl := range tableNames {
-		if !doltdb.IsReadOnlySystemTable(tbl) {
+		if !doltdb.IsReadOnlySystemTable(doltdb.TableName{Name: tbl}) {
 			resultingTblNames = append(resultingTblNames, tbl)
 		}
 	}
@@ -136,4 +139,20 @@ func (db *UserSpaceDatabase) RevisionQualifiedName() string {
 
 func (db *UserSpaceDatabase) RequestedName() string {
 	return db.Name()
+}
+
+func (db *UserSpaceDatabase) GetSchema(ctx *sql.Context, schemaName string) (sql.DatabaseSchema, bool, error) {
+	panic(fmt.Sprintf("GetSchema is not implemented for database %T", db))
+}
+
+func (db *UserSpaceDatabase) CreateSchema(ctx *sql.Context, schemaName string) error {
+	panic(fmt.Sprintf("CreateSchema is not implemented for database %T", db))
+}
+
+func (db *UserSpaceDatabase) AllSchemas(ctx *sql.Context) ([]sql.DatabaseSchema, error) {
+	panic(fmt.Sprintf("AllSchemas is not implemented for database %T", db))
+}
+
+func (db *UserSpaceDatabase) SchemaName() string {
+	return ""
 }

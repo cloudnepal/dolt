@@ -28,15 +28,14 @@ import (
 )
 
 // renameTable renames a table with in a RootValue and returns the updated root.
-func renameTable(ctx context.Context, root doltdb.RootValue, oldName, newName string) (doltdb.RootValue, error) {
+func renameTable(ctx context.Context, root doltdb.RootValue, oldName, newName doltdb.TableName) (doltdb.RootValue, error) {
 	if newName == oldName {
 		return root, nil
 	} else if root == nil {
 		panic("invalid parameters")
 	}
 
-	// TODO: schema name
-	return root.RenameTable(ctx, doltdb.TableName{Name: oldName}, doltdb.TableName{Name: newName})
+	return root.RenameTable(ctx, oldName, newName)
 }
 
 // Nullable represents whether a column can have a null value.
@@ -135,7 +134,7 @@ func validateNewColumn(
 	err = cols.Iter(func(currColTag uint64, currCol schema.Column) (stop bool, err error) {
 		if currColTag == tag {
 			return false, schema.ErrTagPrevUsed(tag, newColName, tblName, tblName)
-		} else if strings.ToLower(currCol.Name) == strings.ToLower(newColName) {
+		} else if strings.EqualFold(currCol.Name, newColName) {
 			return true, fmt.Errorf("A column with the name %s already exists in table %s.", newColName, tblName)
 		}
 
@@ -357,7 +356,7 @@ func backupFkcIndexesForPkDrop(ctx *sql.Context, tbl string, sch schema.Schema, 
 		}
 
 		// find suitable secondary index
-		newIdx, ok, err := findIndexWithPrefix(sch, sch.GetPKCols().GetColumnNames())
+		newIdx, ok, err := FindIndexWithPrefix(sch, sch.GetPKCols().GetColumnNames())
 		if err != nil {
 			return nil, err
 		} else if !ok {

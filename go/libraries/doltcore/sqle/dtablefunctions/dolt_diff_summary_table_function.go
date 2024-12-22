@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sqle
+package dtablefunctions
 
 import (
 	"fmt"
@@ -34,6 +34,7 @@ const diffSummaryDefaultRowCount = 10
 
 var _ sql.TableFunction = (*DiffSummaryTableFunction)(nil)
 var _ sql.ExecSourceRel = (*DiffSummaryTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*DiffSummaryTableFunction)(nil)
 
 type DiffSummaryTableFunction struct {
 	ctx *sql.Context
@@ -149,11 +150,11 @@ func (ds *DiffSummaryTableFunction) WithChildren(children ...sql.Node) (sql.Node
 	return ds, nil
 }
 
-// CheckPrivileges implements the interface sql.Node.
-func (ds *DiffSummaryTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (ds *DiffSummaryTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
 	if ds.tableNameExpr != nil {
 		if !types.IsText(ds.tableNameExpr.Type()) {
-			return false
+			return ExpressionIsDeferred(ds.tableNameExpr)
 		}
 
 		tableNameVal, err := ds.tableNameExpr.Eval(ds.ctx, nil)
@@ -427,10 +428,10 @@ func (d *diffSummaryTableFunctionRowIter) Close(context *sql.Context) error {
 
 func getRowFromSummary(ds *diff.TableDeltaSummary) sql.Row {
 	return sql.Row{
-		ds.FromTableName.Name, // from_table_name
-		ds.ToTableName.Name,   // to_table_name
-		ds.DiffType,           // diff_type
-		ds.DataChange,         // data_change
-		ds.SchemaChange,       // schema_change
+		ds.FromTableName.String(), // from_table_name
+		ds.ToTableName.String(),   // to_table_name
+		ds.DiffType,               // diff_type
+		ds.DataChange,             // data_change
+		ds.SchemaChange,           // schema_change
 	}
 }

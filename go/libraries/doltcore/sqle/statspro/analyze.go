@@ -84,6 +84,11 @@ func (p *Provider) BootstrapDatabaseStats(ctx *sql.Context, db string) error {
 }
 
 func (p *Provider) RefreshTableStatsWithBranch(ctx *sql.Context, table sql.Table, db string, branch string) error {
+	if !p.TryLockForUpdate(branch, db, table.Name()) {
+		return fmt.Errorf("already updating statistics")
+	}
+	defer p.UnlockTable(branch, db, table.Name())
+
 	dSess := dsess.DSessFromSess(ctx.Session)
 
 	sqlDb, err := dSess.Provider().Database(ctx, p.branchQualifiedDatabase(db, branch))
@@ -92,11 +97,13 @@ func (p *Provider) RefreshTableStatsWithBranch(ctx *sql.Context, table sql.Table
 	}
 
 	// lock only after accessing DatabaseProvider
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	tableName := strings.ToLower(table.Name())
 	dbName := strings.ToLower(db)
+	var schemaName string
+	if schTab, ok := table.(sql.DatabaseSchemaTable); ok {
+		schemaName = strings.ToLower(schTab.DatabaseSchema().SchemaName())
+	}
 
 	iat, ok := table.(sql.IndexAddressableTable)
 	if !ok {
@@ -132,6 +139,32 @@ func (p *Provider) RefreshTableStatsWithBranch(ctx *sql.Context, table sql.Table
 		p.setStatDb(dbName, statDb)
 	}
 
+	schHash, err := dTab.GetSchemaHash(ctx)
+	if err != nil {
+		return err
+	}
+
+	if oldSchHash, err := statDb.GetSchemaHash(ctx, branch, tableName); oldSchHash.IsEmpty() {
+		if err := statDb.SetSchemaHash(ctx, branch, tableName, schHash); err != nil {
+			return fmt.Errorf("set schema hash error: %w", err)
+		}
+	} else if oldSchHash != schHash {
+		ctx.GetLogger().Debugf("statistics refresh: detected table schema change: %s,%s/%s", dbName, table, branch)
+		if err := statDb.SetSchemaHash(ctx, branch, tableName, schHash); err != nil {
+			return err
+		}
+
+		stats, err := p.GetTableDoltStats(ctx, branch, dbName, schemaName, tableName)
+		if err != nil {
+			return err
+		}
+		for _, stat := range stats {
+			statDb.DeleteStats(ctx, branch, stat.Qualifier())
+		}
+	} else if err != nil {
+		return err
+	}
+
 	tablePrefix := fmt.Sprintf("%s.", tableName)
 	var idxMetas []indexMeta
 	for _, idx := range indexes {
@@ -140,7 +173,7 @@ func (p *Provider) RefreshTableStatsWithBranch(ctx *sql.Context, table sql.Table
 			cols[i] = strings.TrimPrefix(strings.ToLower(c), tablePrefix)
 		}
 
-		qual := sql.NewStatQualifier(db, table.Name(), strings.ToLower(idx.ID()))
+		qual := sql.NewStatQualifier(db, schemaName, table.Name(), strings.ToLower(idx.ID()))
 		curStat, ok := statDb.GetStat(branch, qual)
 		if !ok {
 			curStat = NewDoltStats()
@@ -169,7 +202,7 @@ func (p *Provider) RefreshTableStatsWithBranch(ctx *sql.Context, table sql.Table
 			// empty table
 			continue
 		}
-		stat.Chunks = idxMeta.allAddrs
+		stat.SetChunks(idxMeta.allAddrs)
 		stat.Hist = targetChunks
 		stat.UpdateActive()
 		if err := statDb.SetStat(ctx, branch, idxMeta.qual, stat); err != nil {

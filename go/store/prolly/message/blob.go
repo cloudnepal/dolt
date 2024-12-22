@@ -78,7 +78,7 @@ func getBlobValues(msg serial.Message) (values ItemAccess, err error) {
 	}
 	if b.TreeLevel() > 0 {
 		values.bufStart = lookupVectorOffset(blobAddressArrayVOffset, b.Table())
-		values.bufLen = uint16(b.AddressArrayLength() * uint16Size)
+		values.bufLen = uint16(b.AddressArrayLength())
 		values.itemWidth = hash.ByteLen
 	} else {
 		values.bufStart = lookupVectorOffset(blobPayloadBytesVOffset, b.Table())
@@ -153,5 +153,22 @@ func estimateBlobSize(values [][]byte, subtrees []uint64) (bufSz int) {
 	}
 	bufSz += len(subtrees) * binary.MaxVarintLen64
 	bufSz += 200 // overhead
+	return
+}
+
+func getBlobKeysAndValues(msg serial.Message) (keys, values ItemAccess, level, count uint16, err error) {
+	keys, err = getBlobKeys(msg)
+	if err != nil {
+		return
+	}
+	values, err = getBlobValues(msg)
+	if err != nil {
+		return
+	}
+	level, err = getBlobTreeLevel(msg)
+	if err != nil {
+		return
+	}
+	count, err = getBlobCount(msg)
 	return
 }

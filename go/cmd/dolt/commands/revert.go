@@ -124,7 +124,7 @@ func (cmd RevertCmd) Exec(ctx context.Context, commandStr string, args []string,
 		return 1
 	}
 
-	_, rowIter, err := queryist.Query(sqlCtx, query)
+	_, rowIter, _, err := queryist.Query(sqlCtx, query)
 	if err != nil {
 		cli.Printf("Failure to execute '%s': %s\n", query, err.Error())
 		return 1
@@ -144,7 +144,7 @@ func (cmd RevertCmd) Exec(ctx context.Context, commandStr string, args []string,
 		pager := outputpager.Start()
 		defer pager.Stop()
 
-		PrintCommitInfo(pager, 0, false, "auto", commit)
+		PrintCommitInfo(pager, 0, false, false, "auto", commit)
 	})
 
 	return 0

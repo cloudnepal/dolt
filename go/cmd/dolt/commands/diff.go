@@ -24,6 +24,7 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/vitess/go/sqltypes"
 	ast "github.com/dolthub/vitess/go/vt/sqlparser"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
@@ -171,7 +172,8 @@ func (cmd DiffCmd) ArgParser() *argparser.ArgParser {
 	ap.SupportsString(FormatFlag, "r", "result output format", "How to format diff output. Valid values are tabular, sql, json. Defaults to tabular.")
 	ap.SupportsString(whereParam, "", "column", "filters columns based on values in the diff.  See {{.EmphasisLeft}}dolt diff --help{{.EmphasisRight}} for details.")
 	ap.SupportsInt(limitParam, "", "record_count", "limits to the first N diffs.")
-	ap.SupportsFlag(cli.CachedFlag, "c", "Show only the staged data changes.")
+	ap.SupportsFlag(cli.StagedFlag, "", "Show only the staged data changes.")
+	ap.SupportsFlag(cli.CachedFlag, "c", "Synonym for --staged")
 	ap.SupportsFlag(SkinnyFlag, "sk", "Shows only primary key columns and any columns with data changes.")
 	ap.SupportsFlag(MergeBase, "", "Uses merge base of the first commit and second commit (or HEAD if not supplied) as the first commit")
 	ap.SupportsString(DiffMode, "", "diff mode", "Determines how to display modified rows with tabular output. Valid values are row, line, in-place, context. Defaults to context.")
@@ -197,7 +199,8 @@ func (cmd DiffCmd) Exec(ctx context.Context, commandStr string, args []string, _
 		return HandleVErrAndExitCode(verr, usage)
 	}
 
-	queryist, sqlCtx, closeFunc, err := cliCtx.QueryEngine(ctx)
+	queryist, oldSqlCtx, closeFunc, err := cliCtx.QueryEngine(ctx)
+	sqlCtx := doltdb.ContextWithDoltCICreateBypassKey(oldSqlCtx)
 	if err != nil {
 		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
 	}
@@ -286,7 +289,9 @@ func parseDiffArgs(queryist cli.Queryist, sqlCtx *sql.Context, apr *argparser.Ar
 		diffDisplaySettings: parseDiffDisplaySettings(apr),
 	}
 
-	tableNames, err := dArgs.applyDiffRoots(queryist, sqlCtx, apr.Args, apr.Contains(cli.CachedFlag), apr.Contains(MergeBase))
+	staged := apr.Contains(cli.StagedFlag) || apr.Contains(cli.CachedFlag)
+
+	tableNames, err := dArgs.applyDiffRoots(queryist, sqlCtx, apr.Args, staged, apr.Contains(MergeBase))
 	if err != nil {
 		return nil, err
 	}
@@ -1204,7 +1209,7 @@ func diffDoltSchemasTable(
 		return errhand.BuildDError("Error building diff query").AddCause(err).Build()
 	}
 
-	_, rowIter, err := queryist.Query(sqlCtx, query)
+	_, rowIter, _, err := queryist.Query(sqlCtx, query)
 	if err != nil {
 		return errhand.BuildDError("Error running diff query:\n%s", query).AddCause(err).Build()
 	}
@@ -1397,7 +1402,12 @@ func diffRows(
 		toSch = pkSch.Schema
 	}
 
-	unionSch := unionSchemas(fromSch, toSch)
+	var unionSch sql.Schema
+	if fromSch.Equals(toSch) {
+		unionSch = fromSch
+	} else {
+		unionSch = unionSchemas(fromSch, toSch)
+	}
 
 	// We always instantiate a RowWriter in case the diffWriter needs it to close off any work from schema output
 	rowWriter, err := dw.RowWriter(fromTableInfo, toTableInfo, tableSummary, unionSch)
@@ -1471,7 +1481,7 @@ func diffRows(
 		return errhand.BuildDError("Error building diff query:\n%s", interpolatedQuery).AddCause(err).Build()
 	}
 
-	sch, rowIter, err := queryist.Query(sqlCtx, interpolatedQuery)
+	sch, rowIter, _, err := queryist.Query(sqlCtx, interpolatedQuery)
 	if sql.ErrSyntaxError.Is(err) {
 		return errhand.BuildDError("Failed to parse diff query. Invalid where clause?\nDiff query: %s", interpolatedQuery).AddCause(err).Build()
 	} else if err != nil {
@@ -1510,7 +1520,7 @@ func diffRows(
 		if err != nil {
 			return errhand.BuildDError("Error closing row iterator:\n%s", interpolatedQuery).AddCause(err).Build()
 		}
-		_, rowIter, err = queryist.Query(sqlCtx, interpolatedQuery)
+		_, rowIter, _, err = queryist.Query(sqlCtx, interpolatedQuery)
 		defer rowIter.Close(sqlCtx)
 		if sql.ErrSyntaxError.Is(err) {
 			return errhand.BuildDError("Failed to parse diff query. Invalid where clause?\nDiff query: %s", interpolatedQuery).AddCause(err).Build()
@@ -1531,11 +1541,78 @@ func unionSchemas(s1 sql.Schema, s2 sql.Schema) sql.Schema {
 	var union sql.Schema
 	union = append(union, s1...)
 	for i := range s2 {
-		if union.IndexOfColName(s2[i].Name) < 0 {
+		idx := union.IndexOfColName(s2[i].Name)
+		if idx < 0 {
 			union = append(union, s2[i])
+		} else {
+			// have same name. choose the one with the most 'flexible' type
+			orig := union[idx]
+			orig.Type = chooseMostFlexibleType(orig.Type, s2[i].Type)
 		}
 	}
 	return union
+}
+
+// chooseMostFlexibleType returns the type that is more 'flexible' than the other type, for the purposes of printing
+// a diff when the type of the column has changed. There are a ton of different ways we could slice this. We'll stick to
+// the following rules for the time being:
+//   - Going from any integer to a float, always take the float.
+//   - Going from any integer to a decimal, always take the decimal.
+//   - Going from any decimal to a decimal (with different precision/scale), always take the new decimal.
+//   - Going from a low precision float to a high precision float, we'll always take the high precision float.
+//   - Going from a low precision integer to a high precision integer, we'll always take the high precision integer.
+//     Currently, we only support this if the signage is the same.
+//   - Going from a DATE, TIME, or DATETIME to a TIMESTAMP, we'll always take the TIMESTAMP.
+//
+// If none of these rules apply, we'll just take the `a` type.
+//
+// Note this is only for printing the diff. This is not robust for other purposes.
+func chooseMostFlexibleType(origA, origB sql.Type) sql.Type {
+	if origA.Equals(origB) {
+		return origA
+	}
+
+	at := origA.Type()
+	bt := origB.Type()
+
+	// If both are numbers, we'll take the float.
+	if sqltypes.IsIntegral(at) && sqltypes.IsFloat(bt) {
+		return origB
+	}
+	if sqltypes.IsIntegral(bt) && sqltypes.IsFloat(at) {
+		return origA
+	}
+
+	if bt == sqltypes.Decimal && sqltypes.IsIntegral(at) {
+		return origB
+	}
+
+	if sqltypes.IsFloat(at) && sqltypes.IsFloat(bt) {
+		// There are only two float types, so we'll always end up with a float64 here.
+		return origA.Promote()
+	}
+
+	if sqltypes.IsIntegral(at) && sqltypes.IsIntegral(bt) {
+		if (sqltypes.IsUnsigned(at) && sqltypes.IsUnsigned(bt)) || (!sqltypes.IsUnsigned(at) && !sqltypes.IsUnsigned(bt)) {
+			// Vitess definitions are ordered in the even that both are signed or unsigned, so take the higher one.
+			if bt > at {
+				return origB
+			}
+			return origA
+		}
+
+		// TODO: moving from unsigned to signed or vice versa.
+	}
+
+	if bt == sqltypes.Decimal && at == sqltypes.Decimal {
+		return origB
+	}
+
+	if bt == sqltypes.Timestamp && (at == sqltypes.Date || at == sqltypes.Time || at == sqltypes.Datetime) {
+		return origB
+	}
+
+	return origA
 }
 
 func getColumnNames(fromTableInfo, toTableInfo *diff.TableInfo) (colNames []string, formatText string) {

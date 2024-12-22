@@ -116,15 +116,15 @@ func walkOpaqueNodes(ctx context.Context, nd Node, ns NodeStore, cb NodeCb) erro
 	})
 }
 
-func NodeFromBytes(msg []byte) (Node, error) {
-	keys, values, level, count, err := message.UnpackFields(msg)
+func NodeFromBytes(msg []byte) (node Node, fileId string, err error) {
+	fileId, keys, values, level, count, err := message.UnpackFields(msg)
 	return Node{
 		keys:   keys,
 		values: values,
 		count:  count,
 		level:  level,
 		msg:    msg,
-	}, err
+	}, fileId, err
 }
 
 func (nd Node) HashOf() hash.Hash {
@@ -223,7 +223,7 @@ func OutputProllyNode(ctx context.Context, w io.Writer, node Node, ns NodeStore,
 				w.Write([]byte(", "))
 			}
 
-			isAddr := val.IsAddrEncoding(kd.Types[j].Enc)
+			isAddr := j < len(kd.Types) && val.IsAddrEncoding(kd.Types[j].Enc)
 			if isAddr {
 				w.Write([]byte("#"))
 			}

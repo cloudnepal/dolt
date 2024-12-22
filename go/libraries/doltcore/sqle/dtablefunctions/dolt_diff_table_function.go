@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sqle
+package dtablefunctions
 
 import (
 	"fmt"
@@ -38,9 +38,11 @@ import (
 const diffTableDefaultRowCount = 1000
 
 var ErrInvalidNonLiteralArgument = errors.NewKind("Invalid argument to %s: %s – only literal values supported")
+var ErrInvalidTableName = errors.NewKind("Invalid table name %s.")
 
 var _ sql.TableFunction = (*DiffTableFunction)(nil)
 var _ sql.ExecSourceRel = (*DiffTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*DiffTableFunction)(nil)
 
 type DiffTableFunction struct {
 	ctx            *sql.Context
@@ -186,7 +188,7 @@ func (dtf *DiffTableFunction) RowIter(ctx *sql.Context, _ sql.Row) (sql.RowIter,
 	ddb := sqledb.DbData().Ddb
 	dp := dtables.NewDiffPartition(dtf.tableDelta.ToTable, dtf.tableDelta.FromTable, toCommitStr, fromCommitStr, dtf.toDate, dtf.fromDate, dtf.tableDelta.ToSch, dtf.tableDelta.FromSch)
 
-	return dtables.NewDiffPartitionRowIter(*dp, ddb, dtf.joiner), nil
+	return dtables.NewDiffPartitionRowIter(dp, ddb, dtf.joiner), nil
 }
 
 // findMatchingDelta returns the best matching table delta for the table name
@@ -195,13 +197,13 @@ func (dtf *DiffTableFunction) RowIter(ctx *sql.Context, _ sql.Row) (sql.RowIter,
 func findMatchingDelta(deltas []diff.TableDelta, tableName string) diff.TableDelta {
 	tableName = strings.ToLower(tableName)
 	for _, d := range deltas {
-		if strings.ToLower(d.ToName.Name) == tableName {
+		if strings.EqualFold(d.ToName.Name, tableName) {
 			return d
 		}
 	}
 
 	for _, d := range deltas {
-		if strings.ToLower(d.FromName.Name) == tableName {
+		if strings.EqualFold(d.FromName.Name, tableName) {
 			return d
 		}
 	}
@@ -353,11 +355,11 @@ func (dtf *DiffTableFunction) WithChildren(node ...sql.Node) (sql.Node, error) {
 	return dtf, nil
 }
 
-// CheckPrivileges implements the sql.Node interface
-func (dtf *DiffTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (dtf *DiffTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
 	_, _, _, tableName, err := dtf.evaluateArguments()
 	if err != nil {
-		return false
+		return ExpressionIsDeferred(dtf.tableNameExpr)
 	}
 
 	subject := sql.PrivilegeCheckSubject{Database: dtf.database.Name(), Table: tableName}
@@ -486,20 +488,6 @@ func (dtf *DiffTableFunction) cacheTableDelta(ctx *sql.Context, fromCommitVal, t
 		return diff.TableDelta{}, err
 	}
 
-	fromTableName, fromTable, fromTableExists, err := resolve.Table(ctx, fromRefDetails.root, tableName)
-	if err != nil {
-		return diff.TableDelta{}, err
-	}
-
-	toTableName, toTable, toTableExists, err := resolve.Table(ctx, toRefDetails.root, tableName)
-	if err != nil {
-		return diff.TableDelta{}, err
-	}
-
-	if !fromTableExists && !toTableExists {
-		return diff.TableDelta{}, sql.ErrTableNotFound.New(tableName)
-	}
-
 	// TODO: it would be nice to limit this to just the table under consideration, not all tables with a diff
 	deltas, err := diff.GetTableDeltas(ctx, fromRefDetails.root, toRefDetails.root)
 	if err != nil {
@@ -514,6 +502,20 @@ func (dtf *DiffTableFunction) cacheTableDelta(ctx *sql.Context, fromCommitVal, t
 	// We only get a delta if there's a diff. When there isn't one, construct a delta here with table and schema info
 	// TODO: schema name
 	if delta.FromTable == nil && delta.ToTable == nil {
+		fromTableName, fromTable, fromTableExists, err := resolve.Table(ctx, fromRefDetails.root, tableName)
+		if err != nil {
+			return diff.TableDelta{}, err
+		}
+
+		toTableName, toTable, toTableExists, err := resolve.Table(ctx, toRefDetails.root, tableName)
+		if err != nil {
+			return diff.TableDelta{}, err
+		}
+
+		if !fromTableExists && !toTableExists {
+			return diff.TableDelta{}, sql.ErrTableNotFound.New(tableName)
+		}
+
 		delta.FromName = fromTableName
 		delta.ToName = toTableName
 		delta.FromTable = fromTable

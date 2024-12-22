@@ -19,6 +19,7 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,17 +27,22 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/mysql_db"
+	"github.com/dolthub/vitess/go/mysql"
+	"github.com/fatih/color"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	"github.com/dolthub/dolt/go/cmd/dolt/commands/engine"
 	"github.com/dolthub/dolt/go/cmd/dolt/errhand"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
+	"github.com/dolthub/dolt/go/libraries/utils/config"
+	"github.com/dolthub/dolt/go/libraries/utils/editor"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
 	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/dolthub/dolt/go/store/util/outputpager"
@@ -260,7 +266,7 @@ func newLateBindingEngine(
 		sqlCtx.SetCurrentDatabase(database)
 
 		rawDb := se.GetUnderlyingEngine().Analyzer.Catalog.MySQLDb
-		salt, err := rawDb.Salt()
+		salt, err := mysql.NewSalt()
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -308,7 +314,7 @@ func newLateBindingEngine(
 }
 
 func GetRowsForSql(queryist cli.Queryist, sqlCtx *sql.Context, query string) ([]sql.Row, error) {
-	_, rowIter, err := queryist.Query(sqlCtx, query)
+	_, rowIter, _, err := queryist.Query(sqlCtx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -397,7 +403,7 @@ func getStrBoolColAsBool(col interface{}) (bool, error) {
 	case bool:
 		return col.(bool), nil
 	case string:
-		return strings.ToLower(col.(string)) == "true" || strings.ToLower(col.(string)) == "1", nil
+		return strings.EqualFold(col.(string), "true") || strings.EqualFold(col.(string), "1"), nil
 	default:
 		return false, fmt.Errorf("unexpected type %T, was expecting bool or string", v)
 	}
@@ -495,7 +501,7 @@ func buildAuthResponse(salt []byte, password string) []byte {
 }
 
 func ValidatePasswordWithAuthResponse(rawDb *mysql_db.MySQLDb, user, password string) error {
-	salt, err := rawDb.Salt()
+	salt, err := mysql.NewSalt()
 	if err != nil {
 		return err
 	}
@@ -556,7 +562,8 @@ func GetDoltStatus(queryist cli.Queryist, sqlCtx *sql.Context) (stagedChangedTab
 }
 
 // PrintCommitInfo prints the given commit in the format used by log and show.
-func PrintCommitInfo(pager *outputpager.Pager, minParents int, showParents bool, decoration string, comm *CommitInfo) {
+func PrintCommitInfo(pager *outputpager.Pager, minParents int, showParents, showSignatures bool, decoration string, comm *CommitInfo) {
+	color.NoColor = false
 	if len(comm.parentHashes) < minParents {
 		return
 	}
@@ -567,7 +574,7 @@ func PrintCommitInfo(pager *outputpager.Pager, minParents int, showParents bool,
 	}
 
 	// Write commit hash
-	pager.Writer.Write([]byte(fmt.Sprintf("\033[33mcommit %s \033[0m", chStr))) // Use Dim Yellow (33m)
+	pager.Writer.Write([]byte(color.YellowString("commit %s ", chStr))) // Use Dim Yellow (33m)
 
 	// Show decoration
 	if decoration != "no" {
@@ -578,6 +585,14 @@ func PrintCommitInfo(pager *outputpager.Pager, minParents int, showParents bool,
 		pager.Writer.Write([]byte(fmt.Sprintf("\nMerge:")))
 		for _, h := range comm.parentHashes {
 			pager.Writer.Write([]byte(fmt.Sprintf(" " + h)))
+		}
+	}
+
+	if showSignatures && len(comm.commitMeta.Signature) > 0 {
+		signatureLines := strings.Split(comm.commitMeta.Signature, "\n")
+		for _, line := range signatureLines {
+			pager.Writer.Write([]byte("\n"))
+			pager.Writer.Write([]byte(color.CyanString(line)))
 		}
 	}
 
@@ -605,7 +620,7 @@ func printRefs(pager *outputpager.Pager, comm *CommitInfo, decoration string) {
 			b = "refs/heads/" + b
 		}
 		// branch names are bright green (32;1m)
-		branchName := fmt.Sprintf("\033[32;1m%s\033[0m", b)
+		branchName := color.HiGreenString(b)
 		references = append(references, branchName)
 	}
 	for _, b := range comm.remoteBranchNames {
@@ -613,7 +628,7 @@ func printRefs(pager *outputpager.Pager, comm *CommitInfo, decoration string) {
 			b = "refs/remotes/" + b
 		}
 		// remote names are bright red (31;1m)
-		branchName := fmt.Sprintf("\033[31;1m%s\033[0m", b)
+		branchName := color.HiRedString(b)
 		references = append(references, branchName)
 	}
 	for _, t := range comm.tagNames {
@@ -621,35 +636,59 @@ func printRefs(pager *outputpager.Pager, comm *CommitInfo, decoration string) {
 			t = "refs/tags/" + t
 		}
 		// tag names are bright yellow (33;1m)
-		tagName := fmt.Sprintf("\033[33;1mtag: %s\033[0m", t)
+
+		tagName := color.HiYellowString("tag: %s", t)
 		references = append(references, tagName)
 	}
 
-	pager.Writer.Write([]byte("\033[33m(\033[0m"))
+	yellow := color.New(color.FgYellow)
+	boldCyan := color.New(color.FgCyan, color.Bold)
+
+	pager.Writer.Write([]byte(yellow.Sprintf("(")))
+
 	if comm.isHead {
-		pager.Writer.Write([]byte("\033[36;1mHEAD -> \033[0m"))
+		pager.Writer.Write([]byte(boldCyan.Sprintf("HEAD -> ")))
 	}
-	pager.Writer.Write([]byte(strings.Join(references, "\033[33m, \033[0m"))) // Separate with Dim Yellow comma
-	pager.Writer.Write([]byte("\033[33m) \033[0m"))
+
+	joinedReferences := strings.Join(references, yellow.Sprint(", "))
+	pager.Writer.Write([]byte(yellow.Sprintf("%s) ", joinedReferences)))
+}
+
+type commitInfoOptions struct {
+	showSignature bool
 }
 
 // getCommitInfo returns the commit info for the given ref.
 func getCommitInfo(queryist cli.Queryist, sqlCtx *sql.Context, ref string) (*CommitInfo, error) {
+	return getCommitInfoWithOptions(queryist, sqlCtx, ref, commitInfoOptions{})
+}
+
+func getCommitInfoWithOptions(queryist cli.Queryist, sqlCtx *sql.Context, ref string, opts commitInfoOptions) (*CommitInfo, error) {
 	hashOfHead, err := getHashOf(queryist, sqlCtx, "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("error getting hash of HEAD: %v", err)
 	}
 
-	q, err := dbr.InterpolateForDialect("select * from dolt_log(?, '--parents', '--decorate=full')", []interface{}{ref}, dialect.MySQL)
-	if err != nil {
-		return nil, fmt.Errorf("error interpolating query: %v", err)
+	var q string
+	if opts.showSignature {
+		q, err = dbr.InterpolateForDialect("select * from dolt_log(?, '--parents', '--decorate=full', '--show-signature')", []interface{}{ref}, dialect.MySQL)
+		if err != nil {
+			return nil, fmt.Errorf("error interpolating query: %v", err)
+		}
+	} else {
+		q, err = dbr.InterpolateForDialect("select * from dolt_log(?, '--parents', '--decorate=full')", []interface{}{ref}, dialect.MySQL)
+		if err != nil {
+			return nil, fmt.Errorf("error interpolating query: %v", err)
+		}
 	}
+
 	rows, err := GetRowsForSql(queryist, sqlCtx, q)
 	if err != nil {
 		return nil, fmt.Errorf("error getting logs for ref '%s': %v", ref, err)
 	}
 	if len(rows) == 0 {
-		return nil, fmt.Errorf("no commits found for ref %s", ref)
+		// No commit with this hash exists
+		return nil, nil
 	}
 
 	row := rows[0]
@@ -663,7 +702,13 @@ func getCommitInfo(queryist cli.Queryist, sqlCtx *sql.Context, ref string) (*Com
 	message := row[4].(string)
 	parent := row[5].(string)
 	height := uint64(len(rows))
+
 	isHead := commitHash == hashOfHead
+
+	var signature string
+	if len(row) > 7 {
+		signature = row[7].(string)
+	}
 
 	localBranchesForHash, err := getBranchesForHash(queryist, sqlCtx, commitHash, true)
 	if err != nil {
@@ -685,6 +730,7 @@ func getCommitInfo(queryist cli.Queryist, sqlCtx *sql.Context, ref string) (*Com
 			Timestamp:     timestamp,
 			Description:   message,
 			UserTimestamp: int64(timestamp),
+			Signature:     signature,
 		},
 		commitHash:        commitHash,
 		height:            height,
@@ -760,7 +806,7 @@ func getFastforward(row sql.Row, index int) bool {
 }
 
 func getHashOf(queryist cli.Queryist, sqlCtx *sql.Context, ref string) (string, error) {
-	q, err := dbr.InterpolateForDialect("select hashof(?)", []interface{}{ref}, dialect.MySQL)
+	q, err := dbr.InterpolateForDialect("select dolt_hashof(?)", []interface{}{ref}, dialect.MySQL)
 	if err != nil {
 		return "", fmt.Errorf("error interpolating hashof query: %v", err)
 	}
@@ -817,4 +863,93 @@ func HandleVErrAndExitCode(verr errhand.VerboseError, usage cli.UsagePrinter) in
 	}
 
 	return 0
+}
+
+// interpolateStoredProcedureCall returns an interpolated query to call |storedProcedureName| with the arguments
+// |args|.
+func interpolateStoredProcedureCall(storedProcedureName string, args []string) (string, error) {
+	query := fmt.Sprintf("CALL %s(%s);", storedProcedureName, buildPlaceholdersString(len(args)))
+	return dbr.InterpolateForDialect(query, stringSliceToInterfaceSlice(args), dialect.MySQL)
+}
+
+// stringSliceToInterfaceSlice converts the string slice |ss| into an interface slice with the same values.
+func stringSliceToInterfaceSlice(ss []string) []interface{} {
+	retSlice := make([]interface{}, 0, len(ss))
+	for _, s := range ss {
+		retSlice = append(retSlice, s)
+	}
+	return retSlice
+}
+
+// buildPlaceholdersString returns a placeholder string to use in an interpolated query with the specified
+// |count| of parameter placeholders.
+func buildPlaceholdersString(count int) string {
+	return strings.Join(make([]string, count), "?, ") + "?"
+}
+
+func PrintStagingError(err error) {
+	vErr := func() errhand.VerboseError {
+		switch {
+		case doltdb.IsRootValUnreachable(err):
+			rt := doltdb.GetUnreachableRootType(err)
+			bdr := errhand.BuildDError("Unable to read %s.", rt.String())
+			bdr.AddCause(doltdb.GetUnreachableRootCause(err))
+			return bdr.Build()
+
+		case actions.IsTblNotExist(err):
+			tbls := actions.GetTablesForError(err)
+			bdr := errhand.BuildDError("Some of the specified tables or docs were not found")
+			bdr.AddDetails("Unknown tables or docs: %v", tbls)
+
+			return bdr.Build()
+
+		case actions.IsTblInConflict(err) || actions.IsTblViolatesConstraints(err):
+			tbls := actions.GetTablesForError(err)
+			bdr := errhand.BuildDError("error: not all tables merged")
+
+			for _, tbl := range tbls {
+				bdr.AddDetails("  %s", tbl)
+			}
+
+			return bdr.Build()
+		case doltdb.AsDoltIgnoreInConflict(err) != nil:
+			return errhand.VerboseErrorFromError(err)
+		default:
+			return errhand.BuildDError("Unknown error").AddCause(err).Build()
+		}
+	}()
+
+	cli.PrintErrln(vErr.Verbose())
+}
+
+// execEditor opens editor to ask user for input.
+func execEditor(initialMsg string, suffix string, cliCtx cli.CliContext) (editedMsg string, err error) {
+	if cli.ExecuteWithStdioRestored == nil {
+		return initialMsg, nil
+	}
+
+	if !checkIsTerminal() {
+		return initialMsg, nil
+	}
+
+	backupEd := "vim"
+	// try getting default editor on the user system
+	if ed, edSet := os.LookupEnv(dconfig.EnvEditor); edSet {
+		backupEd = ed
+	}
+	// try getting Dolt config core.editor
+	editorStr := cliCtx.Config().GetStringOrDefault(config.DoltEditor, backupEd)
+
+	cli.ExecuteWithStdioRestored(func() {
+		editedMsg, err = editor.OpenTempEditor(editorStr, initialMsg, suffix)
+		if err != nil {
+			return
+		}
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("Failed to open commit editor: %v \n Check your `EDITOR` environment variable with `echo $EDITOR` or your dolt config with `dolt config --list` to ensure that your editor is valid", err)
+	}
+
+	return editedMsg, nil
 }

@@ -191,7 +191,7 @@ func (d *DoltHarness) resetScripts() []setup.SetupScript {
 			tableName := tableNameRow[0].(string)
 
 			// special handling for auto_increment_tbl, which is expected to start with particular values
-			if strings.ToLower(tableName) == "auto_increment_tbl" {
+			if strings.EqualFold(tableName, "auto_increment_tbl") {
 				resetCmds = append(resetCmds, setup.AutoincrementData...)
 				continue
 			}
@@ -270,6 +270,10 @@ func (d *DoltHarness) NewEngine(t *testing.T) (enginetest.QueryEngine, error) {
 			if err != nil {
 				return nil, err
 			}
+
+			// Get a fresh session after running setup scripts, since some setup scripts can change the session state
+			d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), d.provider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession)
+			require.NoError(t, err)
 		}
 
 		if d.configureStats {
@@ -304,15 +308,13 @@ func (d *DoltHarness) NewEngine(t *testing.T) (enginetest.QueryEngine, error) {
 	d.engine.Analyzer.Catalog.MySQLDb.AddRootAccount()
 	d.engine.Analyzer.Catalog.StatsProvider = statspro.NewProvider(d.provider.(*sqle.DoltDatabaseProvider), statsnoms.NewNomsStatsFactory(d.multiRepoEnv.RemoteDialProvider()))
 
-	// Get a fresh session if we are reusing the engine
-	if !initializeEngine {
-		var err error
-		d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), d.provider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession)
-		require.NoError(t, err)
-	}
-
+	var err error
 	ctx := enginetest.NewContext(d)
 	e, err := enginetest.RunSetupScripts(ctx, d.engine, d.resetScripts(), d.SupportsNativeIndexCreation())
+
+	// Get a fresh session after running setup scripts, since some setup scripts can change the session state
+	d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), d.provider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession)
+	require.NoError(t, err)
 
 	return e, err
 }
@@ -495,6 +497,7 @@ func (d *DoltHarness) NewDatabaseProvider() sql.MutableDatabaseProvider {
 
 func (d *DoltHarness) Close() {
 	d.closeProvider()
+	sql.SystemVariables.SetGlobal(dsess.DoltStatsAutoRefreshEnabled, int8(0))
 }
 
 func (d *DoltHarness) closeProvider() {
@@ -586,7 +589,7 @@ func (d *DoltHarness) SnapshotTable(db sql.VersionedDatabase, tableName string, 
 
 	ctx := enginetest.NewContext(d)
 
-	_, iter, err := e.Query(ctx,
+	_, iter, _, err := e.Query(ctx,
 		"CALL DOLT_COMMIT('-Am', 'test commit');")
 	require.NoError(d.t, err)
 	_, err = sql.RowIterToRows(ctx, iter)
@@ -596,7 +599,7 @@ func (d *DoltHarness) SnapshotTable(db sql.VersionedDatabase, tableName string, 
 	ctx = enginetest.NewContext(d)
 	query := "CALL dolt_branch('" + asOfString + "')"
 
-	_, iter, err = e.Query(ctx,
+	_, iter, _, err = e.Query(ctx,
 		query)
 	require.NoError(d.t, err)
 	_, err = sql.RowIterToRows(ctx, iter)

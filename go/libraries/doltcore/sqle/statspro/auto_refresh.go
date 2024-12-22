@@ -53,7 +53,7 @@ func (p *Provider) InitAutoRefreshWithParams(ctxFactory func(ctx context.Context
 	defer p.mu.Unlock()
 
 	dropDbCtx, dbStatsCancel := context.WithCancel(context.Background())
-	p.cancelers[dbName] = dbStatsCancel
+	p.autoCtxCancelers[dbName] = dbStatsCancel
 
 	return bThreads.Add(fmt.Sprintf("%s_%s", asyncAutoRefreshStats, dbName), func(ctx context.Context) {
 		ticker := time.NewTicker(checkInterval + time.Nanosecond)
@@ -107,8 +107,10 @@ func (p *Provider) InitAutoRefreshWithParams(ctxFactory func(ctx context.Context
 }
 
 func (p *Provider) checkRefresh(ctx *sql.Context, sqlDb sql.Database, dbName, branch string, updateThresh float64) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	if !p.TryLockForUpdate(branch, dbName, "") {
+		return fmt.Errorf("database already being updated: %s/%s", branch, dbName)
+	}
+	defer p.UnlockTable(branch, dbName, "")
 
 	// Iterate all dbs, tables, indexes. Each db will collect
 	// []indexMeta above refresh threshold. We read and process those
@@ -131,6 +133,12 @@ func (p *Provider) checkRefresh(ctx *sql.Context, sqlDb sql.Database, dbName, br
 	}
 
 	for _, table := range tables {
+		if !p.TryLockForUpdate(branch, dbName, table) {
+			ctx.GetLogger().Debugf("statistics refresh: table is already being updated: %s/%s.%s", branch, dbName, table)
+			return fmt.Errorf("table already being updated: %s", table)
+		}
+		defer p.UnlockTable(branch, dbName, table)
+
 		sqlTable, dTab, err := GetLatestTable(ctx, table, sqlDb)
 		if err != nil {
 			return err
@@ -141,13 +149,43 @@ func (p *Provider) checkRefresh(ctx *sql.Context, sqlDb sql.Database, dbName, br
 			return err
 		}
 
-		if statDb.GetLatestHash(branch, table) == tableHash {
+		if statDb.GetTableHash(branch, table) == tableHash {
 			// no data changes since last check
 			tableExistsAndSkipped[table] = true
 			ctx.GetLogger().Debugf("statistics refresh: table hash unchanged since last check: %s", tableHash)
 			continue
 		} else {
 			ctx.GetLogger().Debugf("statistics refresh: new table hash: %s", tableHash)
+		}
+
+		schHash, err := dTab.GetSchemaHash(ctx)
+		if err != nil {
+			return err
+		}
+
+		var schemaName string
+		if schTab, ok := sqlTable.(sql.DatabaseSchemaTable); ok {
+			schemaName = strings.ToLower(schTab.DatabaseSchema().SchemaName())
+		}
+
+		if oldSchHash, err := statDb.GetSchemaHash(ctx, branch, table); oldSchHash.IsEmpty() {
+			if err := statDb.SetSchemaHash(ctx, branch, table, schHash); err != nil {
+				return err
+			}
+		} else if oldSchHash != schHash {
+			ctx.GetLogger().Debugf("statistics refresh: detected table schema change: %s,%s/%s", dbName, table, branch)
+			if err := statDb.SetSchemaHash(ctx, branch, table, schHash); err != nil {
+				return err
+			}
+			stats, err := p.GetTableDoltStats(ctx, branch, dbName, schemaName, table)
+			if err != nil {
+				return err
+			}
+			for _, stat := range stats {
+				statDb.DeleteStats(ctx, branch, stat.Qualifier())
+			}
+		} else if err != nil {
+			return err
 		}
 
 		iat, ok := sqlTable.(sql.IndexAddressableTable)
@@ -163,7 +201,7 @@ func (p *Provider) checkRefresh(ctx *sql.Context, sqlDb sql.Database, dbName, br
 		// collect indexes and ranges to be updated
 		var idxMetas []indexMeta
 		for _, index := range indexes {
-			qual := sql.NewStatQualifier(dbName, table, strings.ToLower(index.ID()))
+			qual := sql.NewStatQualifier(dbName, schemaName, table, strings.ToLower(index.ID()))
 			qualExists[qual] = true
 			curStat, ok := statDb.GetStat(branch, qual)
 			if !ok {
@@ -196,8 +234,8 @@ func (p *Provider) checkRefresh(ctx *sql.Context, sqlDb sql.Database, dbName, br
 				ctx.GetLogger().Debugf("statistics updating: %s", updateMeta.qual)
 				// mark index for updating
 				idxMetas = append(idxMetas, updateMeta)
-				// update lastest hash if we haven't already
-				statDb.SetLatestHash(branch, table, tableHash)
+				// update latest hash if we haven't already
+				statDb.SetTableHash(branch, table, tableHash)
 			}
 		}
 
@@ -234,7 +272,7 @@ func (p *Provider) checkRefresh(ctx *sql.Context, sqlDb sql.Database, dbName, br
 		}
 	}
 
-	statDb.DeleteStats(branch, deletedStats...)
+	statDb.DeleteStats(ctx, branch, deletedStats...)
 
 	if err := statDb.Flush(ctx, branch); err != nil {
 		return err

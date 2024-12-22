@@ -132,7 +132,7 @@ func testAutoIncrementTrackerWithLockMode(t *testing.T, harness DoltEnginetestHa
 	ctx := enginetest.NewContext(harness)
 
 	// Confirm that the system variable was correctly set.
-	_, iter, err := e.Query(ctx, "select @@innodb_autoinc_lock_mode")
+	_, iter, _, err := e.Query(ctx, "select @@innodb_autoinc_lock_mode")
 	require.NoError(t, err)
 	rows, err := sql.RowIterToRows(ctx, iter)
 	require.NoError(t, err)
@@ -191,7 +191,7 @@ func testAutoIncrementTrackerWithLockMode(t *testing.T, harness DoltEnginetestHa
 
 	// Verify that the inserts are seen by the engine.
 	{
-		_, iter, err := e.Query(ctx, "select count(*) from timestamps")
+		_, iter, _, err := e.Query(ctx, "select count(*) from timestamps")
 		require.NoError(t, err)
 		rows, err := sql.RowIterToRows(ctx, iter)
 		require.NoError(t, err)
@@ -200,7 +200,7 @@ func testAutoIncrementTrackerWithLockMode(t *testing.T, harness DoltEnginetestHa
 
 	// Verify that the insert operations are actually interleaved by inspecting the order that values were added to `timestamps`
 	{
-		_, iter, err := e.Query(ctx, "select (select min(pk) from timestamps where t = 1) < (select max(pk) from timestamps where t = 2)")
+		_, iter, _, err := e.Query(ctx, "select (select min(pk) from timestamps where t = 1) < (select max(pk) from timestamps where t = 2)")
 		require.NoError(t, err)
 		rows, err := sql.RowIterToRows(ctx, iter)
 		require.NoError(t, err)
@@ -208,7 +208,7 @@ func testAutoIncrementTrackerWithLockMode(t *testing.T, harness DoltEnginetestHa
 	}
 
 	{
-		_, iter, err := e.Query(ctx, "select (select min(pk) from timestamps where t = 2) < (select max(pk) from timestamps where t = 1)")
+		_, iter, _, err := e.Query(ctx, "select (select min(pk) from timestamps where t = 2) < (select max(pk) from timestamps where t = 1)")
 		require.NoError(t, err)
 		rows, err := sql.RowIterToRows(ctx, iter)
 		require.NoError(t, err)
@@ -639,22 +639,22 @@ func RunMultiDbTransactionsTest(t *testing.T, h DoltEnginetestHarness) {
 
 func RunMultiDbTransactionsPreparedTest(t *testing.T, h DoltEnginetestHarness) {
 	for _, script := range MultiDbTransactionTests {
-		//func() {
+		// func() {
 		h := h.NewHarness(t)
 		defer h.Close()
 		enginetest.TestScriptPrepared(t, h, script)
-		//}()
+		// }()
 	}
 }
 
 func RunDoltScriptsTest(t *testing.T, harness DoltEnginetestHarness) {
 	for _, script := range DoltScripts {
-		//go func() {
+		// go func() {
 		harness := harness.NewHarness(t)
 
 		enginetest.TestScript(t, harness, script)
 		harness.Close()
-		//}()
+		// }()
 	}
 }
 
@@ -683,6 +683,7 @@ func RunDoltRevisionDbScriptsTest(t *testing.T, h DoltEnginetestHarness) {
 	require.NoError(t, err)
 	defer e.Close()
 	ctx := h.NewContext()
+	ctx.SetCurrentDatabase("mydb")
 
 	setupScripts := []setup.SetupScript{
 		{"create table t01 (pk int primary key, c1 int)"},
@@ -696,7 +697,7 @@ func RunDoltRevisionDbScriptsTest(t *testing.T, h DoltEnginetestHarness) {
 	_, err = enginetest.RunSetupScripts(ctx, h.Engine(), setupScripts, true)
 	require.NoError(t, err)
 
-	_, iter, err := h.Engine().Query(ctx, "select hashof('HEAD~2');")
+	_, iter, _, err := h.Engine().Query(ctx, "select hashof('HEAD~2');")
 	require.NoError(t, err)
 	rows, err := sql.RowIterToRows(ctx, iter)
 	require.NoError(t, err)
@@ -824,6 +825,17 @@ func RunShowCreateTableTests(t *testing.T, h DoltEnginetestHarness) {
 	}
 }
 
+func RunCreateDatabaseTest(t *testing.T, h *DoltHarness) {
+	enginetest.TestCreateDatabase(t, h)
+	h.Close()
+
+	for _, script := range DoltCreateDatabaseScripts {
+		h := h.NewHarness(t)
+		enginetest.TestScript(t, h, script)
+		h.Close()
+	}
+}
+
 func RunShowCreateTablePreparedTests(t *testing.T, h DoltEnginetestHarness) {
 	for _, script := range ShowCreateTableScriptTests {
 		func() {
@@ -947,7 +959,7 @@ func RunDoltConflictsTableNameTableTests(t *testing.T, h DoltEnginetestHarness) 
 	}
 }
 
-func RunKelyessDoltMergeCVsAndConflictsTests(t *testing.T, h DoltEnginetestHarness) {
+func RunKeylessDoltMergeCVsAndConflictsTests(t *testing.T, h DoltEnginetestHarness) {
 	if !types.IsFormat_DOLT(types.Format_Default) {
 		t.Skip()
 	}
@@ -1957,6 +1969,16 @@ func RunDoltReflogTestsPrepared(t *testing.T, h DoltEnginetestHarness) {
 			h.UseLocalFileSystem()
 			h.SkipSetupCommit()
 			enginetest.TestScriptPrepared(t, h, script)
+		}()
+	}
+}
+
+func RunDoltWorkspaceTests(t *testing.T, h DoltEnginetestHarness) {
+	for _, script := range DoltWorkspaceScriptTests {
+		func() {
+			h = h.NewHarness(t)
+			defer h.Close()
+			enginetest.TestScript(t, h, script)
 		}()
 	}
 }

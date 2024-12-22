@@ -531,7 +531,55 @@ func (rcv *RebaseState) MutateOntoCommitAddr(j int, n byte) bool {
 	return false
 }
 
-const RebaseStateNumFields = 3
+func (rcv *RebaseState) EmptyCommitHandling() byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(10))
+	if o != 0 {
+		return rcv._tab.GetByte(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *RebaseState) MutateEmptyCommitHandling(n byte) bool {
+	return rcv._tab.MutateByteSlot(10, n)
+}
+
+func (rcv *RebaseState) CommitBecomesEmptyHandling() byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(12))
+	if o != 0 {
+		return rcv._tab.GetByte(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *RebaseState) MutateCommitBecomesEmptyHandling(n byte) bool {
+	return rcv._tab.MutateByteSlot(12, n)
+}
+
+func (rcv *RebaseState) LastAttemptedStep() float32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		return rcv._tab.GetFloat32(o + rcv._tab.Pos)
+	}
+	return 0.0
+}
+
+func (rcv *RebaseState) MutateLastAttemptedStep(n float32) bool {
+	return rcv._tab.MutateFloat32Slot(14, n)
+}
+
+func (rcv *RebaseState) RebasingStarted() bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(16))
+	if o != 0 {
+		return rcv._tab.GetBool(o + rcv._tab.Pos)
+	}
+	return false
+}
+
+func (rcv *RebaseState) MutateRebasingStarted(n bool) bool {
+	return rcv._tab.MutateBoolSlot(16, n)
+}
+
+const RebaseStateNumFields = 7
 
 func RebaseStateStart(builder *flatbuffers.Builder) {
 	builder.StartObject(RebaseStateNumFields)
@@ -553,6 +601,18 @@ func RebaseStateAddOntoCommitAddr(builder *flatbuffers.Builder, ontoCommitAddr f
 }
 func RebaseStateStartOntoCommitAddrVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(1, numElems, 1)
+}
+func RebaseStateAddEmptyCommitHandling(builder *flatbuffers.Builder, emptyCommitHandling byte) {
+	builder.PrependByteSlot(3, emptyCommitHandling, 0)
+}
+func RebaseStateAddCommitBecomesEmptyHandling(builder *flatbuffers.Builder, commitBecomesEmptyHandling byte) {
+	builder.PrependByteSlot(4, commitBecomesEmptyHandling, 0)
+}
+func RebaseStateAddLastAttemptedStep(builder *flatbuffers.Builder, lastAttemptedStep float32) {
+	builder.PrependFloat32Slot(5, lastAttemptedStep, 0.0)
+}
+func RebaseStateAddRebasingStarted(builder *flatbuffers.Builder, rebasingStarted bool) {
+	builder.PrependBoolSlot(6, rebasingStarted, false)
 }
 func RebaseStateEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

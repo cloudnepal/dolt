@@ -36,13 +36,13 @@ type Database interface {
 	LoadBranchStats(ctx *sql.Context, branch string) error
 	// DeleteBranchStats removes references to in memory index statistics.
 	// If |flush| is true delete the data from storage.
-	DeleteBranchStats(ctx context.Context, branch string, flush bool) error
+	DeleteBranchStats(ctx *sql.Context, branch string, flush bool) error
 	// GetStat returns a branch's index statistics.
 	GetStat(branch string, qual sql.StatQualifier) (*DoltStats, bool)
 	//SetStat bulk replaces the statistic, deleting any previous version
 	SetStat(ctx context.Context, branch string, qual sql.StatQualifier, stats *DoltStats) error
 	//DeleteStats deletes a list of index statistics.
-	DeleteStats(branch string, quals ...sql.StatQualifier)
+	DeleteStats(ctx *sql.Context, branch string, quals ...sql.StatQualifier)
 	// ReplaceChunks is an update interface that lets a stats implementation
 	// decide how to edit stats for a stats refresh.
 	ReplaceChunks(ctx context.Context, branch string, qual sql.StatQualifier, targetHashes []hash.Hash, dropChunks, newChunks []sql.HistogramBucket) error
@@ -50,9 +50,20 @@ type Database interface {
 	Flush(ctx context.Context, branch string) error
 	// Close finalizes any file references.
 	Close() error
-
-	SetLatestHash(branch, tableName string, h hash.Hash)
-	GetLatestHash(branch, tableName string) hash.Hash
+	// SetTableHash updates the most recently tracked table stats table hash
+	SetTableHash(branch, tableName string, h hash.Hash)
+	// GetTableHash returns the most recently tracked table stats table hash
+	GetTableHash(branch, tableName string) hash.Hash
+	// SetSchemaHash updates the most recently stored table stat's schema hash
+	SetSchemaHash(ctx context.Context, branch, tableName string, h hash.Hash) error
+	// GetSchemaHash returns the schema hash for the latest stored statistics
+	GetSchemaHash(ctx context.Context, branch, tableName string) (hash.Hash, error)
+	// Branches returns the set of branches with tracked statistics databases
+	Branches() []string
+	// SchemaChange returns false if any table schema in the session
+	// root is incompatible with the latest schema used to create a stored
+	// set of statistics.
+	SchemaChange(ctx *sql.Context, branch string) (bool, error)
 }
 
 // StatsFactory instances construct statistic databases.

@@ -162,9 +162,13 @@ type WorkingSetHead struct {
 }
 
 type RebaseState struct {
-	preRebaseWorkingAddr *hash.Hash
-	ontoCommitAddr       *hash.Hash
-	branch               string
+	preRebaseWorkingAddr       *hash.Hash
+	ontoCommitAddr             *hash.Hash
+	branch                     string
+	commitBecomesEmptyHandling uint8
+	emptyCommitHandling        uint8
+	lastAttemptedStep          float32
+	rebasingStarted            bool
 }
 
 func (rs *RebaseState) PreRebaseWorkingAddr() hash.Hash {
@@ -184,6 +188,22 @@ func (rs *RebaseState) OntoCommit(ctx context.Context, vr types.ValueReader) (*C
 		return LoadCommitAddr(ctx, vr, *rs.ontoCommitAddr)
 	}
 	return nil, nil
+}
+
+func (rs *RebaseState) LastAttemptedStep(_ context.Context) float32 {
+	return rs.lastAttemptedStep
+}
+
+func (rs *RebaseState) RebasingStarted(_ context.Context) bool {
+	return rs.rebasingStarted
+}
+
+func (rs *RebaseState) CommitBecomesEmptyHandling(_ context.Context) uint8 {
+	return rs.commitBecomesEmptyHandling
+}
+
+func (rs *RebaseState) EmptyCommitHandling(_ context.Context) uint8 {
+	return rs.emptyCommitHandling
 }
 
 type MergeState struct {
@@ -433,7 +453,12 @@ func (h serialWorkingSetHead) HeadWorkingSet() (*WorkingSetHead, error) {
 		ret.RebaseState = NewRebaseState(
 			hash.New(rebaseState.PreWorkingRootAddrBytes()),
 			hash.New(rebaseState.OntoCommitAddrBytes()),
-			string(rebaseState.BranchBytes()))
+			string(rebaseState.BranchBytes()),
+			rebaseState.CommitBecomesEmptyHandling(),
+			rebaseState.EmptyCommitHandling(),
+			rebaseState.LastAttemptedStep(),
+			rebaseState.RebasingStarted(),
+		)
 	}
 
 	return &ret, nil
@@ -533,6 +558,42 @@ func (s statisticsHead) value() types.Value {
 	return s.msg
 }
 
+func newTupleHead(sm types.SerialMessage, addr hash.Hash) serialStashListHead {
+	return serialStashListHead{sm, addr}
+}
+
+type tupleHead struct {
+	msg  types.SerialMessage
+	addr hash.Hash
+}
+
+var _ dsHead = tupleHead{}
+
+// TypeName implements dsHead
+func (s tupleHead) TypeName() string {
+	return "Tuple"
+}
+
+// Addr implements dsHead
+func (s tupleHead) Addr() hash.Hash {
+	return s.addr
+}
+
+// HeadTag implements dsHead
+func (s tupleHead) HeadTag() (*TagMeta, hash.Hash, error) {
+	return nil, hash.Hash{}, errors.New("HeadTag called on tuple")
+}
+
+// HeadWorkingSet implements dsHead
+func (s tupleHead) HeadWorkingSet() (*WorkingSetHead, error) {
+	return nil, errors.New("HeadWorkingSet called on statistic")
+}
+
+// value implements dsHead
+func (s tupleHead) value() types.Value {
+	return s.msg
+}
+
 // Dataset is a named value within a Database. Different head values may be stored in a dataset. Most commonly, this is
 // a commit, but other values are also supported in some cases.
 type Dataset struct {
@@ -590,6 +651,8 @@ func newHead(ctx context.Context, head types.Value, addr hash.Hash) (dsHead, err
 			return newSerialStashListHead(sm, addr), nil
 		case serial.StatisticFileID:
 			return newStatisticHead(sm, addr), nil
+		case serial.TupleFileID:
+			return newTupleHead(sm, addr), nil
 		}
 	}
 

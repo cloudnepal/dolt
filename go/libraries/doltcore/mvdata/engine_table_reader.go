@@ -67,8 +67,8 @@ func NewSqlEngineReader(ctx context.Context, dEnv *env.DoltEnv, tableName string
 	sqlCtx.SetCurrentDatabase(mrEnv.GetFirstDatabase())
 
 	sqlEngine := se.GetUnderlyingEngine()
-	binder := planbuilder.New(sqlCtx, sqlEngine.Analyzer.Catalog, sqlEngine.Parser)
-	ret, _, _, _, err := binder.Parse(fmt.Sprintf("show create table `%s`", tableName), false)
+	binder := planbuilder.New(sqlCtx, sqlEngine.Analyzer.Catalog, sqlEngine.EventScheduler, sqlEngine.Parser)
+	ret, _, _, _, err := binder.Parse(fmt.Sprintf("show create table `%s`", tableName), nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func NewSqlEngineReader(ctx context.Context, dEnv *env.DoltEnv, tableName string
 		return nil, fmt.Errorf("expected *plan.ShowCreate table, found %T", ret)
 	}
 
-	_, iter, err := se.Query(sqlCtx, fmt.Sprintf("SELECT * FROM `%s`", tableName))
+	_, iter, _, err := se.Query(sqlCtx, fmt.Sprintf("SELECT * FROM `%s`", tableName))
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +88,9 @@ func NewSqlEngineReader(ctx context.Context, dEnv *env.DoltEnv, tableName string
 		return nil, err
 	}
 
-	doltSchema, err := sqlutil.ToDoltSchema(ctx, root, tableName, create.PrimaryKeySchema, nil, sql.Collation_Default)
+	// NOTE: We don't support setting a schema name to qualify the table name here, so this code will not work
+	//       correctly with Doltgres yet.
+	doltSchema, err := sqlutil.ToDoltSchema(ctx, root, doltdb.TableName{Name: tableName}, create.PrimaryKeySchema, nil, sql.Collation_Default)
 	if err != nil {
 		return nil, err
 	}
@@ -104,12 +106,14 @@ func NewSqlEngineReader(ctx context.Context, dEnv *env.DoltEnv, tableName string
 
 // Used by Dolthub API
 func NewSqlEngineTableReaderWithEngine(sqlCtx *sql.Context, se *sqle.Engine, db dsqle.Database, root doltdb.RootValue, tableName string) (*sqlEngineTableReader, error) {
-	sch, iter, err := se.Query(sqlCtx, fmt.Sprintf("SELECT * FROM `%s`", tableName))
+	sch, iter, _, err := se.Query(sqlCtx, fmt.Sprintf("SELECT * FROM `%s`", tableName))
 	if err != nil {
 		return nil, err
 	}
 
-	doltSchema, err := sqlutil.ToDoltSchema(sqlCtx, root, tableName, sql.NewPrimaryKeySchema(sch), nil, sql.Collation_Default)
+	// NOTE: We don't support setting a schema name to qualify the table name here, so this code will not work
+	//       correctly with Doltgres yet.
+	doltSchema, err := sqlutil.ToDoltSchema(sqlCtx, root, doltdb.TableName{Name: tableName}, sql.NewPrimaryKeySchema(sch), nil, sql.Collation_Default)
 	if err != nil {
 		return nil, err
 	}
@@ -117,9 +121,8 @@ func NewSqlEngineTableReaderWithEngine(sqlCtx *sql.Context, se *sqle.Engine, db 
 	return &sqlEngineTableReader{
 		se:     engine.NewRebasedSqlEngine(se, map[string]dsess.SqlDatabase{db.Name(): db}),
 		sqlCtx: sqlCtx,
-
-		sch:  doltSchema,
-		iter: iter,
+		sch:    doltSchema,
+		iter:   iter,
 	}, nil
 }
 

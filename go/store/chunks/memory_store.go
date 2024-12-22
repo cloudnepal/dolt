@@ -343,7 +343,24 @@ func (ms *MemoryStoreView) EndGC() {
 	ms.transitionToNoGC()
 }
 
-func (ms *MemoryStoreView) MarkAndSweepChunks(ctx context.Context, hashes <-chan []hash.Hash, dest ChunkStore) error {
+type msvGcFinalizer struct {
+	ms      *MemoryStoreView
+	keepers map[hash.Hash]Chunk
+}
+
+func (mgcf msvGcFinalizer) AddChunksToStore(ctx context.Context) (HasManyFunc, error) {
+	panic("unsupported")
+}
+
+func (mgcf msvGcFinalizer) SwapChunksInStore(ctx context.Context) error {
+	mgcf.ms.mu.Lock()
+	defer mgcf.ms.mu.Unlock()
+	mgcf.ms.storage = &MemoryStorage{rootHash: mgcf.ms.rootHash, data: mgcf.keepers}
+	mgcf.ms.pending = map[hash.Hash]Chunk{}
+	return nil
+}
+
+func (ms *MemoryStoreView) MarkAndSweepChunks(ctx context.Context, hashes <-chan []hash.Hash, dest ChunkStore, mode GCMode) (GCFinalizer, error) {
 	if dest != ms {
 		panic("unsupported")
 	}
@@ -366,20 +383,24 @@ LOOP:
 			for _, h := range hs {
 				c, err := ms.Get(ctx, h)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				keepers[h] = c
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	ms.storage = &MemoryStorage{rootHash: ms.rootHash, data: keepers}
-	ms.pending = map[hash.Hash]Chunk{}
-	return nil
+	return msvGcFinalizer{ms, keepers}, nil
+}
+
+func (ms *MemoryStoreView) Count() (uint32, error) {
+	return uint32(len(ms.pending)), nil
+}
+
+func (ms *MemoryStoreView) IterateAllChunks(_ context.Context, _ func(Chunk)) error {
+	panic("runtime error: GetChunkHashes should never be called on the MemoryStoreView")
 }
 
 func (ms *MemoryStoreView) Stats() interface{} {

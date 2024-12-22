@@ -44,6 +44,9 @@ dolt checkout {{.LessThan}}branch{{.GreaterThan}}
    To prepare for working on {{.LessThan}}branch{{.GreaterThan}}, switch to it by updating the index and the tables in the working tree, and by pointing HEAD at the branch. Local modifications to the tables in the working
    tree are kept, so that they can be committed to the {{.LessThan}}branch{{.GreaterThan}}.
 
+dolt checkout {{.LessThan}}commit{{.GreaterThan}} [--] {{.LessThan}}table{{.GreaterThan}}...
+	 Specifying table names after a commit reference (branch, commit hash, tag, etc.) updates the working set to match that commit for one or more tables, but keeps the current branch. Local modifications to the tables named will be overwritten by their versions in the commit named.
+
 dolt checkout -b {{.LessThan}}new_branch{{.GreaterThan}} [{{.LessThan}}start_point{{.GreaterThan}}]
    Specifying -b causes a new branch to be created as if dolt branch were called and then checked out.
 
@@ -51,6 +54,7 @@ dolt checkout {{.LessThan}}table{{.GreaterThan}}...
   To update table(s) with their values in HEAD `,
 	Synopsis: []string{
 		`{{.LessThan}}branch{{.GreaterThan}}`,
+		`{{.LessThan}}commit{{.GreaterThan}} [--] {{.LessThan}}table{{.GreaterThan}}...`,
 		`{{.LessThan}}table{{.GreaterThan}}...`,
 		`-b {{.LessThan}}new-branch{{.GreaterThan}} [{{.LessThan}}start-point{{.GreaterThan}}]`,
 		`--track {{.LessThan}}remote{{.GreaterThan}}/{{.LessThan}}branch{{.GreaterThan}}`,
@@ -97,15 +101,17 @@ func (cmd CheckoutCmd) Exec(ctx context.Context, commandStr string, args []strin
 	}
 	if closeFunc != nil {
 		defer closeFunc()
-	}
 
-	_, ok := queryEngine.(*engine.SqlEngine)
-	if !ok {
-		// Currently checkout does not fully support remote connections. Prevent them from being used until we have better
-		// CLI session support.
-		msg := fmt.Sprintf(cli.RemoteUnsupportedMsg, commandStr)
-		cli.Println(msg)
-		return 1
+		// We only check for this case when checkout is the first command in a session. The reason for this is that checkout
+		// when connected to a remote server will not work as it won't set the branch. But when operating within the context
+		// of another session, specifically a \checkout in a dolt sql session, this makes sense. Since no closeFunc would be
+		// returned, we don't need to check for this case.
+		_, ok := queryEngine.(*engine.SqlEngine)
+		if !ok {
+			msg := fmt.Sprintf(cli.RemoteUnsupportedMsg, commandStr)
+			cli.Println(msg)
+			return 1
+		}
 	}
 
 	// Argument validation in the CLI is strictly nice to have. The stored procedure will do the same, but the errors
@@ -165,8 +171,8 @@ func (cmd CheckoutCmd) Exec(ctx context.Context, commandStr string, args []strin
 		return HandleVErrAndExitCode(errhand.BuildDError("no 'message' field in response from %s", sqlQuery).Build(), usage)
 	}
 
-	var message string
-	if message, ok = rows[0][1].(string); !ok {
+	message, ok := rows[0][1].(string)
+	if !ok {
 		return HandleVErrAndExitCode(errhand.BuildDError("expected string value for 'message' field in response from %s ", sqlQuery).Build(), usage)
 	}
 

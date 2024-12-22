@@ -106,13 +106,7 @@ func TestSchemaOverrides(t *testing.T) {
 func TestSingleScript(t *testing.T) {
 	t.Skip()
 
-	var scripts = []queries.ScriptTest{
-		{
-			Name:        "",
-			SetUpScript: []string{},
-			Assertions:  []queries.ScriptTestAssertion{},
-		},
-	}
+	var scripts = []queries.ScriptTest{}
 
 	for _, script := range scripts {
 		harness := newDoltHarness(t)
@@ -284,9 +278,9 @@ func TestSingleQueryPrepared(t *testing.T) {
 	t.Skip()
 
 	harness := newDoltHarness(t)
-	//engine := enginetest.NewEngine(t, harness)
-	//enginetest.CreateIndexes(t, harness, engine)
-	//engine := enginetest.NewSpatialEngine(t, harness)
+	// engine := enginetest.NewEngine(t, harness)
+	// enginetest.CreateIndexes(t, harness, engine)
+	// engine := enginetest.NewSpatialEngine(t, harness)
 	engine, err := harness.NewEngine(t)
 	if err != nil {
 		panic(err)
@@ -305,8 +299,8 @@ func TestSingleQueryPrepared(t *testing.T) {
 		enginetest.RunQueryWithContext(t, engine, harness, nil, q)
 	}
 
-	//engine.Analyzer.Debug = true
-	//engine.Analyzer.Verbose = true
+	// engine.Analyzer.Debug = true
+	// engine.Analyzer.Verbose = true
 
 	var test queries.QueryTest
 	test = queries.QueryTest{
@@ -842,8 +836,7 @@ func TestDropColumn(t *testing.T) {
 
 func TestCreateDatabase(t *testing.T) {
 	h := newDoltHarness(t)
-	defer h.Close()
-	enginetest.TestCreateDatabase(t, h)
+	RunCreateDatabaseTest(t, h)
 }
 
 func TestBlobs(t *testing.T) {
@@ -1267,7 +1260,7 @@ func TestDoltConflictsTableNameTable(t *testing.T) {
 // tests new format behavior for keyless merges that create CVs and conflicts
 func TestKeylessDoltMergeCVsAndConflicts(t *testing.T) {
 	h := newDoltEnginetestHarness(t)
-	RunKelyessDoltMergeCVsAndConflictsTests(t, h)
+	RunKeylessDoltMergeCVsAndConflictsTests(t, h)
 }
 
 // eventually this will be part of TestDoltMerge
@@ -1954,6 +1947,7 @@ func TestStatsAutoRefreshConcurrency(t *testing.T) {
 	// create engine
 	harness := newDoltHarness(t)
 	harness.Setup(setup.MydbData)
+	harness.configureStats = true
 	engine := mustNewEngine(t, harness)
 	defer engine.Close()
 
@@ -1973,22 +1967,23 @@ func TestStatsAutoRefreshConcurrency(t *testing.T) {
 	// it is important to use new sessions for this test, to avoid working root conflicts
 	readCtx := enginetest.NewSession(harness)
 	writeCtx := enginetest.NewSession(harness)
+	refreshCtx := enginetest.NewSession(harness)
 	newCtx := func(context.Context) (*sql.Context, error) {
-		return enginetest.NewSession(harness), nil
+		return refreshCtx, nil
 	}
 
 	err := statsProv.InitAutoRefreshWithParams(newCtx, sqlDb.Name(), bThreads, intervalSec, thresholdf64, branches)
 	require.NoError(t, err)
 
 	execQ := func(ctx *sql.Context, q string, id int, tag string) {
-		_, iter, err := engine.Query(ctx, q)
+		_, iter, _, err := engine.Query(ctx, q)
 		require.NoError(t, err)
 		_, err = sql.RowIterToRows(ctx, iter)
-		//fmt.Printf("%s %d\n", tag, id)
+		// fmt.Printf("%s %d\n", tag, id)
 		require.NoError(t, err)
 	}
 
-	iters := 1_000
+	iters := 50
 	{
 		// 3 threads to test auto-refresh/DML concurrency safety
 		// - auto refresh (read + write)
@@ -2051,4 +2046,9 @@ func TestStatsAutoRefreshConcurrency(t *testing.T) {
 
 		wg.Wait()
 	}
+}
+
+func TestDoltWorkspace(t *testing.T) {
+	harness := newDoltEnginetestHarness(t)
+	RunDoltWorkspaceTests(t, harness)
 }

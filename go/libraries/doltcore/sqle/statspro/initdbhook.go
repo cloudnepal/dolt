@@ -37,15 +37,26 @@ func NewStatsInitDatabaseHook(
 		denv *env.DoltEnv,
 		db dsess.SqlDatabase,
 	) error {
-		statsDb, err := statsProv.sf.Init(ctx, db, statsProv.pro, denv.FS, env.GetCurrentUserHomeDir)
-		if err != nil {
-			ctx.GetLogger().Debugf("statistics load error: %s", err.Error())
-			return nil
+		dbName := strings.ToLower(db.Name())
+		if statsDb, ok := statsProv.getStatDb(dbName); !ok {
+			statsDb, err := statsProv.sf.Init(ctx, db, statsProv.pro, denv.FS, env.GetCurrentUserHomeDir)
+			if err != nil {
+				ctx.GetLogger().Debugf("statistics load error: %s", err.Error())
+				return nil
+			}
+			statsProv.setStatDb(dbName, statsDb)
+		} else {
+			for _, br := range statsDb.Branches() {
+				if ok, err := statsDb.SchemaChange(ctx, br); err != nil {
+					return err
+				} else if ok {
+					if err := statsDb.DeleteBranchStats(ctx, br, true); err != nil {
+						return err
+					}
+				}
+			}
+			ctx.GetLogger().Debugf("statistics init error: preexisting stats db: %s", dbName)
 		}
-		statsProv.mu.Lock()
-		statsProv.setStatDb(strings.ToLower(db.Name()), statsDb)
-		statsProv.mu.Unlock()
-
 		ctx.GetLogger().Debugf("statistics refresh: initialize %s", name)
 		return statsProv.InitAutoRefresh(ctxFactory, name, bThreads)
 	}
@@ -54,12 +65,15 @@ func NewStatsInitDatabaseHook(
 func NewStatsDropDatabaseHook(statsProv *Provider) sqle.DropDatabaseHook {
 	return func(ctx *sql.Context, name string) {
 		statsProv.CancelRefreshThread(name)
-		statsProv.DropDbStats(ctx, name, false)
+		if err := statsProv.DropDbStats(ctx, name, false); err != nil {
+			ctx.GetLogger().Debugf("failed to close stats database: %s", err)
+		}
 
 		if db, ok := statsProv.getStatDb(name); ok {
 			if err := db.Close(); err != nil {
 				ctx.GetLogger().Debugf("failed to close stats database: %s", err)
 			}
+			delete(statsProv.statDbs, name)
 		}
 	}
 }

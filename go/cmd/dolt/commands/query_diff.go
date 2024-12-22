@@ -70,8 +70,8 @@ func (q QueryDiff) ArgParser() *argparser.ArgParser {
 func (q QueryDiff) compareRows(pkOrds []int, row1, row2 sql.Row) (int, bool) {
 	var cmp int
 	for _, pkOrd := range pkOrds {
-		pk1, _ := gmstypes.ConvertToString(row1[pkOrd], gmstypes.Text)
-		pk2, _ := gmstypes.ConvertToString(row2[pkOrd], gmstypes.Text)
+		pk1, _ := gmstypes.ConvertToString(row1[pkOrd], gmstypes.Text, nil)
+		pk2, _ := gmstypes.ConvertToString(row2[pkOrd], gmstypes.Text, nil)
 		if pk1 < pk2 {
 			cmp = -1
 		} else if pk1 > pk2 {
@@ -82,8 +82,8 @@ func (q QueryDiff) compareRows(pkOrds []int, row1, row2 sql.Row) (int, bool) {
 	}
 	var diff bool
 	for i := 0; i < len(row1); i++ {
-		a, _ := gmstypes.ConvertToString(row1[i], gmstypes.Text)
-		b, _ := gmstypes.ConvertToString(row2[i], gmstypes.Text)
+		a, _ := gmstypes.ConvertToString(row1[i], gmstypes.Text, nil)
+		b, _ := gmstypes.ConvertToString(row2[i], gmstypes.Text, nil)
 		if a != b {
 			diff = true
 			break
@@ -121,7 +121,7 @@ func (q QueryDiff) Exec(ctx context.Context, commandStr string, args []string, d
 	if err != nil {
 		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
 	}
-	schema, rowIter, err := queryist.Query(sqlCtx, query)
+	schema, rowIter, _, err := queryist.Query(sqlCtx, query)
 	if err != nil {
 		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), usage)
 	}

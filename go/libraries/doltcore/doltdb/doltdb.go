@@ -15,6 +15,7 @@
 package doltdb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,6 +23,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -86,12 +89,18 @@ type DoltDB struct {
 }
 
 // DoltDBFromCS creates a DoltDB from a noms chunks.ChunkStore
-func DoltDBFromCS(cs chunks.ChunkStore) *DoltDB {
+func DoltDBFromCS(cs chunks.ChunkStore, databaseName string) *DoltDB {
 	vrw := types.NewValueStore(cs)
 	ns := tree.NewNodeStore(cs)
 	db := datas.NewTypesDatabase(vrw, ns)
 
-	return &DoltDB{db: hooksDatabase{Database: db}, vrw: vrw, ns: ns}
+	return &DoltDB{db: hooksDatabase{Database: db}, vrw: vrw, ns: ns, databaseName: databaseName}
+}
+
+// GetDatabaseName returns the name of the database.
+// Note: This can return an empty string if the database name is not populated.
+func (ddb *DoltDB) GetDatabaseName() string {
+	return ddb.databaseName
 }
 
 // HackDatasDatabaseFromDoltDB unwraps a DoltDB to a datas.Database.
@@ -138,6 +147,7 @@ func LoadDoltDBWithParams(ctx context.Context, nbf *types.NomsBinFormat, urlStr 
 	if err != nil {
 		return nil, err
 	}
+
 	return &DoltDB{db: hooksDatabase{Database: db}, vrw: vrw, ns: ns, databaseName: name}, nil
 }
 
@@ -1056,6 +1066,7 @@ func (ddb *DoltDB) GetRefsWithHashes(ctx context.Context) ([]RefWithHash, error)
 }
 
 var tagsRefFilter = map[ref.RefType]struct{}{ref.TagRefType: {}}
+var tuplesRefFilter = map[ref.RefType]struct{}{ref.TupleRefType: {}}
 
 // GetTags returns a list of all tags in the database.
 func (ddb *DoltDB) GetTags(ctx context.Context) ([]ref.DoltRef, error) {
@@ -1101,6 +1112,35 @@ func (ddb *DoltDB) GetTagsWithHashes(ctx context.Context) ([]TagWithHash, error)
 		return nil
 	})
 	return refs, err
+}
+
+// SetTuple sets a key ref value
+func (ddb *DoltDB) SetTuple(ctx context.Context, key string, value []byte) error {
+	ds, err := ddb.db.GetDataset(ctx, ref.NewTupleRef(key).String())
+	if err != nil {
+		return err
+	}
+	_, err = ddb.db.SetTuple(ctx, ds, value)
+	return err
+}
+
+// GetTuple returns a key's value, whether the key was valid, and an optional error.
+func (ddb *DoltDB) GetTuple(ctx context.Context, key string) ([]byte, bool, error) {
+	ds, err := ddb.db.GetDataset(ctx, ref.NewTupleRef(key).String())
+	if err != nil {
+		return nil, false, err
+	}
+
+	if !ds.HasHead() {
+		return nil, false, nil
+	}
+
+	tup, err := datas.LoadTuple(ctx, ddb.Format(), ddb.NodeStore(), ddb.ValueReadWriter(), ds)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return tup.Bytes(), true, nil
 }
 
 var workspacesRefFilter = map[ref.RefType]struct{}{ref.WorkspaceRefType: {}}
@@ -1184,7 +1224,7 @@ func (ddb *DoltDB) GetRefByNameInsensitive(ctx context.Context, refName string) 
 		return nil, err
 	}
 	for _, branchRef := range branchRefs {
-		if strings.ToLower(branchRef.GetPath()) == strings.ToLower(refName) {
+		if strings.EqualFold(branchRef.GetPath(), refName) {
 			return branchRef, nil
 		}
 	}
@@ -1194,7 +1234,7 @@ func (ddb *DoltDB) GetRefByNameInsensitive(ctx context.Context, refName string) 
 		return nil, err
 	}
 	for _, headRef := range headRefs {
-		if strings.ToLower(headRef.GetPath()) == strings.ToLower(refName) {
+		if strings.EqualFold(headRef.GetPath(), refName) {
 			return headRef, nil
 		}
 	}
@@ -1204,7 +1244,7 @@ func (ddb *DoltDB) GetRefByNameInsensitive(ctx context.Context, refName string) 
 		return nil, err
 	}
 	for _, tagRef := range tagRefs {
-		if strings.ToLower(tagRef.GetPath()) == strings.ToLower(refName) {
+		if strings.EqualFold(tagRef.GetPath(), refName) {
 			return tagRef, nil
 		}
 	}
@@ -1577,6 +1617,14 @@ func (ddb *DoltDB) DeleteWorkingSet(ctx context.Context, workingSetRef ref.Worki
 	return err
 }
 
+func (ddb *DoltDB) DeleteTuple(ctx context.Context, key string) error {
+	err := ddb.deleteRef(ctx, ref.NewTupleRef(key), nil, "")
+	if err == ErrBranchNotFound {
+		return ErrTupleNotFound
+	}
+	return err
+}
+
 func (ddb *DoltDB) DeleteTag(ctx context.Context, tag ref.DoltRef) error {
 	err := ddb.deleteRef(ctx, tag, nil, "")
 
@@ -1630,7 +1678,7 @@ func (ddb *DoltDB) Rebase(ctx context.Context) error {
 // until no possibly-stale ChunkStore state is retained in memory, or failing
 // certain in-progress operations which cannot be finalized in a timely manner,
 // etc.
-func (ddb *DoltDB) GC(ctx context.Context, safepointF func() error) error {
+func (ddb *DoltDB) GC(ctx context.Context, mode types.GCMode, safepointF func() error) error {
 	collector, ok := ddb.db.Database.(datas.GarbageCollector)
 	if !ok {
 		return fmt.Errorf("this database does not support garbage collection")
@@ -1674,7 +1722,7 @@ func (ddb *DoltDB) GC(ctx context.Context, safepointF func() error) error {
 		return err
 	}
 
-	return collector.GC(ctx, oldGen, newGen, safepointF)
+	return collector.GC(ctx, mode, oldGen, newGen, safepointF)
 }
 
 func (ddb *DoltDB) ShallowGC(ctx context.Context) error {
@@ -2044,4 +2092,115 @@ func (ddb *DoltDB) GetStashRootAndHeadCommitAtIdx(ctx context.Context, idx int) 
 // a shallow clone, but should not be called after the clone is complete.
 func (ddb *DoltDB) PersistGhostCommits(ctx context.Context, ghostCommits hash.HashSet) error {
 	return ddb.db.Database.PersistGhostCommitIDs(ctx, ghostCommits)
+}
+
+type FSCKReport struct {
+	ChunkCount uint32
+	Problems   []error
+}
+
+// FSCK performs a full file system check on the database. This is currently exposed with the CLI as `dolt fsck`
+// The success of failure of the scan are returned in the report as a list of errors. The error returned by this function
+// indicates a deeper issue such as having database in an old format.
+func (ddb *DoltDB) FSCK(ctx context.Context, progress chan string) (*FSCKReport, error) {
+	cs := datas.ChunkStoreFromDatabase(ddb.db)
+
+	vs := types.NewValueStore(cs)
+
+	gs, ok := cs.(*nbs.GenerationalNBS)
+	if !ok {
+		return nil, errors.New("FSCK requires a local database")
+	}
+
+	chunkCount, err := gs.OldGen().Count()
+	if err != nil {
+		return nil, err
+	}
+	chunkCount2, err := gs.NewGen().Count()
+	if err != nil {
+		return nil, err
+	}
+	chunkCount += chunkCount2
+	proccessedCnt := int64(0)
+
+	var errs []error
+
+	decodeMsg := func(chk chunks.Chunk) string {
+		hrs := ""
+		val, err := types.DecodeValue(chk, vs)
+		if err == nil {
+			hrs = val.HumanReadableString()
+		} else {
+			hrs = fmt.Sprintf("Unable to decode value: %s", err.Error())
+		}
+		return hrs
+	}
+
+	// Append safely to the slice of errors with a mutex.
+	errsLock := &sync.Mutex{}
+	appendErr := func(err error) {
+		errsLock.Lock()
+		defer errsLock.Unlock()
+		errs = append(errs, err)
+	}
+
+	// Callback for validating chunks. This code could be called concurrently, though that is not currently the case.
+	validationCallback := func(chunk chunks.Chunk) {
+		chunkOk := true
+		pCnt := atomic.AddInt64(&proccessedCnt, 1)
+		h := chunk.Hash()
+		raw := chunk.Data()
+		calcChkSum := hash.Of(raw)
+
+		if h != calcChkSum {
+			fuzzyMatch := false
+			// Special case for the journal chunk source. We may have an address which has 4 null bytes at the end.
+			if h[hash.ByteLen-1] == 0 && h[hash.ByteLen-2] == 0 && h[hash.ByteLen-3] == 0 && h[hash.ByteLen-4] == 0 {
+				// Now we'll just verify that the first 16 bytes match.
+				ln := hash.ByteLen - 4
+				fuzzyMatch = bytes.Compare(h[:ln], calcChkSum[:ln]) == 0
+			}
+			if !fuzzyMatch {
+				hrs := decodeMsg(chunk)
+				appendErr(errors.New(fmt.Sprintf("Chunk: %s content hash mismatch: %s\n%s", h.String(), calcChkSum.String(), hrs)))
+				chunkOk = false
+			}
+		}
+
+		if chunkOk {
+			// Round trip validation. Ensure that the top level store returns the same data.
+			c, err := cs.Get(ctx, h)
+			if err != nil {
+				appendErr(errors.New(fmt.Sprintf("Chunk: %s load failed with error: %s", h.String(), err.Error())))
+				chunkOk = false
+			} else if bytes.Compare(raw, c.Data()) != 0 {
+				hrs := decodeMsg(chunk)
+				appendErr(errors.New(fmt.Sprintf("Chunk: %s read with incorrect ID: %s\n%s", h.String(), c.Hash().String(), hrs)))
+				chunkOk = false
+			}
+		}
+
+		percentage := (float64(pCnt) * 100) / float64(chunkCount)
+		result := fmt.Sprintf("(%4.1f%% done)", percentage)
+
+		progStr := "OK: " + h.String()
+		if !chunkOk {
+			progStr = "FAIL: " + h.String()
+		}
+		progStr = result + " " + progStr
+		progress <- progStr
+	}
+
+	err = gs.OldGen().IterateAllChunks(ctx, validationCallback)
+	if err != nil {
+		return nil, err
+	}
+	err = gs.NewGen().IterateAllChunks(ctx, validationCallback)
+	if err != nil {
+		return nil, err
+	}
+
+	FSCKReport := FSCKReport{Problems: errs, ChunkCount: chunkCount}
+
+	return &FSCKReport, nil
 }

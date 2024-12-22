@@ -160,7 +160,7 @@ func getBranches(sqlCtx *sql.Context, queryEngine cli.Queryist, remote bool) ([]
 		command = "SELECT name, hash from dolt_branches"
 	}
 
-	schema, rowIter, err := queryEngine.Query(sqlCtx, command)
+	schema, rowIter, _, err := queryEngine.Query(sqlCtx, command)
 	if err != nil {
 		return nil, err
 	}
@@ -479,7 +479,7 @@ func generateForceDeleteMessage(args []string) string {
 	return newArgs
 }
 
-// callStoredProcedure generates and exectures the SQL query for calling the DOLT_BRANCH stored procedure.
+// callStoredProcedure generates and executes the SQL query for calling the DOLT_BRANCH stored procedure.
 // All actions that modify branches delegate to this after they validate their arguments.
 // Actions that don't modify branches, such as `dolt branch --list` and `dolt branch --show-current`, don't call
 // this method.
@@ -488,7 +488,7 @@ func callStoredProcedure(sqlCtx *sql.Context, queryEngine cli.Queryist, args []s
 	if err != nil {
 		return HandleVErrAndExitCode(errhand.VerboseErrorFromError(err), nil)
 	}
-	_, rowIter, err := queryEngine.Query(sqlCtx, query)
+	_, rowIter, _, err := queryEngine.Query(sqlCtx, query)
 	if err != nil {
 		if strings.Contains(err.Error(), "is not fully merged") {
 			newErrorMessage := fmt.Sprintf("%s. If you are sure you want to delete it, run 'dolt branch -D%s'", err.Error(), generateForceDeleteMessage(args))

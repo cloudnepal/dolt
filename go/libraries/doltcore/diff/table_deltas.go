@@ -216,8 +216,7 @@ func GetTableDeltas(ctx context.Context, fromRoot, toRoot doltdb.RootValue) (del
 func getFkParentSchs(ctx context.Context, root doltdb.RootValue, fks ...doltdb.ForeignKey) (map[doltdb.TableName]schema.Schema, error) {
 	schs := make(map[doltdb.TableName]schema.Schema)
 	for _, toFk := range fks {
-		// TODO: schema
-		toRefTable, _, ok, err := doltdb.GetTableInsensitive(ctx, root, doltdb.TableName{Name: toFk.ReferencedTableName})
+		toRefTable, _, ok, err := doltdb.GetTableInsensitive(ctx, root, toFk.ReferencedTableName)
 		if err != nil {
 			return nil, err
 		}
@@ -228,8 +227,7 @@ func getFkParentSchs(ctx context.Context, root doltdb.RootValue, fks ...doltdb.F
 		if err != nil {
 			return nil, err
 		}
-		// TODO: schema name
-		schs[doltdb.TableName{Name: toFk.ReferencedTableName}] = toRefSch
+		schs[toFk.ReferencedTableName] = toRefSch
 	}
 	return schs, nil
 }
@@ -322,9 +320,21 @@ func matchTableDeltas(fromDeltas, toDeltas []TableDelta) (deltas []TableDelta) {
 }
 
 func schemasOverlap(from, to schema.Schema) bool {
-	f := set.NewUint64Set(from.GetAllCols().Tags)
-	t := set.NewUint64Set(to.GetAllCols().Tags)
-	return f.Intersection(t).Size() > 0
+	fromCols := from.GetAllCols()
+	toCols := to.GetAllCols()
+	fromColSet := set.NewUint64Set(fromCols.Tags)
+	toColSet := set.NewUint64Set(toCols.Tags)
+
+	overlappingTags := fromColSet.Intersection(toColSet)
+	numOverlaps := overlappingTags.Size()
+	for _, tag := range overlappingTags.AsSlice() {
+		fromCol, _ := fromCols.GetByTag(tag)
+		toCol, _ := toCols.GetByTag(tag)
+		if fromCol.Name != toCol.Name {
+			numOverlaps--
+		}
+	}
+	return numOverlaps > 0
 }
 
 // IsAdd returns true if the table was added between the fromRoot and toRoot.
@@ -394,6 +404,81 @@ func (td TableDelta) HasSchemaChanged(ctx context.Context) (bool, error) {
 	return !fromSchemaHash.Equal(toSchemaHash), nil
 }
 
+func (td TableDelta) HasChangesIgnoringColumnTags(ctx context.Context) (bool, error) {
+
+	if td.FromTable == nil && td.ToTable == nil {
+		return true, nil
+	}
+
+	if td.IsAdd() || td.IsDrop() {
+		return true, nil
+	}
+
+	if td.IsRename() {
+		return true, nil
+	}
+
+	if td.HasFKChanges() {
+		return true, nil
+	}
+
+	fromRowDataHash, err := td.FromTable.GetRowDataHash(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	toRowDataHash, err := td.ToTable.GetRowDataHash(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	// Any change to the table data counts as a change
+	if !fromRowDataHash.Equal(toRowDataHash) {
+		return true, nil
+	}
+
+	fromTableHash, err := td.FromTable.HashOf()
+	if err != nil {
+		return false, err
+	}
+
+	toTableHash, err := td.FromTable.HashOf()
+	if err != nil {
+		return false, err
+	}
+
+	// If the data hashes have changed, the table has obviously changed.
+	if !fromTableHash.Equal(toTableHash) {
+		return true, nil
+	}
+
+	fromSchemaHash, err := td.FromTable.GetSchemaHash(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	toSchemaHash, err := td.ToTable.GetSchemaHash(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	// If neither data nor schema hashes have changed, the table is obviously the same.
+	if fromSchemaHash.Equal(toSchemaHash) {
+		return false, nil
+	}
+
+	// The schema hash has changed but the data has remained the same. We must inspect the schema to determine
+	// whether the change is observable or if only column tags have changed.
+
+	fromSchema, toSchema, err := td.GetSchemas(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	// SchemasAreEqual correctly accounts for tags
+	return !schema.SchemasAreEqual(fromSchema, toSchema), nil
+}
+
 func (td TableDelta) HasDataChanged(ctx context.Context) (bool, error) {
 	// Database collation change is not a data change
 	if td.FromTable == nil && td.ToTable == nil {
@@ -446,9 +531,9 @@ func (td TableDelta) HasChanges() (bool, error) {
 // CurName returns the most recent name of the table.
 func (td TableDelta) CurName() string {
 	if td.ToName.Name != "" {
-		return td.ToName.Name
+		return td.ToName.String()
 	}
-	return td.FromName.Name
+	return td.FromName.String()
 }
 
 func (td TableDelta) HasFKChanges() bool {
@@ -615,6 +700,21 @@ func (td TableDelta) GetRowData(ctx context.Context) (from, to durable.Index, er
 	return from, to, nil
 }
 
+// GetUniqueSchemaNamesFromTableNames returns a list of unique schema names from a list of table names
+func GetUniqueSchemaNamesFromTableDeltas(deltas []TableDelta) []string {
+	schemaMap := make(map[string]struct{})
+	var schemas []string
+
+	for _, td := range deltas {
+		if _, exists := schemaMap[td.ToName.Schema]; !exists {
+			schemaMap[td.ToName.Schema] = struct{}{}
+			schemas = append(schemas, td.ToName.Schema)
+		}
+	}
+
+	return schemas
+}
+
 // WorkingSetContainsOnlyIgnoredTables returns true if all changes in working set are ignored tables.
 // Otherwise, if there are any non-ignored changes, returns false.
 // Note that only unstaged tables are subject to dolt_ignore (this is consistent with what git does.)
@@ -628,7 +728,8 @@ func WorkingSetContainsOnlyIgnoredTables(ctx context.Context, roots doltdb.Roots
 		return false, nil
 	}
 
-	ignorePatterns, err := doltdb.GetIgnoredTablePatterns(ctx, roots)
+	schemas := GetUniqueSchemaNamesFromTableDeltas(unstaged)
+	ignorePatternMap, err := doltdb.GetIgnoredTablePatterns(ctx, roots, schemas)
 	if err != nil {
 		return false, err
 	}
@@ -637,6 +738,8 @@ func WorkingSetContainsOnlyIgnoredTables(ctx context.Context, roots doltdb.Roots
 		if !(tableDelta.IsAdd()) {
 			return false, nil
 		}
+
+		ignorePatterns := ignorePatternMap[tableDelta.ToName.Schema]
 		isIgnored, err := ignorePatterns.IsTableNameIgnored(tableDelta.ToName)
 		if err != nil {
 			return false, err

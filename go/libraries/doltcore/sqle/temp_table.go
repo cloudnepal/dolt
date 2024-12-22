@@ -95,7 +95,9 @@ func NewTempTable(
 		colKinds[i] = ti.NomsKind()
 	}
 
-	tags, err := doltdb.GenerateTagsForNewColumns(ctx, ws.WorkingRoot(), name, colNames, colKinds, ws.WorkingRoot())
+	// NOTE: We don't support setting a schema name to qualify the table name here, so this code will not work
+	//       correctly with Doltgres yet.
+	tags, err := doltdb.GenerateTagsForNewColumns(ctx, ws.WorkingRoot(), doltdb.TableName{Name: name}, colNames, colKinds, ws.WorkingRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +109,7 @@ func NewTempTable(
 	vrw := ddb.ValueReadWriter()
 	ns := ddb.NodeStore()
 
-	idx, err := durable.NewEmptyIndex(ctx, vrw, ns, sch)
+	idx, err := durable.NewEmptyPrimaryIndex(ctx, vrw, ns, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +146,7 @@ func NewTempTable(
 		opts:      opts,
 	}
 
-	tempTable.ed, err = writeSession.GetTableWriter(ctx, doltdb.TableName{Name: name}, db, setTempTableRoot(tempTable))
+	tempTable.ed, err = writeSession.GetTableWriter(ctx, doltdb.TableName{Name: name}, db, setTempTableRoot(tempTable), false)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +186,7 @@ func setTempTableRoot(t *TempTable) func(ctx *sql.Context, dbName string, newRoo
 		}
 
 		writeSession := writer.NewWriteSession(newTable.Format(), newWs, ait, t.opts)
-		t.ed, err = writeSession.GetTableWriter(ctx, doltdb.TableName{Name: t.tableName}, t.dbName, setTempTableRoot(t))
+		t.ed, err = writeSession.GetTableWriter(ctx, doltdb.TableName{Name: t.tableName}, t.dbName, setTempTableRoot(t), false)
 		if err != nil {
 			return err
 		}

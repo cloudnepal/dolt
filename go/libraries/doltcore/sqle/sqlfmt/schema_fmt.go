@@ -76,7 +76,7 @@ func GenerateSqlPatchSchemaStatements(ctx *sql.Context, toRoot doltdb.RootValue,
 	if td.IsDrop() {
 		ddlStatements = append(ddlStatements, DropTableStmt(td.FromName.Name))
 	} else if td.IsAdd() {
-		stmt, err := GenerateCreateTableStatement(td.ToName.Name, td.ToSch, td.ToFks, nameMapFromTableNameMap(td.ToFksParentSch))
+		stmt, err := GenerateCreateTableStatement(td.ToName.Name, td.ToSch, td.ToFks, td.ToFksParentSch)
 		if err != nil {
 			return nil, errhand.VerboseErrorFromError(err)
 		}
@@ -92,17 +92,9 @@ func GenerateSqlPatchSchemaStatements(ctx *sql.Context, toRoot doltdb.RootValue,
 	return ddlStatements, nil
 }
 
-func nameMapFromTableNameMap(tableNameMap map[doltdb.TableName]schema.Schema) map[string]schema.Schema {
-	nameMap := make(map[string]schema.Schema)
-	for name := range tableNameMap {
-		nameMap[name.Name] = tableNameMap[name]
-	}
-	return nameMap
-}
-
 // generateNonCreateNonDropTableSqlSchemaDiff returns any schema diff in SQL statements that is NEITHER 'CREATE TABLE' NOR 'DROP TABLE' statements.
 // TODO: schema names
-func generateNonCreateNonDropTableSqlSchemaDiff(td diff.TableDelta, toSchemas map[string]schema.Schema, fromSch, toSch schema.Schema) ([]string, error) {
+func generateNonCreateNonDropTableSqlSchemaDiff(td diff.TableDelta, toSchemas map[doltdb.TableName]schema.Schema, fromSch, toSch schema.Schema) ([]string, error) {
 	if td.IsAdd() || td.IsDrop() {
 		// use add and drop specific methods
 		return nil, nil
@@ -175,7 +167,6 @@ func generateNonCreateNonDropTableSqlSchemaDiff(td diff.TableDelta, toSchemas ma
 		case diff.SchDiffModified:
 			from := fkDiff.From
 			ddlStatements = append(ddlStatements, AlterTableDropForeignKeyStmt(from.TableName, from.Name))
-
 			parentSch := toSchemas[fkDiff.To.ReferencedTableName]
 			ddlStatements = append(ddlStatements, AlterTableAddForeignKeyStmt(fkDiff.To, toSch, parentSch))
 		}
@@ -201,6 +192,10 @@ func GenerateCreateTableColumnDefinition(col schema.Column, tableCollation sql.C
 func GenerateCreateTableIndentedColumnDefinition(col schema.Column, tableCollation sql.CollationID) string {
 	var defaultVal, genVal, onUpdateVal *sql.ColumnDefaultValue
 	if col.Default != "" {
+		// hacky way to determine if column default is an expression
+		if col.Default[0] != '(' && col.Default[len(col.Default)-1] != ')' && col.Default[0] != '\'' && col.Default[len(col.Default)-1] != '\'' {
+			col.Default = fmt.Sprintf("'%s'", col.Default)
+		}
 		defaultVal = sql.NewUnresolvedColumnDefaultValue(col.Default)
 	}
 	if col.Generated != "" {
@@ -226,7 +221,7 @@ func GenerateCreateTableIndentedColumnDefinition(col schema.Column, tableCollati
 
 // GenerateCreateTableIndexDefinition returns index definition for CREATE TABLE statement with indentation of 2 spaces
 func GenerateCreateTableIndexDefinition(index schema.Index) string {
-	return sql.GenerateCreateTableIndexDefinition(index.IsUnique(), index.IsSpatial(), index.IsFullText(), index.Name(),
+	return sql.GenerateCreateTableIndexDefinition(index.IsUnique(), index.IsSpatial(), index.IsFullText(), false, index.Name(),
 		sql.QuoteIdentifiers(index.ColumnNames()), index.Comment())
 }
 
@@ -261,7 +256,9 @@ func GenerateCreateTableForeignKeyDefinition(fk doltdb.ForeignKey, sch, parentSc
 	if fk.OnUpdate != doltdb.ForeignKeyReferentialAction_DefaultAction {
 		onUpdate = fk.OnUpdate.String()
 	}
-	return sql.GenerateCreateTableForiegnKeyDefinition(fk.Name, fkCols, fk.ReferencedTableName, parentCols, onDelete, onUpdate)
+
+	// TODO: schema name
+	return sql.GenerateCreateTableForiegnKeyDefinition(fk.Name, fkCols, fk.ReferencedTableName.Name, parentCols, onDelete, onUpdate)
 }
 
 // GenerateCreateTableCheckConstraintClause returns check constraint clause definition for CREATE TABLE statement with indentation of 2 spaces
@@ -410,7 +407,7 @@ func AlterDatabaseCollateStmt(dbName string, fromCollation, toCollation schema.C
 func AlterTableAddForeignKeyStmt(fk doltdb.ForeignKey, sch, parentSch schema.Schema) string {
 	var b strings.Builder
 	b.WriteString("ALTER TABLE ")
-	b.WriteString(QuoteIdentifier(fk.TableName))
+	b.WriteString(QuoteTableName(fk.TableName))
 	b.WriteString(" ADD CONSTRAINT ")
 	b.WriteString(QuoteIdentifier(fk.Name))
 	b.WriteString(" FOREIGN KEY ")
@@ -426,15 +423,15 @@ func AlterTableAddForeignKeyStmt(fk doltdb.ForeignKey, sch, parentSch schema.Sch
 		c, _ := parentSch.GetAllCols().GetByTag(tag)
 		parentCols = append(parentCols, QuoteIdentifier(c.Name))
 	}
-	b.WriteString(QuoteIdentifier(fk.ReferencedTableName))
+	b.WriteString(QuoteTableName(fk.ReferencedTableName))
 	b.WriteString(" (" + strings.Join(parentCols, ",") + ");")
 	return b.String()
 }
 
-func AlterTableDropForeignKeyStmt(tableName, fkName string) string {
+func AlterTableDropForeignKeyStmt(tableName doltdb.TableName, fkName string) string {
 	var b strings.Builder
 	b.WriteString("ALTER TABLE ")
-	b.WriteString(QuoteIdentifier(tableName))
+	b.WriteString(QuoteTableName(tableName))
 	b.WriteString(" DROP FOREIGN KEY ")
 	b.WriteString(QuoteIdentifier(fkName))
 	b.WriteRune(';')
@@ -444,13 +441,7 @@ func AlterTableDropForeignKeyStmt(tableName, fkName string) string {
 // GenerateCreateTableStatement returns a CREATE TABLE statement for given table. This is a reasonable approximation of
 // `SHOW CREATE TABLE` in the engine, but may have some differences. Callers are advised to use the engine when
 // possible.
-// TODO: schema names
-func GenerateCreateTableStatement(
-	tblName string,
-	sch schema.Schema,
-	fks []doltdb.ForeignKey,
-	fksParentSch map[string]schema.Schema,
-) (string, error) {
+func GenerateCreateTableStatement(tblName string, sch schema.Schema, fks []doltdb.ForeignKey, fksParentSch map[doltdb.TableName]schema.Schema) (string, error) {
 	colStmts := make([]string, sch.GetAllCols().Size())
 
 	// Statement creation parts for each column

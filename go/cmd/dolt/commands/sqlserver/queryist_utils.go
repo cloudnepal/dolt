@@ -22,6 +22,7 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/vitess/go/vt/sqlparser"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
@@ -67,7 +68,9 @@ func BuildConnectionStringQueryist(ctx context.Context, cwdFS filesys.Filesys, c
 	var lateBind cli.LateBindQueryist = func(ctx context.Context) (cli.Queryist, *sql.Context, func(), error) {
 		sqlCtx := sql.NewContext(ctx)
 		sqlCtx.SetCurrentDatabase(dbRev)
-		return queryist, sqlCtx, func() { conn.Conn(ctx) }, nil
+		return queryist, sqlCtx, func() {
+			conn.Conn(ctx)
+		}, nil
 	}
 
 	return lateBind, nil
@@ -80,16 +83,20 @@ type ConnectionQueryist struct {
 
 var _ cli.Queryist = ConnectionQueryist{}
 
-func (c ConnectionQueryist) Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, error) {
+func (c ConnectionQueryist) Query(ctx *sql.Context, query string) (sql.Schema, sql.RowIter, *sql.QueryFlags, error) {
 	rows, err := c.connection.QueryContext(ctx, query)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	rowIter, err := NewMysqlRowWrapper(rows)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return rowIter.Schema(), rowIter, nil
+	return rowIter.Schema(), rowIter, nil, nil
+}
+
+func (c ConnectionQueryist) QueryWithBindings(ctx *sql.Context, query string, _ sqlparser.Statement, _ map[string]sqlparser.Expr, _ *sql.QueryFlags) (sql.Schema, sql.RowIter, *sql.QueryFlags, error) {
+	return c.Query(ctx, query)
 }
 
 type MysqlRowWrapper struct {

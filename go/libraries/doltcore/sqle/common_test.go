@@ -50,7 +50,7 @@ func executeSelect(t *testing.T, ctx context.Context, dEnv *env.DoltEnv, root do
 		return nil, nil, err
 	}
 
-	sch, iter, err := engine.Query(sqlCtx, query)
+	sch, iter, _, err := engine.Query(sqlCtx, query)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -82,7 +82,7 @@ func executeModify(t *testing.T, ctx context.Context, dEnv *env.DoltEnv, root do
 		return nil, err
 	}
 
-	_, iter, err := engine.Query(sqlCtx, query)
+	_, iter, _, err := engine.Query(sqlCtx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +181,7 @@ func CreateTestTable(t *testing.T, dEnv *env.DoltEnv, tableName string, sch sche
 	vrw := dEnv.DoltDB.ValueReadWriter()
 	ns := dEnv.DoltDB.NodeStore()
 
-	rows, err := durable.NewEmptyIndex(ctx, vrw, ns, sch)
+	rows, err := durable.NewEmptyPrimaryIndex(ctx, vrw, ns, sch)
 	require.NoError(t, err)
 	tbl, err := doltdb.NewTable(ctx, vrw, ns, sch, rows, nil, nil)
 	require.NoError(t, err)

@@ -15,35 +15,93 @@
 package dtables
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/dolthub/go-mysql-server/sql"
+	gmstypes "github.com/dolthub/go-mysql-server/sql/types"
+	"github.com/dolthub/vitess/go/sqltypes"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
 	"github.com/dolthub/dolt/go/libraries/doltcore/merge"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema/typeinfo"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlutil"
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/pool"
 	"github.com/dolthub/dolt/go/store/prolly"
 	"github.com/dolthub/dolt/go/store/prolly/tree"
+	"github.com/dolthub/dolt/go/store/types"
 	"github.com/dolthub/dolt/go/store/val"
 )
 
-func newProllyCVTable(ctx *sql.Context, tblName string, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
-	tbl, tblName, ok, err := doltdb.GetTableInsensitive(ctx, root, doltdb.TableName{Name: tblName})
+func getDoltConstraintViolationsBaseSqlSchema() sql.Schema {
+	return []*sql.Column{
+		{Name: "from_root_ish", Type: gmstypes.MustCreateStringWithDefaults(sqltypes.VarChar, 1023), PrimaryKey: false, Nullable: true},
+		{Name: "violation_type", Type: gmstypes.MustCreateEnumType([]string{"foreign key", "unique index", "check constraint", "not null"}, sql.Collation_Default), PrimaryKey: true},
+	}
+}
+
+// GetDoltConstraintViolationsBaseSqlSchema returns the base schema for the dolt_constraint_violations_* system table.
+// This is used by Doltgres to update the dolt_constraint_violations_* schema using Doltgres types.
+var GetDoltConstraintViolationsBaseSqlSchema = getDoltConstraintViolationsBaseSqlSchema
+
+// getConstraintViolationsSchema returns a table's dolt_constraint_violations system table schema.
+func getConstraintViolationsSchema(ctx context.Context, t *doltdb.Table, tn doltdb.TableName, root doltdb.RootValue) (schema.Schema, error) {
+	sch, err := t.GetSchema(ctx)
 	if err != nil {
 		return nil, err
-	} else if !ok {
-		return nil, sql.ErrTableNotFound.New(tblName)
 	}
-	cvSch, err := tbl.GetConstraintViolationsSchema(ctx)
+
+	baseSch := sql.NewPrimaryKeySchema(GetDoltConstraintViolationsBaseSqlSchema())
+	baseDoltSch, err := sqlutil.ToDoltSchema(ctx, root, tn, baseSch, root, sql.Collation_Default)
 	if err != nil {
 		return nil, err
 	}
-	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConstViolTablePrefix+tblName, cvSch)
+	baseColColl := baseDoltSch.GetAllCols()
+	baseCols := baseColColl.GetColumns()
+
+	schSize := sch.GetAllCols().Size()
+	if schema.IsKeyless(sch) {
+		// Keyless tables have an additional dolt_row_hash column
+		schSize += 1
+	}
+
+	cols := make([]schema.Column, 0, baseColColl.Size()+schSize)
+	cols = append(cols, baseCols[0:2]...)
+	infoCol, err := schema.NewColumnWithTypeInfo("violation_info", schema.DoltConstraintViolationsInfoTag, typeinfo.JSONType, false, "", false, "")
+	if err != nil {
+		return nil, err
+	}
+
+	if schema.IsKeyless(sch) {
+		// If this is a keyless table, we need to add a new column for the keyless table's generated row hash.
+		// We need to add this internal row hash value, in order to guarantee a unique primary key in the
+		// constraint violations table.
+		cols = append(cols, schema.NewColumn("dolt_row_hash", 0, types.BlobKind, true))
+	} else {
+		cols = append(cols, sch.GetPKCols().GetColumns()...)
+	}
+	cols = append(cols, sch.GetNonPKCols().GetColumns()...)
+	cols = append(cols, infoCol)
+
+	return schema.NewSchema(schema.NewColCollection(cols...), nil, schema.Collation_Default, nil, nil)
+}
+
+func newProllyCVTable(ctx *sql.Context, tblName doltdb.TableName, root doltdb.RootValue, rs RootSetter) (sql.Table, error) {
+	var tbl *doltdb.Table
+	var err error
+	tbl, tblName, err = getTableInsensitiveOrError(ctx, root, tblName)
+	if err != nil {
+		return nil, err
+	}
+	cvSch, err := getConstraintViolationsSchema(ctx, tbl, tblName, root)
+	if err != nil {
+		return nil, err
+	}
+	sqlSch, err := sqlutil.FromDoltSchema("", doltdb.DoltConstViolTablePrefix+tblName.Name, cvSch)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +124,7 @@ func newProllyCVTable(ctx *sql.Context, tblName string, root doltdb.RootValue, r
 // prollyConstraintViolationsTable is a sql.Table implementation that provides access to the constraint violations that exist
 // for a user table for the v1 format.
 type prollyConstraintViolationsTable struct {
-	tblName string
+	tblName doltdb.TableName
 	root    doltdb.RootValue
 	sqlSch  sql.PrimaryKeySchema
 	tbl     *doltdb.Table
@@ -79,12 +137,12 @@ var _ sql.DeletableTable = (*prollyConstraintViolationsTable)(nil)
 
 // Name implements the interface sql.Table.
 func (cvt *prollyConstraintViolationsTable) Name() string {
-	return doltdb.DoltConstViolTablePrefix + cvt.tblName
+	return doltdb.DoltConstViolTablePrefix + cvt.tblName.Name
 }
 
 // String implements the interface sql.Table.
 func (cvt *prollyConstraintViolationsTable) String() string {
-	return doltdb.DoltConstViolTablePrefix + cvt.tblName
+	return doltdb.DoltConstViolTablePrefix + cvt.tblName.Name
 }
 
 // Schema implements the interface sql.Table.
@@ -278,7 +336,7 @@ func (d *prollyCVDeleter) Delete(ctx *sql.Context, r sql.Row) error {
 	d.kb.PutCommitAddr(d.kd.Count()-2, h)
 
 	// Finally the artifact type
-	artType := merge.UnmapCVType(merge.CvType(r[1].(uint64)))
+	artType := merge.UnmapCVType(r[1])
 	d.kb.PutUint8(d.kd.Count()-1, uint8(artType))
 
 	key := d.kb.Build(d.pool)
@@ -319,7 +377,7 @@ func (d *prollyCVDeleter) Close(ctx *sql.Context) error {
 		return err
 	}
 
-	updatedRoot, err := d.cvt.root.PutTable(ctx, doltdb.TableName{Name: d.cvt.tblName}, updatedTbl)
+	updatedRoot, err := d.cvt.root.PutTable(ctx, d.cvt.tblName, updatedTbl)
 	if err != nil {
 		return err
 	}

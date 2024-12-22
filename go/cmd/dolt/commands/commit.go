@@ -38,7 +38,6 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/env/actions"
 	"github.com/dolthub/dolt/go/libraries/utils/argparser"
 	"github.com/dolthub/dolt/go/libraries/utils/config"
-	"github.com/dolthub/dolt/go/libraries/utils/editor"
 	"github.com/dolthub/dolt/go/libraries/utils/iohelp"
 	"github.com/dolthub/dolt/go/libraries/utils/set"
 	"github.com/dolthub/dolt/go/store/datas"
@@ -133,7 +132,7 @@ func performCommit(ctx context.Context, commandStr string, args []string, cliCtx
 	if !msgOk {
 		amendStr := ""
 		if apr.Contains(cli.AmendFlag) {
-			_, rowIter, err := queryist.Query(sqlCtx, "select message from dolt_log() limit 1")
+			_, rowIter, _, err := queryist.Query(sqlCtx, "select message from dolt_log() limit 1")
 			if err != nil {
 				cli.Println(err.Error())
 				return 1, false
@@ -162,7 +161,7 @@ func performCommit(ctx context.Context, commandStr string, args []string, cliCtx
 		return 1, false
 	}
 
-	_, rowIter, err := queryist.Query(sqlCtx, interpolatedQuery)
+	_, rowIter, _, err := queryist.Query(sqlCtx, interpolatedQuery)
 	if err != nil {
 		return handleCommitErr(sqlCtx, queryist, err, usage), false
 	}
@@ -181,7 +180,7 @@ func performCommit(ctx context.Context, commandStr string, args []string, cliCtx
 			pager := outputpager.Start()
 			defer pager.Stop()
 
-			PrintCommitInfo(pager, 0, false, "auto", commit)
+			PrintCommitInfo(pager, 0, false, false, "auto", commit)
 		})
 	}
 
@@ -268,6 +267,18 @@ func constructParametrizedDoltCommitQuery(msg string, apr *argparser.ArgParseRes
 		writeToBuffer("--skip-empty")
 	}
 
+	cfgSign := cliCtx.Config().GetStringOrDefault("sqlserver.global.gpgsign", "")
+	if apr.Contains(cli.SignFlag) || strings.ToLower(cfgSign) == "true" {
+		writeToBuffer("--gpg-sign")
+
+		gpgKey := apr.GetValueOrDefault(cli.SignFlag, "")
+		if gpgKey != "" {
+			param = true
+			writeToBuffer("?")
+			params = append(params, gpgKey)
+		}
+	}
+
 	buffer.WriteString(")")
 	return buffer.String(), params, nil
 }
@@ -299,7 +310,7 @@ func handleCommitErr(sqlCtx *sql.Context, queryist cli.Queryist, err error, usag
 	}
 
 	if err.Error() == "nothing to commit" {
-		_, ri, err := queryist.Query(sqlCtx, "select table_name, status from dolt_status where staged = false")
+		_, ri, _, err := queryist.Query(sqlCtx, "select table_name, status from dolt_status where staged = false")
 		if err != nil {
 			cli.Println(err)
 			return 1
@@ -335,14 +346,6 @@ func handleCommitErr(sqlCtx *sql.Context, queryist cli.Queryist, err error, usag
 // getCommitMessageFromEditor opens editor to ask user for commit message if none defined from command line.
 // suggestedMsg will be returned if no-edit flag is defined or if this function was called from sql dolt_merge command.
 func getCommitMessageFromEditor(sqlCtx *sql.Context, queryist cli.Queryist, suggestedMsg, amendString string, noEdit bool, cliCtx cli.CliContext) (string, error) {
-	if cli.ExecuteWithStdioRestored == nil || noEdit {
-		return suggestedMsg, nil
-	}
-
-	if !checkIsTerminal() {
-		return suggestedMsg, nil
-	}
-
 	var finalMsg string
 	initialMsg, err := buildInitalCommitMsg(sqlCtx, queryist, suggestedMsg)
 	if err != nil {
@@ -352,26 +355,20 @@ func getCommitMessageFromEditor(sqlCtx *sql.Context, queryist cli.Queryist, sugg
 		initialMsg = fmt.Sprintf("%s\n%s", amendString, initialMsg)
 	}
 
-	backupEd := "vim"
-	// try getting default editor on the user system
-	if ed, edSet := os.LookupEnv(dconfig.EnvEditor); edSet {
-		backupEd = ed
+	if cli.ExecuteWithStdioRestored == nil || noEdit {
+		return suggestedMsg, nil
 	}
-	// try getting Dolt config core.editor
-	editorStr := cliCtx.Config().GetStringOrDefault(config.DoltEditor, backupEd)
 
-	cli.ExecuteWithStdioRestored(func() {
-		commitMsg, cErr := editor.OpenTempEditor(editorStr, initialMsg)
-		if cErr != nil {
-			err = cErr
-		}
-		finalMsg = parseCommitMessage(commitMsg)
-	})
+	if !checkIsTerminal() {
+		return suggestedMsg, nil
+	}
 
+	commitMsg, err := execEditor(initialMsg, "", cliCtx)
 	if err != nil {
 		return "", fmt.Errorf("Failed to open commit editor: %v \n Check your `EDITOR` environment variable with `echo $EDITOR` or your dolt config with `dolt config --list` to ensure that your editor is valid", err)
 	}
 
+	finalMsg = parseCommitMessage(commitMsg)
 	return finalMsg, nil
 }
 
@@ -389,7 +386,7 @@ func buildInitalCommitMsg(sqlCtx *sql.Context, queryist cli.Queryist, suggestedM
 	initialNoColor := color.NoColor
 	color.NoColor = true
 
-	_, ri, err := queryist.Query(sqlCtx, "select table_name, status from dolt_status where staged = true")
+	_, ri, _, err := queryist.Query(sqlCtx, "select table_name, status from dolt_status where staged = true")
 	if err != nil {
 		return "", err
 	}
@@ -398,7 +395,7 @@ func buildInitalCommitMsg(sqlCtx *sql.Context, queryist cli.Queryist, suggestedM
 		return "", err
 	}
 
-	_, ri, err = queryist.Query(sqlCtx, "select table_name, status from dolt_status where staged = false")
+	_, ri, _, err = queryist.Query(sqlCtx, "select table_name, status from dolt_status where staged = false")
 	if err != nil {
 		return "", err
 	}
@@ -456,7 +453,7 @@ func PrintDiffsNotStaged(
 	linesPrinted int,
 ) (int, error) {
 	// get data conflict tables
-	_, ri, err := queryist.Query(sqlCtx, "select `table` from dolt_conflicts")
+	_, ri, _, err := queryist.Query(sqlCtx, "select `table` from dolt_conflicts")
 	if err != nil {
 		return 0, err
 	}
@@ -471,7 +468,7 @@ func PrintDiffsNotStaged(
 	inCnfSet := set.NewStrSet(conflictTables)
 
 	// get schema conflict tables
-	_, ri, err = queryist.Query(sqlCtx, "select table_name from dolt_status where status = 'schema conflict'")
+	_, ri, _, err = queryist.Query(sqlCtx, "select table_name from dolt_status where status = 'schema conflict'")
 	if err != nil {
 		return 0, err
 	}
@@ -486,7 +483,7 @@ func PrintDiffsNotStaged(
 	inCnfSet.Add(schemaConflictTables...)
 
 	// get constraint violation tables
-	_, ri, err = queryist.Query(sqlCtx, "select `table` from dolt_constraint_violations")
+	_, ri, _, err = queryist.Query(sqlCtx, "select `table` from dolt_constraint_violations")
 	if err != nil {
 		return 0, err
 	}
@@ -716,7 +713,7 @@ func printStagedDiffs(wr io.Writer, stagedRows []sql.Row, printHelp bool) int {
 
 		lines := make([]string, 0, len(stagedRows))
 		for _, row := range stagedRows {
-			if !doltdb.IsReadOnlySystemTable(row[0].(string)) {
+			if !doltdb.IsReadOnlySystemTable(doltdb.TableName{Name: row[0].(string)}) {
 				switch row[1].(string) {
 				case "new table":
 					lines = append(lines, fmt.Sprintf(statusFmt, tblDiffTypeToLabel[diff.AddedTable], row[0].(string)))

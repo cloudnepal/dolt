@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sqle
+package dtablefunctions
 
 import (
 	"fmt"
@@ -27,13 +27,14 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/diff"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
-	"github.com/dolthub/dolt/go/libraries/doltcore/table/editor"
+	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/sqlfmt"
 )
 
 const schemaDiffDefaultRowCount = 100
 
 var _ sql.TableFunction = (*SchemaDiffTableFunction)(nil)
 var _ sql.ExecSourceRel = (*SchemaDiffTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*SchemaDiffTableFunction)(nil)
 
 type SchemaDiffTableFunction struct {
 	ctx *sql.Context
@@ -168,12 +169,12 @@ func (ds *SchemaDiffTableFunction) WithChildren(children ...sql.Node) (sql.Node,
 	return ds, nil
 }
 
-// CheckPrivileges implements the interface sql.Node.
-func (ds *SchemaDiffTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (ds *SchemaDiffTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
 	if ds.tableNameExpr != nil {
 		_, _, _, tableName, err := ds.evaluateArguments()
 		if err != nil {
-			return false
+			return ExpressionIsDeferred(ds.tableNameExpr)
 		}
 
 		subject := sql.PrivilegeCheckSubject{Database: ds.database.Name(), Table: tableName}
@@ -314,18 +315,14 @@ func (ds *SchemaDiffTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.R
 		var fromCreate, toCreate string
 
 		if delta.FromTable != nil {
-			fromSqlDb := NewUserSpaceDatabase(fromRoot, editor.Options{})
-			fromSqlCtx, fromEngine, _ := PrepareCreateTableStmt(ctx, fromSqlDb)
-			fromCreate, err = GetCreateTableStmt(fromSqlCtx, fromEngine, delta.FromName.Name)
+			fromCreate, err = sqlfmt.GenerateCreateTableStatement(delta.FromName.Name, delta.FromSch, delta.FromFks, delta.FromFksParentSch)
 			if err != nil {
 				return nil, err
 			}
 		}
 
 		if delta.ToTable != nil {
-			toSqlDb := NewUserSpaceDatabase(toRoot, editor.Options{})
-			toSqlCtx, toEngine, _ := PrepareCreateTableStmt(ctx, toSqlDb)
-			toCreate, err = GetCreateTableStmt(toSqlCtx, toEngine, delta.ToName.Name)
+			toCreate, err = sqlfmt.GenerateCreateTableStatement(delta.ToName.Name, delta.ToSch, delta.ToFks, delta.ToFksParentSch)
 			if err != nil {
 				return nil, err
 			}
@@ -338,10 +335,10 @@ func (ds *SchemaDiffTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.R
 		}
 
 		row := sql.Row{
-			fromName.Name, // 0
-			toName.Name,   // 1
-			fromCreate,    // 2
-			toCreate,      // 3
+			fromName.String(), // from_table_name
+			toName.String(),   // to_table_name
+			fromCreate,        // from_create_statement
+			toCreate,          // to_create_statement
 		}
 		dataRows = append(dataRows, row)
 	}
@@ -413,3 +410,15 @@ func (s *schemaDiffTableFunctionRowIter) Close(context *sql.Context) error {
 }
 
 var _ sql.RowIter = (*schemaDiffTableFunctionRowIter)(nil)
+
+// ExpressionIsDeferred checks for whether the given expression is a deferred binding variable. For prepared statements,
+// the normal workflow causes issues with privilege checking since it occurs during AST construction rather than during
+// analysis, so this will catch those instances.
+func ExpressionIsDeferred(expr sql.Expression) bool {
+	if bv, ok := expr.(*expression.BindVar); ok {
+		if deferredType, ok := bv.Type().(sql.DeferredType); ok && deferredType.IsDeferred() {
+			return true
+		}
+	}
+	return false
+}

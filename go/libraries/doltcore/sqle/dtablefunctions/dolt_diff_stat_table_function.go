@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sqle
+package dtablefunctions
 
 import (
 	"errors"
@@ -37,6 +37,7 @@ const diffStatDefaultRowCount = 10
 
 var _ sql.TableFunction = (*DiffStatTableFunction)(nil)
 var _ sql.ExecSourceRel = (*DiffStatTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*DiffStatTableFunction)(nil)
 
 type DiffStatTableFunction struct {
 	ctx *sql.Context
@@ -159,11 +160,11 @@ func (ds *DiffStatTableFunction) WithChildren(children ...sql.Node) (sql.Node, e
 	return ds, nil
 }
 
-// CheckPrivileges implements the interface sql.Node.
-func (ds *DiffStatTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (ds *DiffStatTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
 	if ds.tableNameExpr != nil {
 		if !types.IsText(ds.tableNameExpr.Type()) {
-			return false
+			return ExpressionIsDeferred(ds.tableNameExpr)
 		}
 
 		tableNameVal, err := ds.tableNameExpr.Eval(ds.ctx, nil)
@@ -176,8 +177,6 @@ func (ds *DiffStatTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql
 		}
 
 		subject := sql.PrivilegeCheckSubject{Database: ds.database.Name(), Table: tableName}
-
-		// TODO: Add tests for privilege checking
 		return opChecker.UserHasPrivileges(ctx, sql.NewPrivilegedOperation(subject, sql.PrivilegeType_Select))
 	}
 
@@ -293,7 +292,11 @@ func (ds *DiffStatTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.Row
 	// If tableNameExpr defined, return a single table diff stat result
 	if ds.tableNameExpr != nil {
 		delta := findMatchingDelta(deltas, tableName)
-		diffStat, hasDiff, err := getDiffStatNodeFromDelta(ctx, delta, fromRefDetails.root, toRefDetails.root, tableName)
+		schemaName := delta.FromName.Schema
+		if schemaName == "" {
+			schemaName = delta.ToName.Schema
+		}
+		diffStat, hasDiff, err := getDiffStatNodeFromDelta(ctx, delta, fromRefDetails.root, toRefDetails.root, doltdb.TableName{Name: tableName, Schema: schemaName})
 		if err != nil {
 			return nil, err
 		}
@@ -309,13 +312,12 @@ func (ds *DiffStatTableFunction) RowIter(ctx *sql.Context, row sql.Row) (sql.Row
 		if tblName.Name == "" {
 			tblName = delta.FromName
 		}
-		// TODO: schema name
-		diffStat, hasDiff, err := getDiffStatNodeFromDelta(ctx, delta, fromRefDetails.root, toRefDetails.root, tblName.Name)
+		diffStat, hasDiff, err := getDiffStatNodeFromDelta(ctx, delta, fromRefDetails.root, toRefDetails.root, tblName)
 		if err != nil {
 			if errors.Is(err, diff.ErrPrimaryKeySetChanged) {
 				ctx.Warn(dtables.PrimaryKeyChangeWarningCode, fmt.Sprintf("stat for table %s cannot be determined. Primary key set changed.", tblName))
 				// Report an empty diff for tables that have primary key set changes
-				diffStats = append(diffStats, diffStatNode{tblName: tblName.Name})
+				diffStats = append(diffStats, diffStatNode{tblName: tblName})
 				continue
 			}
 			return nil, err
@@ -369,10 +371,10 @@ func (ds *DiffStatTableFunction) evaluateArguments() (interface{}, interface{}, 
 
 // getDiffStatNodeFromDelta returns diffStatNode object and whether there is data diff or not. It gets tables
 // from roots and diff stat if there is a valid table exists in both fromRoot and toRoot.
-func getDiffStatNodeFromDelta(ctx *sql.Context, delta diff.TableDelta, fromRoot, toRoot doltdb.RootValue, tableName string) (diffStatNode, bool, error) {
+func getDiffStatNodeFromDelta(ctx *sql.Context, delta diff.TableDelta, fromRoot, toRoot doltdb.RootValue, tableName doltdb.TableName) (diffStatNode, bool, error) {
 	var oldColLen int
 	var newColLen int
-	fromTable, _, fromTableExists, err := doltdb.GetTableInsensitive(ctx, fromRoot, doltdb.TableName{Name: tableName})
+	fromTable, _, fromTableExists, err := doltdb.GetTableInsensitive(ctx, fromRoot, tableName)
 	if err != nil {
 		return diffStatNode{}, false, err
 	}
@@ -385,7 +387,7 @@ func getDiffStatNodeFromDelta(ctx *sql.Context, delta diff.TableDelta, fromRoot,
 		oldColLen = len(fromSch.GetAllCols().GetColumns())
 	}
 
-	toTable, _, toTableExists, err := doltdb.GetTableInsensitive(ctx, toRoot, doltdb.TableName{Name: tableName})
+	toTable, _, toTableExists, err := doltdb.GetTableInsensitive(ctx, toRoot, tableName)
 	if err != nil {
 		return diffStatNode{}, false, err
 	}
@@ -488,7 +490,7 @@ func (d *diffStatTableFunctionRowIter) incrementIndexes() {
 }
 
 type diffStatNode struct {
-	tblName   string
+	tblName   doltdb.TableName
 	diffStat  diff.DiffStatProgress
 	oldColLen int
 	newColLen int
@@ -522,11 +524,11 @@ func (d *diffStatTableFunctionRowIter) Close(context *sql.Context) error {
 // getRowFromDiffStat takes diff.DiffStatProgress and calculates the row_modified, cell_added, cell_deleted.
 // If the number of cell change from old to new cell count does not equal to cell_added and/or cell_deleted, there
 // must be schema changes that affects cell_added and cell_deleted value addition to the row count * col length number.
-func getRowFromDiffStat(tblName string, dsp diff.DiffStatProgress, newColLen, oldColLen int, keyless bool) sql.Row {
+func getRowFromDiffStat(tblName doltdb.TableName, dsp diff.DiffStatProgress, newColLen, oldColLen int, keyless bool) sql.Row {
 	// if table is keyless table, match current CLI command result
 	if keyless {
 		return sql.Row{
-			tblName,            // table_name
+			tblName.String(),   // table_name
 			nil,                // rows_unmodified
 			int64(dsp.Adds),    // rows_added
 			int64(dsp.Removes), // rows_deleted
@@ -545,7 +547,7 @@ func getRowFromDiffStat(tblName string, dsp diff.DiffStatProgress, newColLen, ol
 	rowsUnmodified := dsp.OldRowSize - dsp.Changes - dsp.Removes
 
 	return sql.Row{
-		tblName,                // table_name
+		tblName.String(),       // table_name
 		int64(rowsUnmodified),  // rows_unmodified
 		int64(dsp.Adds),        // rows_added
 		int64(dsp.Removes),     // rows_deleted

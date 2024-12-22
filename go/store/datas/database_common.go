@@ -99,7 +99,7 @@ func (db *database) loadDatasetsNomsMap(ctx context.Context, rootHash hash.Hash)
 	}
 
 	if val == nil {
-		return types.EmptyMap, fmt.Errorf("Root hash doesn't exist: %v", rootHash)
+		return types.EmptyMap, fmt.Errorf("root hash doesn't exist: %s", rootHash)
 	}
 
 	return val.(types.Map), nil
@@ -116,7 +116,7 @@ func (db *database) loadDatasetsRefmap(ctx context.Context, rootHash hash.Hash) 
 	}
 
 	if val == nil {
-		return prolly.AddressMap{}, fmt.Errorf("Root hash doesn't exist: %v", rootHash)
+		return prolly.AddressMap{}, fmt.Errorf("root hash doesn't exist: %s", rootHash)
 	}
 
 	return parse_storeroot([]byte(val.(types.SerialMessage)), db.nodeStore())
@@ -289,7 +289,7 @@ func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash, w
 			return err
 		}
 		if !iscommit {
-			return fmt.Errorf("SetHead failed: reffered to value is not a commit:")
+			return fmt.Errorf("SetHead failed: referred to value is not a commit:")
 		}
 	case tagName:
 		istag, err := IsTag(ctx, newVal)
@@ -297,7 +297,7 @@ func (db *database) doSetHead(ctx context.Context, ds Dataset, addr hash.Hash, w
 			return err
 		}
 		if !istag {
-			return fmt.Errorf("SetHead failed: reffered to value is not a tag:")
+			return fmt.Errorf("SetHead failed: referred to value is not a tag:")
 		}
 		_, commitaddr, err := newHead.HeadTag()
 		if err != nil {
@@ -744,6 +744,26 @@ func (db *database) doTag(ctx context.Context, datasetID string, tagAddr hash.Ha
 	})
 }
 
+func (db *database) SetTuple(ctx context.Context, ds Dataset, val []byte) (Dataset, error) {
+	tupleAddr, _, err := newTuple(ctx, db, val)
+	if err != nil {
+		return Dataset{}, err
+	}
+	return db.doHeadUpdate(ctx, ds, func(ds Dataset) error {
+		return db.update(ctx, func(_ context.Context, datasets types.Map) (types.Map, error) {
+			// this is for old format, so this should not happen
+			return datasets, errors.New("WriteTuple is not supported for old storage format")
+		}, func(ctx context.Context, am prolly.AddressMap) (prolly.AddressMap, error) {
+			ae := am.Editor()
+			err := ae.Update(ctx, ds.ID(), tupleAddr)
+			if err != nil {
+				return prolly.AddressMap{}, err
+			}
+			return ae.Flush(ctx)
+		})
+	})
+}
+
 func (db *database) SetStatsRef(ctx context.Context, ds Dataset, mapAddr hash.Hash) (Dataset, error) {
 	statAddr, _, err := newStat(ctx, db, mapAddr)
 	if err != nil {
@@ -1148,8 +1168,8 @@ func (db *database) doDelete(ctx context.Context, datasetIDstr string, workingse
 }
 
 // GC traverses the database starting at the Root and removes all unreferenced data from persistent storage.
-func (db *database) GC(ctx context.Context, oldGenRefs, newGenRefs hash.HashSet, safepointF func() error) error {
-	return db.ValueStore.GC(ctx, oldGenRefs, newGenRefs, safepointF)
+func (db *database) GC(ctx context.Context, mode types.GCMode, oldGenRefs, newGenRefs hash.HashSet, safepointF func() error) error {
+	return db.ValueStore.GC(ctx, mode, oldGenRefs, newGenRefs, safepointF)
 }
 
 func (db *database) tryCommitChunks(ctx context.Context, newRootHash hash.Hash, currentRootHash hash.Hash) error {

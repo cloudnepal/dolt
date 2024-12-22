@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sqle
+package dtablefunctions
 
 import (
 	"fmt"
@@ -28,6 +28,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/merge"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
+	"github.com/dolthub/dolt/go/libraries/utils/gpg"
 	"github.com/dolthub/dolt/go/store/hash"
 )
 
@@ -35,6 +36,7 @@ const logTableDefaultRowCount = 10
 
 var _ sql.TableFunction = (*LogTableFunction)(nil)
 var _ sql.ExecSourceRel = (*LogTableFunction)(nil)
+var _ sql.AuthorizationCheckerNode = (*LogTableFunction)(nil)
 
 type LogTableFunction struct {
 	ctx *sql.Context
@@ -44,9 +46,10 @@ type LogTableFunction struct {
 	notRevisionStrs  []string
 	tableNames       []string
 
-	minParents  int
-	showParents bool
-	decoration  string
+	minParents    int
+	showParents   bool
+	showSignature bool
+	decoration    string
 
 	database sql.Database
 }
@@ -107,7 +110,9 @@ func (ltf *LogTableFunction) Name() string {
 // Resolved implements the sql.Resolvable interface
 func (ltf *LogTableFunction) Resolved() bool {
 	for _, expr := range ltf.revisionExprs {
-		return expr.Resolved()
+		if !expr.Resolved() {
+			return false
+		}
 	}
 	return true
 }
@@ -140,6 +145,10 @@ func (ltf *LogTableFunction) getOptionsString() string {
 		options = append(options, fmt.Sprintf("--%s", cli.ParentsFlag))
 	}
 
+	if ltf.showSignature {
+		options = append(options, fmt.Sprintf("--%s", cli.ShowSignatureFlag))
+	}
+
 	if len(ltf.decoration) > 0 && ltf.decoration != "auto" {
 		options = append(options, fmt.Sprintf("--%s %s", cli.DecorateFlag, ltf.decoration))
 	}
@@ -161,6 +170,9 @@ func (ltf *LogTableFunction) Schema() sql.Schema {
 	if shouldDecorateWithRefs(ltf.decoration) {
 		logSchema = append(logSchema, &sql.Column{Name: "refs", Type: types.Text})
 	}
+	if ltf.showSignature {
+		logSchema = append(logSchema, &sql.Column{Name: "signature", Type: types.Text})
+	}
 
 	return logSchema
 }
@@ -178,8 +190,8 @@ func (ltf *LogTableFunction) WithChildren(children ...sql.Node) (sql.Node, error
 	return ltf, nil
 }
 
-// CheckPrivileges implements the interface sql.Node.
-func (ltf *LogTableFunction) CheckPrivileges(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
+// CheckAuth implements the interface sql.AuthorizationCheckerNode.
+func (ltf *LogTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.PrivilegedOperationChecker) bool {
 	tblNames, err := ltf.database.GetTableNames(ctx)
 	if err != nil {
 		return false
@@ -253,6 +265,7 @@ func (ltf *LogTableFunction) addOptions(expression []sql.Expression) error {
 
 	ltf.minParents = minParents
 	ltf.showParents = apr.Contains(cli.ParentsFlag)
+	ltf.showSignature = apr.Contains(cli.ShowSignatureFlag)
 
 	decorateOption := apr.GetValueOrDefault(cli.DecorateFlag, "auto")
 	switch decorateOption {
@@ -593,11 +606,12 @@ var _ sql.RowIter = (*logTableFunctionRowIter)(nil)
 
 // logTableFunctionRowIter is a sql.RowIter implementation which iterates over each commit as if it's a row in the table.
 type logTableFunctionRowIter struct {
-	child       doltdb.CommitItr
-	showParents bool
-	decoration  string
-	cHashToRefs map[hash.Hash][]string
-	headHash    hash.Hash
+	child         doltdb.CommitItr
+	showParents   bool
+	showSignature bool
+	decoration    string
+	cHashToRefs   map[hash.Hash][]string
+	headHash      hash.Hash
 
 	tableNames []string
 }
@@ -614,12 +628,13 @@ func (ltf *LogTableFunction) NewLogTableFunctionRowIter(ctx *sql.Context, ddb *d
 	}
 
 	return &logTableFunctionRowIter{
-		child:       child,
-		showParents: ltf.showParents,
-		decoration:  ltf.decoration,
-		cHashToRefs: cHashToRefs,
-		headHash:    h,
-		tableNames:  tableNames,
+		child:         child,
+		showParents:   ltf.showParents,
+		showSignature: ltf.showSignature,
+		decoration:    ltf.decoration,
+		cHashToRefs:   cHashToRefs,
+		headHash:      h,
+		tableNames:    tableNames,
 	}, nil
 }
 
@@ -654,12 +669,13 @@ func (ltf *LogTableFunction) NewDotDotLogTableFunctionRowIter(ctx *sql.Context, 
 	}
 
 	return &logTableFunctionRowIter{
-		child:       child,
-		showParents: ltf.showParents,
-		decoration:  ltf.decoration,
-		cHashToRefs: cHashToRefs,
-		headHash:    headHash,
-		tableNames:  tableNames,
+		child:         child,
+		showParents:   ltf.showParents,
+		showSignature: ltf.showSignature,
+		decoration:    ltf.decoration,
+		cHashToRefs:   cHashToRefs,
+		headHash:      headHash,
+		tableNames:    tableNames,
 	}, nil
 }
 
@@ -762,6 +778,19 @@ func (itr *logTableFunctionRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 		branchNames := itr.cHashToRefs[commitHash]
 		isHead := itr.headHash == commitHash
 		row = row.Append(sql.NewRow(getRefsString(branchNames, isHead)))
+	}
+
+	if itr.showSignature {
+		if len(meta.Signature) > 0 {
+			out, err := gpg.Verify(ctx, []byte(meta.Signature))
+			if err != nil {
+				return nil, err
+			}
+
+			row = row.Append(sql.NewRow(string(out)))
+		} else {
+			row = row.Append(sql.NewRow(""))
+		}
 	}
 
 	return row, nil

@@ -206,7 +206,7 @@ func performMerge(
 	}
 
 	if len(spec.StompedTblNames) != 0 {
-		return ws, "", noConflictsOrViolations, threeWayMerge, "", fmt.Errorf("error: local changes would be stomped by merge:\n\t%s\n Please commit your changes before you merge.", strings.Join(spec.StompedTblNames, "\n\t"))
+		return ws, "", noConflictsOrViolations, threeWayMerge, "", fmt.Errorf("error: local changes would be stomped by merge:\n\t%s\n Please commit your changes before you merge.", strings.Join(doltdb.FlattenTableNames(spec.StompedTblNames), "\n\t"))
 	}
 
 	dbData, ok := sess.GetDbData(ctx, dbName)
@@ -317,7 +317,7 @@ func executeMerge(
 	cmSpec string,
 	ws *doltdb.WorkingSet,
 	opts editor.Options,
-	workingDiffs map[string]hash.Hash,
+	workingDiffs map[doltdb.TableName]hash.Hash,
 ) (*doltdb.WorkingSet, error) {
 	result, err := merge.MergeCommits(ctx, head, cm, opts)
 	if err != nil {
@@ -396,7 +396,7 @@ func executeNoFFMerge(
 	if err != nil {
 		return nil, nil, err
 	}
-	result := &merge.Result{Root: mergeRoot, Stats: make(map[string]*merge.MergeStats)}
+	result := &merge.Result{Root: mergeRoot, Stats: make(map[doltdb.TableName]*merge.MergeStats)}
 
 	ws, err = mergeRootToWorking(ctx, dSess, dbName, false, spec.Force, ws, result, spec.WorkingDiffs, spec.MergeC, spec.MergeCSpecStr)
 	if err != nil {
@@ -517,7 +517,7 @@ func mergeRootToWorking(
 	squash, force bool,
 	ws *doltdb.WorkingSet,
 	merged *merge.Result,
-	workingDiffs map[string]hash.Hash,
+	workingDiffs map[doltdb.TableName]hash.Hash,
 	cm2 *doltdb.Commit,
 	cm2Spec string,
 ) (*doltdb.WorkingSet, error) {
@@ -554,7 +554,7 @@ func mergeRootToWorking(
 	return ws, nil
 }
 
-func applyChanges(ctx *sql.Context, root doltdb.RootValue, workingDiffs map[string]hash.Hash) (doltdb.RootValue, error) {
+func applyChanges(ctx *sql.Context, root doltdb.RootValue, workingDiffs map[doltdb.TableName]hash.Hash) (doltdb.RootValue, error) {
 	var err error
 	for tblName, h := range workingDiffs {
 		root, err = root.SetTableHash(ctx, tblName, h)
